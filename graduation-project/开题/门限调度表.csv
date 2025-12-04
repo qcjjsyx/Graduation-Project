@@ -1,0 +1,5 @@
+front_size,panel_NB,pivot_mode,precision,DMA_chunk_KiB,prefetch_distance,batch_small_front,IR_tol,IR_max_iter,notes
+<128,64,threshold,"bf16* + acc32, res64",64,1,16,1e-10,5,非阻塞/微内核；尽可能 batched
+128–256,128,threshold→rook(失败切换),"bf16* + acc32, res64",128,2,8,1e-10,5,可与 mini-panel 拼接
+>256,256,tournament(CALU),"bf16* + acc32, res64",256,3,-,1e-10,5,高吞吐主路径；失败回退 FP32/64
+任意,auto,auto,FP32/64,128,2,-,—,—,触发回退条件满足时切换全精度
