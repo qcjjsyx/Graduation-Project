@@ -1,2 +1,2 @@
 # Graduation-Project
-本科毕业设计
+毕业设计
