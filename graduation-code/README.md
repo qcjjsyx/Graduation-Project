@@ -14,6 +14,24 @@
 │   └── dataStruct.cpp     # 核心数据结构定义与符号分析算法
 └── README.md              # 本文档
 
+GCU:
+gcu_top
+ ├─ gcu_reg_if             // 寄存器接口（AXI-Lite）：配置、状态、启动/中断
+ ├─ gcu_task_fetch         // Node_Task 获取与解码
+ ├─ gcu_dep_scoreboard     // 节点依赖记分牌：pending_children / front_ready
+ ├─ gcu_buffer_mgr         // 双缓冲管理：Buffer A / B 状态机
+ ├─ gcu_micro_scheduler    // 单节点内部的 Panel 级调度（SFU / HPU / Tensor / ATU）
+ ├─ gcu_phase_ctrl         // 阶段一/阶段二模式切换（Factor vs External Update）
+ ├─ dma_front_loader       // 前沿矩阵 DMA Load（Node frontal 到片上 buffer）
+ ├─ dma_factor_writer      // L/U 因子写回 DMA
+ ├─ dma_update_writer      // Large external update 写回 / 中间块搬运 (可选)
+ ├─ scatter_engine         // Update Matrix → 父节点前沿矩阵的 Scatter（读改写 DDR）
+ └─ compute cores (外部 IP)
+      ├─ sfu_core          // Panel 分解核（调用 HPU + ATU）
+      ├─ hpu_top           // HPU
+      ├─ atu_top           // ATU
+      └─ tensor_core_if    // Tensor Core GEMM 接口/包裹
+
 ```
 
 ---
@@ -29,8 +47,6 @@
 * **Macro-Scheduling**: 维护 **Ping-Pong Buffer** 状态机。负责任务预取（Prefetching），并执行**硬件依赖检查**，防止预取未完成写回的父节点数据。
 * **Micro-Scheduling (Lookahead)**: 维护超节点内部的 **Dependency Scoreboard (记分牌)**。
 * 当 Tensor Core 正在更新 Panel K 时，GCU 提前触发 HPU/SFU 处理 Panel K+1。
-
-
 * **Phase Switching**: 控制系统在 *Kernel Factorization* (分解模式) 和 *Large Update* (更新模式) 之间切换。
 
 ### 2. `ATU` (Address Translation Unit) - 零拷贝存储路由
@@ -53,8 +69,6 @@
 * **Tensor Core**: 处理矩阵吞吐。采用 32 \times 32 脉动阵列 (Systolic Array)，负责：
 * 超节点内部的子块更新。
 * 外部大规模 Schur Complement 的生成 (GEMM)。
-
-
 * *(注：Scatter Engine 逻辑通常集成于此模块的输出端口，负责将计算结果 Scatter-Add 到父节点)*
 
 ---
@@ -66,7 +80,8 @@
 该文件是软硬件交互的契约核心，主要负责以下任务：
 
 1. **任务描述符定义 (`Node_Task`)**:
-定义了硬件执行所需的全部元数据。硬件通过 DMA 读取此结构体来启动一个节点的计算。
+   定义了硬件执行所需的全部元数据。硬件通过 DMA 读取此结构体来启动一个节点的计算。
+
 ```cpp
 struct Node_Task {
     uint32_t total_dim;        // 波前矩阵总维数 (N)
@@ -80,21 +95,19 @@ struct Node_Task {
 
 ```
 
-
 2. **符号分析与消解树构建**:
+
 * 输入稀疏矩阵，进行 AMD 重排和符号分解。
 * 构建 Elimination Tree，识别并合并 Supernodes (Max size 256)。
 
-
 3. **Sibling Scheduling (兄弟节点优先调度)**:
+
 * 在生成任务队列时，优化节点顺序。
 * **策略**：在“子节点”和“父节点”任务之间插入无依赖的“兄弟节点”，利用计算时间掩盖子节点 Scatter 写回 DDR 的延迟，避免数据冒险。
 
-
 4. **隐式装配预处理**:
+
 * 负责在 DDR 中预分配内存，并将原始矩阵 A 的数值填入对应的节点区域，作为 Scatter Add 的“底板”。
-
-
 
 ---
 
@@ -103,15 +116,14 @@ struct Node_Task {
 1. **Pre-process**: Host 运行 `dataStruct.cpp`，生成 `Node_Task` 队列并填入 DDR。
 2. **Fetch**: `GCU` 预取任务，DMA 将 Task N 加载至 Buffer A，Task N+1 加载至 Buffer B。
 3. **Compute**:
+
 * `GCU` 指挥 `HPU` 搜索主元，`ATU` 映射地址。
 * `Matrix_Engine` (SFU + Tensor Core) 执行 Blocked LU 分解。
 
-
 4. **Write-Back**:
+
 * L/U 因子 Burst 写回 DDR。
 * Update Matrix 通过 Scatter 逻辑累加到父节点地址。
-
-
 
 ---
 

@@ -22,8 +22,8 @@ module gcu_buffer_mgr #(
     // Front DMA load interface
     // ----------------------------
     output logic [BUFFER_NUM-1:0]         front_load_req,                 // 1-cycle pulse
-    output logic [FRONT_ADDR_W-1:0]       front_load_addr [BUFFER_NUM-1:0],
-    output logic [FRONT_DIM_W-1:0]        front_load_dim  [BUFFER_NUM-1:0],
+    output logic [BUFFER_NUM*FRONT_ADDR_W-1:0] front_load_addr,           // packed: [buf][addr]
+    output logic [BUFFER_NUM*FRONT_DIM_W-1:0]  front_load_dim,            // packed: [buf][dim]
     input  logic [BUFFER_NUM-1:0]         front_load_done,                // pulse/level
 
     // ----------------------------
@@ -37,7 +37,7 @@ module gcu_buffer_mgr #(
     // ----------------------------
     // Export per-buffer task
     // ----------------------------
-    output logic [TASK_W-1:0]             buf_task [BUFFER_NUM-1:0],
+    output logic [BUFFER_NUM*TASK_W-1:0]       buf_task,                      // packed: [buf][task]
     output logic [BUFFER_NUM-1:0]         buf_busy,
 
     // ----------------------------
@@ -71,13 +71,13 @@ module gcu_buffer_mgr #(
     genvar g;
     generate
         for (g = 0; g < BUFFER_NUM; g++) begin : gen_out
-            assign buf_task[g]             = task_q[g];
-            assign buf_ready_for_compute[g]= (state_q[g] == BS_READY);
-            assign buf_busy[g]             = (state_q[g] != BS_IDLE);
+            assign buf_task[g*TASK_W +: TASK_W] = task_q[g];
+            assign buf_ready_for_compute[g] = (state_q[g] == BS_READY);
+            assign buf_busy[g]              = (state_q[g] != BS_IDLE);
 
-            // 只从 task_q 派生 DMA 参数（不再寄存 front_addr/front_dim）
-            assign front_load_addr[g]      = task_q[g][FRONT_ADDR_LSB +: FRONT_ADDR_W];
-            assign front_load_dim[g]       = task_q[g][FRONT_DIM_LSB  +: FRONT_DIM_W];
+            // 只从 task_q 派生 DMA 参数（packed 扁平化，避免网表端口被拆名）
+            assign front_load_addr[g*FRONT_ADDR_W +: FRONT_ADDR_W] = task_q[g][FRONT_ADDR_LSB +: FRONT_ADDR_W];
+            assign front_load_dim[g*FRONT_DIM_W  +: FRONT_DIM_W ]  = task_q[g][FRONT_DIM_LSB  +: FRONT_DIM_W ];
         end
     endgenerate
 
@@ -86,7 +86,10 @@ module gcu_buffer_mgr #(
     // ----------------------------
     logic has_idle;
     logic [$clog2(BUFFER_NUM)-1:0] alloc_buf;
+    logic [$clog2(BUFFER_NUM)-1:0] alloc_buf_q; // registered for delayed req
+    logic accept_task_q;                        // registered handshake
 
+    // 更新alloc_buf组合逻辑
     always_comb begin
         int i;
         has_idle  = 1'b0;
@@ -176,10 +179,22 @@ module gcu_buffer_mgr #(
         int i;
         if (!rst_n) begin
             front_load_req <= '0;
+            accept_task_q  <= 1'b0;
+            alloc_buf_q    <= '0;
         end else begin
+            // default deassert pulse and handshake reg
             front_load_req <= '0;
+            accept_task_q  <= 1'b0;
+
+            // latch handshake info when accept_task hits
             if (accept_task) begin
-                front_load_req[alloc_buf] <= 1'b1;
+                accept_task_q <= 1'b1;
+                alloc_buf_q   <= alloc_buf;
+            end
+
+            // one-cycle-later pulse based on latched buffer id
+            if (accept_task_q) begin
+                front_load_req[alloc_buf_q] <= 1'b1;
             end
         end
     end
