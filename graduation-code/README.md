@@ -109,6 +109,25 @@ struct Node_Task {
 
 * 负责在 DDR 中预分配内存，并将原始矩阵 A 的数值填入对应的节点区域，作为 Scatter Add 的“底板”。
 
+5. **IR:迭代求解**
+
+- 当第一次计算得到$x_0$,软件层负责计算$r=b-LUx_0$，并确定$r$是否符合误差要求。
+- 若不符合要求，动态计算放缩因子$\alpha$.给硬件端计算求解$LU\delta x=\alpha r$
+- 如此迭代使得求解精度提高
+
+* **算法流程**:
+    1.  **Scan**: Host 计算残差 $r$，并找出其最大绝对值 $v_{max} = \max(|r|)$。
+    2.  **Scale Factor**: 计算缩放因子 $\alpha = 2^k$，使得 $v_{max} \cdot \alpha \approx 1.0$。
+        * *Note*: 采用 $2$ 的幂次缩放仅修改浮点数指数位，不引入额外的舍入误差。
+    3.  **Scaling**: Host 计算 $r' = r \cdot \alpha$ 并通过 DMA 发送给 FPGA。
+    4.  **Solve**: FPGA 复用已有的 $L/U$ 因子求解 $A d' = r'$。
+    5.  **Descaling**: Host 接收 $d'$，计算真实修正量 $d = d' / \alpha$。
+    6.  **Update**: 更新解向量 $x_{new} = x_{old} + d$。
+
+    
+
+
+
 ---
 
 ## 🚀 系统数据流 (System Workflow)
@@ -127,4 +146,4 @@ struct Node_Task {
 
 ---
 
-*Last Updated: 2025*
+**Last Updated: 20260109**
