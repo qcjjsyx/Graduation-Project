@@ -1,12 +1,12 @@
 `timescale 1ns/1ps
 
-module gcu_dep_scoreboard_tb;
+module tb_scoreboard;
 
     // 参数配置：小规模便于看波形
     localparam int NODE_ID_W   = 4;    // 支持 node_id 0..15
     localparam int MAX_NODES   = 8;    // 实际开 8 个 entry
     // 与 DUT 端口保持一致：init_children_count 在设计中固定 16bit
-    localparam int CHILD_CNT_W = 16;
+    localparam int CHILD_CNT_W = 4;
 
     // DUT 端口信号
     logic                         clk;
@@ -27,9 +27,9 @@ module gcu_dep_scoreboard_tb;
 
     // 实例化待测模块
     gcu_dep_scoreboard #(
-        .NODE_ID_W   (NODE_ID_W),
-        .MAX_NODES   (MAX_NODES),
-        .CHILD_CNT_W (CHILD_CNT_W)
+        // .NODE_ID_W   (NODE_ID_W),
+        // .MAX_NODES   (MAX_NODES),
+        // .CHILD_CNT_W (CHILD_CNT_W)
     ) dut (
         .clk                     (clk),
         .rst_n                   (rst_n),

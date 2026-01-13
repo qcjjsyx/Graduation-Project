@@ -4,7 +4,7 @@
 
 ## 📂 目录结构索引
 
-```text
+```
 ├── hardware/              # 硬件加速器 RTL/HLS 源码
 │   ├── ATU/               # 地址转换单元 (Address Translation Unit)
 │   ├── GCU/               # 全局控制单元 (Global Control Unit / Scheduler)
@@ -38,7 +38,7 @@ gcu_top
 
 ## 🏗️ 硬件模块详解 (Hardware)
 
-硬件架构设计遵循 **Right-Looking Blocked LU** 算法，针对 256 \times 256 超节点进行优化。
+硬件架构设计遵循 **Right-Looking Blocked LU** 算法，针对 $256 \times 256$ 超节点进行优化。
 
 ### 1. `GCU` (Global Control Unit) - 系统的“大脑”
 
@@ -48,6 +48,28 @@ gcu_top
 * **Micro-Scheduling (Lookahead)**: 维护超节点内部的 **Dependency Scoreboard (记分牌)**。
 * 当 Tensor Core 正在更新 Panel K 时，GCU 提前触发 HPU/SFU 处理 Panel K+1。
 * **Phase Switching**: 控制系统在 *Kernel Factorization* (分解模式) 和 *Large Update* (更新模式) 之间切换。
+
+```
+gcu_top
+ ├─ gcu_reg_if
+ ├─ gcu_task_fetch
+ ├─ gcu_dep_scoreboard
+ ├─ gcu_buffer_mgr
+ ├─ gcu_micro_scheduler
+ ├─ gcu_phase_ctrl
+ ├─ dma_front_loader
+ ├─ dma_factor_writer
+ ├─ dma_update_writer (optional)
+ ├─ scatter_engine
+ └─ compute cores (external)
+     ├─ sfu_core
+     ├─ hpu_top
+     ├─ atu_top
+     └─ tensor_core_if
+
+```
+
+
 
 ### 2. `ATU` (Address Translation Unit) - 零拷贝存储路由
 

@@ -27,9 +27,9 @@ module tb_hpu_top ();
 
     // 实例化 DUT
     hpu_top #(
-        .DATA_W    (DATA_W),
-        .ROW_IDX_W (ROW_IDX_W),
-        .MAX_ELEMS (MAX_ELEMS)
+        // .DATA_W    (DATA_W),
+        // .ROW_IDX_W (ROW_IDX_W),
+        // .MAX_ELEMS (MAX_ELEMS)
     ) dut (
         .clk            (clk),
         .rst_n          (rst_n),

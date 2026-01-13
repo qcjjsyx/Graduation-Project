@@ -1,31 +1,30 @@
 `timescale 1ns/1ps
 module tb_ATU;
 
-localparam ROW_IDX_W = 8;
+localparam ROW_IDX_WIDTH = 8;
 
 logic clk;
 logic rst_n;
 
 // 查询接口
 logic  q_req_valid;
-logic [ROW_IDX_W-1:0] q_req_row_logic; // 逻辑行号 max = 256行
+logic [ROW_IDX_WIDTH-1:0] q_req_row_logic; // 逻辑行号 max = 256行
 logic  q_req_ready;
 
 logic  q_resp_valid;
-logic [ROW_IDX_W-1:0] q_resp_row_physical;// 物理行号
-
+logic [ROW_IDX_WIDTH-1:0] q_resp_row_physical;// 物理行号
 
 // pivot 更新接口
 logic  pivot_req_valid;
-logic [ROW_IDX_W-1:0] pivot_row_i; // 行i
-logic [ROW_IDX_W-1:0] pivot_row_j; // 行j
+logic [ROW_IDX_WIDTH-1:0] pivot_row_i; // 行i
+logic [ROW_IDX_WIDTH-1:0] pivot_row_j; // 行j
 logic  pivot_req_ready;
 logic  pivot_done;
 
 //配置
 logic cfg_we;
-logic [ROW_IDX_W-1:0] cfg_p_idx;
-logic [ROW_IDX_W-1:0] cfg_p_row_physical;
+logic [ROW_IDX_WIDTH-1:0] cfg_p_idx;
+logic [ROW_IDX_WIDTH-1:0] cfg_p_row_physical;
 logic cfg_ready;
 
 // 初始化接口
@@ -33,9 +32,7 @@ logic init_identity; // 初始化为单位映射
 logic init_done;
 
 
-ATU#(
-    .ROW_IDX_W                  ( ROW_IDX_W )
-)u_ATU(
+ATU u_ATU(
     . q_req_valid          (  q_req_valid          ),
     . q_req_row_logic      (  q_req_row_logic      ),
     . q_req_ready          (  q_req_ready          ),
@@ -93,8 +90,8 @@ end
 
 endtask
 
-task automatic cfg_write(input  [ROW_IDX_W-1:0] idx,
-                      input  [ROW_IDX_W-1:0] phys);
+task automatic cfg_write(input  [ROW_IDX_WIDTH-1:0] idx,
+                      input  [ROW_IDX_WIDTH-1:0] phys);
 begin
     $display("[%0t]********** ATU CFG WRITE **********", $time);
     wait(cfg_ready==1'b1);
@@ -108,8 +105,8 @@ begin
 end
 endtask
 
-task automatic pivot_swap(input  [ROW_IDX_W-1:0] i,
-                          input  [ROW_IDX_W-1:0] j);
+task automatic pivot_swap(input  [ROW_IDX_WIDTH-1:0] i,
+                          input  [ROW_IDX_WIDTH-1:0] j);
 begin
     $display("[%0t]********** ATU PIVOT SWAP **********", $time);
     wait(pivot_req_ready==1'b1);
@@ -128,7 +125,7 @@ end
 endtask
 
 
-task automatic query(input  [ROW_IDX_W-1:0] logic_idx
+task automatic query(input  [ROW_IDX_WIDTH-1:0] logic_idx
                        );
 begin
     $display("[%0t]********** ATU QUERY **********", $time);

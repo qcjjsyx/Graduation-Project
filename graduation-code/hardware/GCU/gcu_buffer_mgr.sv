@@ -1,3 +1,11 @@
+/**
+ * gcu_buffer_mgr.sv
+ *
+ * GCU Buffer Manager 模块
+ * 管理多个 buffer 的状态机，负责 buffer 分配、状态转换，以及派发 DMA load 请求
+ */
+
+
 module gcu_buffer_mgr #(
     parameter int BUFFER_NUM     = 2,
     parameter int TASK_W         = 128,
@@ -13,38 +21,38 @@ module gcu_buffer_mgr #(
     // ----------------------------
     // Task input (from task_fetch)
     // ----------------------------
-    input  logic                          task_valid,
-    output logic                          task_ready,
-    input  logic [TASK_W-1:0]             task_in,
-    input  logic                          front_ready_for_task,
+    input  logic                              task_valid,
+    output logic                              task_ready,
+    input  logic [TASK_W-1:0]                 task_in,
+    input  logic                              front_ready_for_task,
 
     // ----------------------------
     // Front DMA load interface
     // ----------------------------
-    output logic [BUFFER_NUM-1:0]         front_load_req,                 // 1-cycle pulse
+    output logic [BUFFER_NUM-1:0]              front_load_req,                 // 1-cycle pulse
     output logic [BUFFER_NUM*FRONT_ADDR_W-1:0] front_load_addr,           // packed: [buf][addr]
     output logic [BUFFER_NUM*FRONT_DIM_W-1:0]  front_load_dim,            // packed: [buf][dim]
-    input  logic [BUFFER_NUM-1:0]         front_load_done,                // pulse/level
+    input  logic [BUFFER_NUM-1:0]              front_load_done,                // pulse/level
 
     // ----------------------------
     // Interface to micro_scheduler
     // ----------------------------
-    output logic [BUFFER_NUM-1:0]         buf_ready_for_compute,           // state==READY
-    input  logic [BUFFER_NUM-1:0]         buf_take,                        // READY->PROCESSING
-    input  logic [BUFFER_NUM-1:0]         node_compute_done,               // PROCESSING->WRITEBACK
-    input  logic [BUFFER_NUM-1:0]         writeback_done,                  // WRITEBACK->IDLE
+    output logic [BUFFER_NUM-1:0]              buf_ready_for_compute,           // state==READY
+    input  logic [BUFFER_NUM-1:0]              buf_take,                        // READY->PROCESSING
+    input  logic [BUFFER_NUM-1:0]              node_compute_done,               // PROCESSING->WRITEBACK
+    input  logic [BUFFER_NUM-1:0]              writeback_done,                  // WRITEBACK->IDLE
 
     // ----------------------------
     // Export per-buffer task
     // ----------------------------
     output logic [BUFFER_NUM*TASK_W-1:0]       buf_task,                      // packed: [buf][task]
-    output logic [BUFFER_NUM-1:0]         buf_busy,
+    output logic [BUFFER_NUM-1:0]              buf_busy,
 
     // ----------------------------
     // Clock / Reset
     // ----------------------------
-    input  logic                          clk,
-    input  logic                          rst_n
+    input  logic                              clk,
+    input  logic                              rst_n
 );
 
     // ----------------------------

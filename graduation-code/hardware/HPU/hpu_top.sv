@@ -1,6 +1,6 @@
 module hpu_top #(
     parameter DATA_W    = 32,
-    parameter ROW_IDX_W = 16,
+    parameter ROW_IDX_W = 8,
     parameter MAX_ELEMS  = 256
 )
 (

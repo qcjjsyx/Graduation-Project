@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-module gcu_buffer_mgr_tb;
+module tb_gcu_buffer_mgr;
 
     localparam int NUM_BUFS        = 2;
     localparam int TASK_W          = 128;
@@ -14,25 +14,7 @@ module gcu_buffer_mgr_tb;
     //========================
     logic clk, rst_n;
 
-    initial begin
-        clk = 1'b0;
-        forever #5 clk = ~clk; // 100MHz
-    end
-
-    initial begin
-        rst_n                 = 1'b0;
-        front_ready_for_task  = 1'b0;
-        task_valid            = 1'b0;
-        task_in               = '0;
-        front_load_done       = '0;
-        buf_take              = '0;
-        node_compute_done     = '0;
-        writeback_done        = '0;
-        @(negedge clk);
-        #1000;
-        rst_n                 = 1'b1;
-        front_ready_for_task  = 1'b1;
-    end
+    
 
     //========================
     // DUT ports
@@ -53,16 +35,37 @@ module gcu_buffer_mgr_tb;
     logic [NUM_BUFS*TASK_W-1:0]       buf_task;
     logic [NUM_BUFS-1:0]              buf_busy;
 
+
+
+    initial begin
+        clk = 1'b0;
+        forever #5 clk = ~clk; // 100MHz
+    end
+
+    initial begin
+        rst_n                 = 1'b0;
+        front_ready_for_task  = 1'b0;
+        task_valid            = 1'b0;
+        task_in               = '0;
+        front_load_done       = '0;
+        buf_take              = '0;
+        node_compute_done     = '0;
+        writeback_done        = '0;
+        @(negedge clk);
+        #1000;
+        rst_n                 = 1'b1;
+        front_ready_for_task  = 1'b1;
+    end
     //========================
     // DUT instance
     //========================
     gcu_buffer_mgr #(
-        .BUFFER_NUM     (NUM_BUFS),
-        .TASK_W         (TASK_W),
-        .FRONT_ADDR_W   (FRONT_ADDR_W),
-        .FRONT_DIM_W    (FRONT_DIM_W),
-        .FRONT_ADDR_LSB (FRONT_ADDR_LSB),
-        .FRONT_DIM_LSB  (FRONT_DIM_LSB)
+        // .BUFFER_NUM     (NUM_BUFS),
+        // .TASK_W         (TASK_W),
+        // .FRONT_ADDR_W   (FRONT_ADDR_W),
+        // .FRONT_DIM_W    (FRONT_DIM_W),
+        // .FRONT_ADDR_LSB (FRONT_ADDR_LSB),
+        // .FRONT_DIM_LSB  (FRONT_DIM_LSB)
     ) dut (
         .task_valid            (task_valid),
         .task_ready            (task_ready),
@@ -195,51 +198,51 @@ module gcu_buffer_mgr_tb;
 
 
         // 场景 2：无空闲 buffer 时发 task2，不应产生 front_load_req
-        // @(negedge clk);
-        // task_in    <= make_task(4'h5, 4'h6);
-        // task_valid <= 1'b1;
-        // @(posedge clk);
-        // #1;
-        // if (front_load_req !== '0) begin
-        //     $fatal("[%0t] Expect no front_load_req when all buffers are busy", $time);
-        // end
-        // @(negedge clk);
-        // task_valid <= 1'b0;
+        @(negedge clk);
+        task_in    <= make_task(4'h5, 4'h6);
+        task_valid <= 1'b1;
+        @(posedge clk);
+        #1;
+        if (front_load_req !== '0) begin
+            $fatal("[%0t] Expect no front_load_req when all buffers are busy", $time);
+        end
+        @(negedge clk);
+        task_valid <= 1'b0;
 
         // buf0 完成加载 -> READY
-        // pulse_signal(front_load_done, 0);
-        // @(posedge clk);
-        // expect_ready(0, 1'b1, 1'b1, "buf0 after front_load_done");
-        // if (buf_task[(0*TASK_W)+FRONT_ADDR_LSB +: FRONT_ADDR_W] !== 4'h1) begin
-        //     $fatal("[%0t] buf0 task addr mismatch", $time);
-        // end
+        pulse_signal(front_load_done, 0);
+        @(posedge clk);
+        expect_ready(0, 1'b1, 1'b1, "buf0 after front_load_done");
+        if (buf_task[(0*TASK_W)+FRONT_ADDR_LSB +: FRONT_ADDR_W] !== 4'h1) begin
+            $fatal("[%0t] buf0 task addr mismatch", $time);
+        end
 
         // buf1 完成加载 -> READY
-        // pulse_signal(front_load_done, 1);
-        // @(posedge clk);
-        // expect_ready(1, 1'b1, 1'b1, "buf1 after front_load_done");
+        pulse_signal(front_load_done, 1);
+        @(posedge clk);
+        expect_ready(1, 1'b1, 1'b1, "buf1 after front_load_done");
 
         // buf0 被调度 -> PROCESSING
-        // pulse_signal(buf_take, 0);
-        // @(posedge clk);
-        // expect_ready(0, 1'b0, 1'b1, "buf0 after buf_take");
+        pulse_signal(buf_take, 0);
+        @(posedge clk);
+        expect_ready(0, 1'b0, 1'b1, "buf0 after buf_take");
 
         // buf0 计算完成 -> WRITEBACK
-        // pulse_signal(node_compute_done, 0);
-        // @(posedge clk);
-        // expect_ready(0, 1'b0, 1'b1, "buf0 in writeback");
+        pulse_signal(node_compute_done, 0);
+        @(posedge clk);
+        expect_ready(0, 1'b0, 1'b1, "buf0 in writeback");
 
         // buf0 写回完成 -> IDLE
-        // pulse_signal(writeback_done, 0);
-        // @(posedge clk);
-        // expect_ready(0, 1'b0, 1'b0, "buf0 after writeback_done");
+        pulse_signal(writeback_done, 0);
+        @(posedge clk);
+        expect_ready(0, 1'b0, 1'b0, "buf0 after writeback_done");
 
         // buf1 直接走完流程
-        // pulse_signal(buf_take, 1);
-        // pulse_signal(node_compute_done, 1);
-        // pulse_signal(writeback_done, 1);
-        // @(posedge clk);
-        // expect_ready(1, 1'b0, 1'b0, "buf1 returned to IDLE");
+        pulse_signal(buf_take, 1);
+        pulse_signal(node_compute_done, 1);
+        pulse_signal(writeback_done, 1);
+        @(posedge clk);
+        expect_ready(1, 1'b0, 1'b0, "buf1 returned to IDLE");
 
         $display("==== gcu_buffer_mgr_tb PASSED ====");
         #50;
