@@ -45,7 +45,7 @@ gcu_top
 负责宏观与微观的双层调度，确保计算流水线满载。
 
 * **Macro-Scheduling**: 维护 **Ping-Pong Buffer** 状态机。负责任务预取（Prefetching），并执行**硬件依赖检查**，防止预取未完成写回的父节点数据。
-* **Micro-Scheduling (Lookahead)**: 维护超节点内部的 **Dependency Scoreboard (记分牌)**。
+* **Micro-Scheduling (Lookahead)**: 维护超节点内部的 **Dependency Scoreboard (记分牌)**。负责整个波前矩阵的处理。
 * 当 Tensor Core 正在更新 Panel K 时，GCU 提前触发 HPU/SFU 处理 Panel K+1。
 * **Phase Switching**: 控制系统在 *Kernel Factorization* (分解模式) 和 *Large Update* (更新模式) 之间切换。
 
@@ -68,8 +68,6 @@ gcu_top
      └─ tensor_core_if
 
 ```
-
-
 
 ### 2. `ATU` (Address Translation Unit) - 零拷贝存储路由
 
@@ -138,17 +136,13 @@ struct Node_Task {
 - 如此迭代使得求解精度提高
 
 * **算法流程**:
-    1.  **Scan**: Host 计算残差 $r$，并找出其最大绝对值 $v_{max} = \max(|r|)$。
-    2.  **Scale Factor**: 计算缩放因子 $\alpha = 2^k$，使得 $v_{max} \cdot \alpha \approx 1.0$。
-        * *Note*: 采用 $2$ 的幂次缩放仅修改浮点数指数位，不引入额外的舍入误差。
-    3.  **Scaling**: Host 计算 $r' = r \cdot \alpha$ 并通过 DMA 发送给 FPGA。
-    4.  **Solve**: FPGA 复用已有的 $L/U$ 因子求解 $A d' = r'$。
-    5.  **Descaling**: Host 接收 $d'$，计算真实修正量 $d = d' / \alpha$。
-    6.  **Update**: 更新解向量 $x_{new} = x_{old} + d$。
-
-    
-
-
+  1. **Scan**: Host 计算残差 $r$，并找出其最大绝对值 $v_{max} = \max(|r|)$。
+  2. **Scale Factor**: 计算缩放因子 $\alpha = 2^k$，使得 $v_{max} \cdot \alpha \approx 1.0$。
+     * *Note*: 采用 $2$ 的幂次缩放仅修改浮点数指数位，不引入额外的舍入误差。
+  3. **Scaling**: Host 计算 $r' = r \cdot \alpha$ 并通过 DMA 发送给 FPGA。
+  4. **Solve**: FPGA 复用已有的 $L/U$ 因子求解 $A d' = r'$。
+  5. **Descaling**: Host 接收 $d'$，计算真实修正量 $d = d' / \alpha$。
+  6. **Update**: 更新解向量 $x_{new} = x_{old} + d$。
 
 ---
 
