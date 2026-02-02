@@ -143,6 +143,28 @@ struct Node_Task {
   4. **Solve**: FPGA 复用已有的 $L/U$ 因子求解 $A d' = r'$。
   5. **Descaling**: Host 接收 $d'$，计算真实修正量 $d = d' / \alpha$。
   6. **Update**: 更新解向量 $x_{new} = x_{old} + d$。
+  
+  ```
+  software/                   # 💻 上位机驱动与预处理 (C++)
+  │       ├── include/
+  │       │   └── dataStruct.h        # 软硬接口定义 (Node_Task, Map Table)
+  │       ├── src/
+  │       │   ├── symbolic/           # 符号分析
+  │       │   │   ├── amd_reorder.cpp # 矩阵重排
+  │       │   │   └── etree_build.cpp # 消解树与超节点切分
+  │       │   ├── scheduler/          # 任务调度
+  │       │   │   ├── map_gen.cpp     # 相对映射表生成
+  │       │   │   └── task_queue.cpp  # Sibling Scheduling (防数据冒险)
+  │       │   ├── solver/             # 求解流程控制
+  │       │   │   ├── iterative_refine.cpp # 迭代求精与动态缩放
+  │       │   │   └── host_solver.cpp # 顶层 Solve Loop
+  │       │   ├── verify/             # 验证模块
+  │       │   │   └── mumps_error.cpp # MUMPS 后误差分析 (omega1)
+  │       │   └── memory/             # 内存管理与 A 矩阵预填
+  │       └── scripts/                # 辅助脚本 (Python 绘图/数据清洗)
+  ```
+  
+  
 
 ---
 

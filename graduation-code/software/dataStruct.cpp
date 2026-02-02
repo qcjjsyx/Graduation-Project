@@ -26,5 +26,7 @@ struct Node_Task {
     uint64_t u_factor_addr;   // U 因子写到哪里 (DDR Base Address for U)
                               // 注：为了读取方便，L和U有时会分开存，或者存成一个紧凑块
 
+    uint64_t p_vector_addr;   // [NEW] 用于存储行置换历史 (Permutation Vector)
+                              // 大小通常为: total_dim * sizeof(int32)
     uint16_t flag;            //预留字段                          
 };
