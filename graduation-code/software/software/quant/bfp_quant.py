@@ -20,14 +20,16 @@ class QuantResult:
     tiles: Tuple[int, int]
     sat_count: int
     sat_total: int
+    clip_count: int
 
 
-def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
+def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
     if x.size == 0:
-        return x.astype(np.int32), 0, 0, 0
+        return x.astype(np.int32), 0, 0, 0, 0
     a = np.percentile(np.abs(x), 99.5)
     if a == 0:
-        return np.zeros_like(x, dtype=np.int32), 0, 0, x.size
+        return np.zeros_like(x, dtype=np.int32), 0, 0, x.size, 0
+    clip_count = int(np.count_nonzero(np.abs(x) > a))
     e = int(np.ceil(np.log2(a / Q_MAX)))
     x_c = np.clip(x, -a, a)
     q = np.clip(np.round(x_c / (2 ** e)), -Q_MAX, Q_MAX).astype(np.int32)
@@ -35,7 +37,7 @@ def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
         e -= 1
         q = np.clip(np.round(x_c / (2 ** e)), -Q_MAX, Q_MAX).astype(np.int32)
     sat_count = int(np.count_nonzero(np.abs(q) == Q_MAX))
-    return q, e, sat_count, x.size
+    return q, e, sat_count, x.size, clip_count
 
 
 def quantize_matrix(x: np.ndarray) -> QuantResult:
@@ -51,6 +53,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
 
     sat_count = 0
     sat_total = 0
+    clip_total = 0
     for ty in range(tiles_y):
         for tx in range(tiles_x):
             y0 = ty * TILE
@@ -64,9 +67,10 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
                 tile[SUB:TILE, SUB:TILE],
             ]
             for bi, block in enumerate(blocks):
-                q_block, e, b_sat, b_total = _quantize_block(block)
+                q_block, e, b_sat, b_total, b_clip = _quantize_block(block)
                 sat_count += b_sat
                 sat_total += b_total
+                clip_total += b_clip
                 e_out[ty, tx, bi] = np.int8(e)
                 if bi == 0:
                     q_out[y0 : y0 + SUB, x0 : x0 + SUB] = q_block
@@ -85,6 +89,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
         tiles=(tiles_y, tiles_x),
         sat_count=sat_count,
         sat_total=sat_total,
+        clip_count=clip_total,
     )
 
 
@@ -103,8 +108,10 @@ def dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
                 (slice(SUB, TILE), slice(SUB, TILE)),
             ]
             for bi, (ys, xs) in enumerate(blocks):
-                block = q[y0 + ys, x0 + xs].astype(np.float32)
-                out[y0 + ys, x0 + xs] = block * (2 ** int(exps[bi]))
+                ys_abs = slice(y0 + ys.start, y0 + ys.stop)
+                xs_abs = slice(x0 + xs.start, x0 + xs.stop)
+                block = q[ys_abs, xs_abs].astype(np.float32)
+                out[ys_abs, xs_abs] = block * (2 ** int(exps[bi]))
     return out
 
 
