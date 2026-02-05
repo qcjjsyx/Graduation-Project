@@ -23,10 +23,30 @@ from software.verify.metrics import residual_norm
 
 def _load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_matrix:
     if path:
-        a = scipy.io.mmread(path).tocsr()
-        if a.shape[0] != a.shape[1]:
-            raise ValueError("Matrix must be square")
-        return a
+        # Check if file is .mat format
+        if path.endswith('.mat'):
+            try:
+                from matrix_compress.compress import read_mat_file
+                a = read_mat_file(path)
+                if a.shape[0] != a.shape[1]:
+                    raise ValueError("Matrix must be square")
+                return a
+            except ImportError:
+                # Fall back to scipy.io if matrix_compress is not available
+                a = scipy.io.loadmat(path)
+                for key, value in a.items():
+                    if isinstance(value, np.ndarray) and value.ndim == 2:
+                        a = sp.csr_matrix(value)
+                        if a.shape[0] != a.shape[1]:
+                            raise ValueError("Matrix must be square")
+                        return a
+                raise ValueError("No matrix found in .mat file")
+        else:
+            # Load MatrixMarket format
+            a = scipy.io.mmread(path).tocsr()
+            if a.shape[0] != a.shape[1]:
+                raise ValueError("Matrix must be square")
+            return a
     rng = np.random.default_rng(seed)
     r = sp.random(n, n, density=density, format="csr", random_state=rng)
     a = r + r.T

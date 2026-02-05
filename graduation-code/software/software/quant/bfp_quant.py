@@ -18,14 +18,17 @@ class QuantResult:
     orig_shape: Tuple[int, int]
     padded_shape: Tuple[int, int]
     tiles: Tuple[int, int]
-    sat_count: int
-    sat_total: int
+    sat_count: int   ## 饱和计数
+    sat_total: int   ## 饱和总数
 
 
+'''
+量化一个块, 返回量化后的结果, 指数, 饱和计数, 总元素数
+'''
 def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
     if x.size == 0:
         return x.astype(np.int32), 0, 0, 0
-    a = np.percentile(np.abs(x), 99.5)
+    a = np.percentile(np.abs(x), 99.5)  ## 99.5% 分位数 有待商榷，根据具体例子调整
     if a == 0:
         return np.zeros_like(x, dtype=np.int32), 0, 0, x.size
     e = int(np.ceil(np.log2(a / Q_MAX)))
@@ -37,12 +40,14 @@ def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
     sat_count = int(np.count_nonzero(np.abs(q) == Q_MAX))
     return q, e, sat_count, x.size
 
-
+'''
+量化一个矩阵, 返回量化后的结果, 指数矩阵, 饱和计数, 总元素数
+'''
 def quantize_matrix(x: np.ndarray) -> QuantResult:
     h, w = x.shape
     h_pad = (TILE - h % TILE) % TILE
     w_pad = (TILE - w % TILE) % TILE
-    padded = np.pad(x, ((0, h_pad), (0, w_pad)), mode="constant")
+    padded = np.pad(x, ((0, h_pad), (0, w_pad)), mode="constant") ## 填充为32的整数倍
     tiles_y = padded.shape[0] // TILE
     tiles_x = padded.shape[1] // TILE
 
@@ -81,13 +86,15 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
         q=q_out,
         e=e_out,
         orig_shape=(h, w),
-        padded_shape=padded.shape,
+        padded_shape=padded.shape, # type: ignore
         tiles=(tiles_y, tiles_x),
         sat_count=sat_count,
         sat_total=sat_total,
     )
 
-
+'''
+反量化一个矩阵, 返回反量化后的结果
+'''
 def dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
     tiles_y, tiles_x, _ = e.shape
     out = np.zeros_like(q, dtype=np.float32)
@@ -103,11 +110,13 @@ def dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
                 (slice(SUB, TILE), slice(SUB, TILE)),
             ]
             for bi, (ys, xs) in enumerate(blocks):
-                block = q[y0 + ys, x0 + xs].astype(np.float32)
-                out[y0 + ys, x0 + xs] = block * (2 ** int(exps[bi]))
+                block = q[y0 + ys, x0 + xs].astype(np.float32) # type: ignore
+                out[y0 + ys, x0 + xs] = block * (2 ** int(exps[bi])) # type: ignore
     return out
 
-
+'''
+将量化后的矩阵和指数矩阵展平为行优先的整数列表，用于二进制输出
+'''
 def flatten_tiles(q: np.ndarray, e: np.ndarray) -> Tuple[List[int], List[int]]:
     """Flatten tiles to row-major lists for binary output."""
     q_list = q.flatten().astype(np.int32).tolist()
