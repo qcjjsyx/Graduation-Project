@@ -140,6 +140,9 @@ def main() -> None:
     e_sizes: List[int] = []
     q_offsets: List[int] = []
     e_offsets: List[int] = []
+    tile_shapes: List[Tuple[int, int]] = []
+    clip_total = 0
+    sat_total = 0
 
     q_cursor = 0
     e_cursor = 0
@@ -147,6 +150,9 @@ def main() -> None:
         block = a_perm[start:end, start:end].toarray().astype(np.float32)
         qr = quantize_matrix(block)
         q_list, e_list = flatten_tiles(qr.q, qr.e)
+        tile_shapes.append(qr.tiles)
+        clip_total += qr.clip_count
+        sat_total += qr.sat_count
         q_offsets.append(q_cursor)
         e_offsets.append(e_cursor)
         q_bytes, e_bytes = write_front_data(front_q_path, front_e_path, q_list, e_list)
@@ -173,6 +179,10 @@ def main() -> None:
 
     manifest = {
         "total_bytes": total_bytes,
+        "quantization": {
+            "clip_count": clip_total,
+            "sat_count": sat_total,
+        },
         "nodes": {
             str(node_id): {
                 "front_q": mem_plans[node_id].front_q.__dict__,
@@ -181,7 +191,7 @@ def main() -> None:
                 "front_q_file_offset": q_offsets[node_id],
                 "front_e_file_offset": e_offsets[node_id],
                 "map_table_file_offset": map_offsets[node_id],
-                "tiles": list(quantize_matrix(a_perm[node_ranges[node_id][0]:node_ranges[node_id][1], node_ranges[node_id][0]:node_ranges[node_id][1]].toarray()).tiles),
+                "tiles": list(tile_shapes[node_id]),
             }
             for node_id in range(len(node_ranges))
         },
