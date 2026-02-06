@@ -19,7 +19,7 @@ class QuantResult:
     padded_shape: Tuple[int, int]
     tiles: Tuple[int, int]
     sat_count: int   ## 饱和计数
-    sat_total: int   ## 饱和总数
+    total_elements: int   ## 总元素数
     clip_count: int ## 裁剪计数 统计被百分位剪裁掉的数量
 
 
@@ -54,7 +54,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
     e_out = np.zeros((tiles_y, tiles_x, 4), dtype=np.int8)
 
     sat_count = 0
-    sat_total = 0
+    total_elements = 0
     clip_total = 0
     for ty in range(tiles_y):
         for tx in range(tiles_x):
@@ -71,7 +71,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
             for bi, block in enumerate(blocks):
                 q_block, e, b_sat, b_total, b_clip = _quantize_block(block) 
                 sat_count += b_sat
-                sat_total += b_total
+                total_elements += b_total
                 clip_total += b_clip
                 e_out[ty, tx, bi] = np.int8(e)
                 if bi == 0:
@@ -90,7 +90,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
         padded_shape=padded.shape, # type: ignore
         tiles=(tiles_y, tiles_x),
         sat_count=sat_count,
-        sat_total=sat_total,
+        total_elements=total_elements,
         clip_count=clip_total,
     )
 

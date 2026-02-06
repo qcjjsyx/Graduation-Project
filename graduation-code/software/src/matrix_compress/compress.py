@@ -20,14 +20,14 @@ class CompressedMatrix:
     matrix: sp.spmatrix
     blocksize: Tuple[int, int] | None = None
 
-
-def read_mat_file(path: str, key: Optional[str] = None) -> sp.csr_matrix:
-    """Load a .mat file and return a CSR sparse matrix.
+"""Load a .mat file and return a CSR sparse matrix.
 
     If key is None, the first 2D array-like entry is used.
-    """
+"""
+def read_mat_file(path: str, key: Optional[str] = None) -> sp.csr_matrix:
     data = scipy.io.loadmat(path)
     if key is not None:
+        print(f"Loading key '{key}' from .mat file")
         if key not in data:
             raise KeyError(f"Key '{key}' not found in .mat file")
         value = data[key]
@@ -42,7 +42,7 @@ def read_mat_file(path: str, key: Optional[str] = None) -> sp.csr_matrix:
 def compress_sparse(
     matrix: sp.spmatrix | np.ndarray,
     fmt: str = CompressionFormat.CSR,
-    blocksize: Tuple[int, int] = (2, 2),
+    blocksize: Tuple[int, int] = (4, 4),
 ) -> CompressedMatrix:
     """Compress a matrix into COO/CSR/BCSR format."""
     fmt = fmt.lower()
@@ -51,9 +51,9 @@ def compress_sparse(
 
     base = _to_sparse(matrix)
     if fmt == CompressionFormat.COO:
-        return CompressedMatrix(format=fmt, matrix=base.tocoo(), blocksize=None)
+        return CompressedMatrix(format=fmt, matrix=base.tocoo(), blocksize=None) # type: ignore
     if fmt == CompressionFormat.CSR:
-        return CompressedMatrix(format=fmt, matrix=base.tocsr(), blocksize=None)
+        return CompressedMatrix(format=fmt, matrix=base.tocsr(), blocksize=None) # type: ignore
 
     # BCSR -> SciPy BSR
     bsr = sp.bsr_matrix(base, blocksize=blocksize)
@@ -71,15 +71,15 @@ def decompress_sparse(
 
     matrix = compressed.matrix if isinstance(compressed, CompressedMatrix) else compressed
     if out == CompressionFormat.COO:
-        return matrix.tocoo()
-    return matrix.tocsr()
+        return matrix.tocoo() # type: ignore
+    return matrix.tocsr() # type: ignore
 
 
 def compress_mat_file(
     path: str,
     out_path: str,
     fmt: str = CompressionFormat.CSR,
-    blocksize: Tuple[int, int] = (2, 2),
+    blocksize: Tuple[int, int] = (4, 4),
     key: Optional[str] = None,
 ) -> CompressedMatrix:
     """Load a .mat file, compress it, and save to .npz."""
@@ -112,7 +112,7 @@ def _to_csr(value) -> sp.csr_matrix:
 
 def _to_sparse(matrix: sp.spmatrix | np.ndarray) -> sp.spmatrix:
     if sp.isspmatrix(matrix):
-        return matrix
+        return matrix # type: ignore
     if isinstance(matrix, np.ndarray):
         return sp.csr_matrix(matrix)
     raise TypeError("matrix must be a numpy array or scipy sparse matrix")
