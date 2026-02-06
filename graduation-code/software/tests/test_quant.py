@@ -1,6 +1,6 @@
 import numpy as np
 
-from software.quant.bfp_quant import dequantize, quantize_matrix
+from src.quant.bfp_quant import dequantize, quantize_matrix
 
 
 def test_quant_dequant_mse():

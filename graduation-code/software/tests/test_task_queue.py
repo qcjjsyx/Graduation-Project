@@ -1,4 +1,4 @@
-from software.scheduler.task_queue import sibling_friendly_order
+from src.scheduler.task_queue import sibling_friendly_order
 
 
 def test_task_queue_parent_after_children():

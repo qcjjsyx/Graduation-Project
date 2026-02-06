@@ -1,4 +1,4 @@
-from software.scheduler.map_gen import generate_map_tables
+from src.scheduler.map_gen import generate_map_tables
 
 
 def test_map_table_identity_overlap():
