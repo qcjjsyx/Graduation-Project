@@ -1,4 +1,4 @@
-from software.memory.pack import pack_exponents, unpack_exponents
+from src.memory.pack import pack_exponents, unpack_exponents
 
 
 def test_pack_unpack_exponents():

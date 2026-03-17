@@ -10,15 +10,15 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import scipy.io
 
-from software.io import NodeTask, write_front_data, write_manifest, write_map_table, write_tasks
-from software.memory.planner import plan_memory
-from software.quant.bfp_quant import dequantize, flatten_tiles, quantize_matrix
-from software.scheduler.map_gen import generate_map_tables
-from software.scheduler.task_queue import sibling_friendly_order
-from software.symbolic.etree import children_from_parent, elimination_tree
-from software.symbolic.reorder import apply_permutation, reorder_rcm
-from software.symbolic.supernode import build_supernodes
-from software.verify.metrics import residual_norm
+from src.io import NodeTask, write_front_data, write_manifest, write_map_table, write_tasks
+from src.memory.planner import plan_memory
+from src.quant.bfp_quant import dequantize, flatten_tiles, quantize_matrix
+from src.scheduler.map_gen import generate_map_tables
+from src.scheduler.task_queue import sibling_friendly_order
+from src.symbolic.etree import children_from_parent, elimination_tree
+from src.symbolic.reorder import apply_permutation, reorder_rcm
+from src.symbolic.supernode import build_supernodes
+from src.verify.metrics import residual_norm
 
 
 def _load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_matrix:
@@ -26,7 +26,7 @@ def _load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_
         # Check if file is .mat format
         if path.endswith('.mat'):
             try:
-                from matrix_compress.compress import read_mat_file
+                from src.matrix_compress.compress import read_mat_file
                 a = read_mat_file(path)
                 if a.shape[0] != a.shape[1]:
                     raise ValueError("Matrix must be square")

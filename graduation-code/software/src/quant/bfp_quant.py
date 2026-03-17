@@ -19,15 +19,16 @@ class QuantResult:
     padded_shape: Tuple[int, int]
     tiles: Tuple[int, int]
     sat_count: int   ## 饱和计数
-    sat_total: int   ## 饱和总数
+    total_elements: int   ## 总元素数
+    clip_count: int ## 裁剪计数 统计被百分位剪裁掉的数量
 
 
-def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
+def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
     if x.size == 0:
-        return x.astype(np.int32), 0, 0, 0
+        return x.astype(np.int32), 0, 0, 0, 0
     a = np.percentile(np.abs(x), 99.5)  ## 99.5% 分位数 有待商榷，根据具体例子调整
     if a == 0:
-        return np.zeros_like(x, dtype=np.int32), 0, 0, x.size, 
+        return np.zeros_like(x, dtype=np.int32), 0, 0, x.size, 0
     clip_count = int(np.count_nonzero(np.abs(x) > a))
     e = int(np.ceil(np.log2(a / Q_MAX)))
     x_c = np.clip(x, -a, a)
@@ -36,7 +37,7 @@ def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int]:
         e -= 1
         q = np.clip(np.round(x_c / (2 ** e)), -Q_MAX, Q_MAX).astype(np.int32)
     sat_count = int(np.count_nonzero(np.abs(q) == Q_MAX))
-    return q, e, sat_count, x.size
+    return q, e, sat_count, x.size, clip_count
 
 '''
 量化一个矩阵, 返回量化后的结果, 指数矩阵, 饱和计数, 总元素数
@@ -53,7 +54,7 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
     e_out = np.zeros((tiles_y, tiles_x, 4), dtype=np.int8)
 
     sat_count = 0
-    sat_total = 0
+    total_elements = 0
     clip_total = 0
     for ty in range(tiles_y):
         for tx in range(tiles_x):
@@ -68,9 +69,9 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
                 tile[SUB:TILE, SUB:TILE],
             ]
             for bi, block in enumerate(blocks):
-                q_block, e, b_sat, b_total, b_clip = _quantize_block(block) # type: ignore
+                q_block, e, b_sat, b_total, b_clip = _quantize_block(block) 
                 sat_count += b_sat
-                sat_total += b_total
+                total_elements += b_total
                 clip_total += b_clip
                 e_out[ty, tx, bi] = np.int8(e)
                 if bi == 0:
@@ -89,7 +90,8 @@ def quantize_matrix(x: np.ndarray) -> QuantResult:
         padded_shape=padded.shape, # type: ignore
         tiles=(tiles_y, tiles_x),
         sat_count=sat_count,
-        sat_total=sat_total,
+        total_elements=total_elements,
+        clip_count=clip_total,
     )
 
 '''

@@ -1,4 +1,4 @@
-from software.memory.planner import plan_memory
+from src.memory.planner import plan_memory
 
 
 def test_memory_planner_non_overlap():
