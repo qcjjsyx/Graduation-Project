@@ -2,7 +2,8 @@
  * 
  * This module is a placeholder for the ATU (Address Translation Unit) functionality.
  * 这是同步版本的ATU模块。
- * 
+ * 20260305 该模块是需要修改的，最后应当作为访问DDR的地址转换单元，提供行号映射功能。应当与DDR 控制器配合使用，提供行号转换服务。
+ * 目前未修改
  */
 
 module ATU #(
