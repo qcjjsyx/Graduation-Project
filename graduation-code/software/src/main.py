@@ -28,7 +28,7 @@ def _load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_
             try:
                 from src.matrix_compress.compress import read_mat_file
                 a = read_mat_file(path)
-                if a.shape[0] != a.shape[1]:
+                if a.shape[0] != a.shape[1]:  # pyright: ignore[reportOptionalSubscript]
                     raise ValueError("Matrix must be square")
                 return a
             except ImportError:
@@ -37,18 +37,18 @@ def _load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_
                 for key, value in a.items():
                     if isinstance(value, np.ndarray) and value.ndim == 2:
                         a = sp.csr_matrix(value)
-                        if a.shape[0] != a.shape[1]:
+                        if a.shape[0] != a.shape[1]: # type: ignore
                             raise ValueError("Matrix must be square")
                         return a
                 raise ValueError("No matrix found in .mat file")
         else:
             # Load MatrixMarket format
-            a = scipy.io.mmread(path).tocsr()
-            if a.shape[0] != a.shape[1]:
+            a = scipy.io.mmread(path).tocsr() # type: ignore
+            if a.shape[0] != a.shape[1]: # type: ignore
                 raise ValueError("Matrix must be square")
-            return a
+            return a # type: ignore
     rng = np.random.default_rng(seed)
-    r = sp.random(n, n, density=density, format="csr", random_state=rng)
+    r = sp.random(n, n, density=density, format="csr", random_state=rng) # type: ignore
     a = r + r.T
     a = a + sp.eye(n, format="csr") * n
     return a
@@ -114,7 +114,7 @@ def main() -> None:
     a = _load_matrix(args.mtx, args.n, args.density, args.seed)
 
     perm = reorder_rcm(a)
-    a_perm = apply_permutation(a, perm)
+    a_perm = apply_permutation(a, perm) # type: ignore
 
     etree = elimination_tree(a_perm)
     supernodes = build_supernodes(etree)
@@ -147,7 +147,7 @@ def main() -> None:
     q_cursor = 0
     e_cursor = 0
     for node_id, (start, end) in enumerate(node_ranges):
-        block = a_perm[start:end, start:end].toarray().astype(np.float32)
+        block = a_perm[start:end, start:end].toarray().astype(np.float32) # type: ignore
         qr = quantize_matrix(block)
         q_list, e_list = flatten_tiles(qr.q, qr.e)
         tile_shapes.append(qr.tiles)
@@ -201,8 +201,8 @@ def main() -> None:
 
     # Verification
     b = np.ones(a_perm.shape[0], dtype=np.float32)
-    x = spla.spsolve(a_perm.tocsr(), b)
-    res = residual_norm(a_perm, x, b)
+    x = spla.spsolve(a_perm.tocsr(), b) # type: ignore
+    res = residual_norm(a_perm, x, b) # type: ignore
     print(f"residual_norm: {res:.3e}")
 
 
