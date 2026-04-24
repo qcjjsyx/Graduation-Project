@@ -38,6 +38,48 @@
 * 写回 L/U 因子到 DDR（factor_writer）
 * 当前节点执行完成后，生成面向父节点的 update payload，并写入独立 update 区；父节点进入执行前，再由 front_loader / assembly 路径结合本地贡献与所有子节点 update 完成装配，并确定该父节点的 node-scale
 
+### 2.1.1
+
+父节点进入执行前，不直接使用软件侧预装配好的统一 front，而是由硬件侧根据本地贡献 `A_local` 与所有子节点 update payload 完成装配，并在装配完成后决定该父节点的统一 `node-scale`。
+
+为此，区分三类数值格式：
+
+1. **S_format（assembly 输入格式）**
+
+   $$
+   x\approx q_x \cdot 2^{e_s}
+   $$
+
+   其中：
+   \- `q_x` 为 int32 mantissa
+   \- `e_s` 为 source 自带指数
+   \- source 可以是：
+   \- 当前节点本地贡献 `A_local`
+   \- 某个子节点 update payload
+2. **M_format（node 内矩阵值格式）**
+   $x \approx q_x \cdot 2^{e_n}$
+   其中：
+   \- `e_n` 为当前 node 的统一指数
+   \- node 执行期间 `e_n` 固定
+3. **QF_format（乘子格式）**
+   $l \approx \frac{m}{2^F}$
+   用于 node 内 LU / TRSM 中的乘子表示。
+
+父节点装配流程如下：
+
+1. `dep_scoreboard` 判断所有子节点 update 已就绪，允许父节点进入装配阶段；
+2. `front_loader` 先读取本地贡献和各 child update 的 exponent metadata；
+3. 确定统一装配参考指数 `e_asm`；
+4. 各 source 按 `e_asm` 做指数对齐后，通过 `map_table` 在线装配到 assembly buffer；
+5. 在 assembly buffer 中统计 `maxabs_acc`；
+6. 装配完成后根据 `maxabs_acc` 决定最终 node-scale `e_n`；
+7. 将 assembly buffer 重新量化写入 front SRAM，得到 node 内执行所需的 `M_format` 数据。
+
+当前原型版建议使用：
+$e_{asm} = \max(e_{local}, e_{child,1}, e_{child,2}, \dots)$
+
+该方案实现简单，但可能导致较小 source 在右移对齐时丢失。因此测试使用的矩阵会性质比较良好
+
 ### 2.2 依赖与预取风险（父子数据冒险）
 
 若父节点任务被预取到 Buffer B，而子节点 update 尚未写回父节点区域，则父节点使用过期数据。
@@ -46,6 +88,26 @@
 
 * **软件侧** ：任务队列排序（sibling scheduling）尽量插入无依赖节点填充空隙
 * **硬件侧** ：dep_scoreboard 维护 `pending_children`，仅当父节点 `front_ready` 才允许 task_fetch 发射与 buffer_mgr 预取
+
+### 2.3 轻量级 ready-task 选择（机会发现）
+
+当前系统中，`dep_scoreboard` 首先保证任务发射的正确性：只有当 `pending_children = 0` 且 `front_ready = 1` 时，节点才进入 ready 集合。
+
+在此基础上，为了提高双缓冲下预取与计算的重叠概率，引入轻量级 ready-task selector。其目标不是做全局最优调度，而是在多个合法可发节点中，优先选择当前更适合预取的节点。
+
+当前原型版采用简单启发式：
+
+1. 优先选择 `front_size_class` 与当前计算窗口更匹配的节点；
+2. 若接近，则优先选择 `critical_level` 更高的节点；
+3. 若仍接近，则优先选择 `child_update_count` 更小、assembly 成本更低的节点。
+
+其中，以下字段由软件侧在 `Node_Task` 中预先给出：
+
+- `front_size_class`
+- `critical_level`
+- `child_update_count`
+
+该机制的定位是“在正确性 gating 之上增加轻量机会发现”，不宣称全局最优，也不直接承诺整体性能一定提升。
 
 ---
 
@@ -56,7 +118,10 @@
 * **GCU（Global Control Unit）**
 
   * `task_fetch`：从 DDR 读取 `Node_Task` 描述符，做 decode
-  * `dep_scoreboard`：依赖记分牌（pending_children / front_ready）
+  * `dep_scoreboard`：
+    - 维护 `pending_children / front_ready`
+    - 仅当父节点依赖满足时，允许其进入 ready 集合
+    - 向 `task_fetch / buffer_mgr` 输出 ready 节点集合，供轻量级任务选择器进一步决定“先发谁”
   * `buffer_mgr`：双缓冲管理，状态机（IDLE/LOAD/READY/PROC/WB），逻辑上对节点进行一个宏观的管理，包括加载数据，可以开始计算，确定更新矩阵写回等任务。
   * `micro_scheduler`：节点内调度，驱动 SFU/HPU/ATU/矩阵核协作，完成节点对应的frontal matrix的全部计算
 * **ATU（地址变化单元）**
@@ -75,8 +140,13 @@
   * signed `+ - *`：用于 Schur 更新 GEMM 等高吞吐部分
 * **辅助模块**
 
-  * `dma_front_loader`：frontal 数据预取到buffer
-  * `scatter_engine`：update 写更新区；父节点装配时统一确定 node-scale
+  * `dma_front_loader`：
+    - 读取 parent node 的本地贡献与 child update payload
+    - 预读 exponent metadata
+    - 配合 assembly 单元完成多 source 在线装配
+    - 统计 assembly buffer 的 `maxabs`
+    - 根据 `node-scale` 对装配结果重新量化并写入 front SRAM
+  * `update_writer`：update 写更新区；
   * `dma_factor_writer`：写回 L/U
   * 其他一些必要的辅助模块，目前还没有确定
 
@@ -93,31 +163,48 @@
 * elimination tree构建
 * supernode (超节点，目前限制最大为256*256)形成
 
-3. **任务生成（Node_Task）** ：
+3. **任务生成（Node_Task）** ：`Node_Task` 除 front 尺寸、地址、映射等必要字段外，还需要补充以下元数据：
+
+   - `front_size_class`：当前 node 前沿矩阵规模类别，用于轻量调度
+   - `critical_level`：节点关键级别，用于 ready-task 选择
+   - `child_update_count`：子节点 update 数量，用于粗略估计 assembly 成本
+   - `e_local` 或本地贡献 exponent metadata 地址
+   - child update descriptor / exponent metadata 地址
 4. **map_table 生成（extend-add 映射）**
 
    确定子节点的更新矩阵应该加到父节点的哪一行/列中
 5. **任务队列排序（sibling scheduling）** ：避免父子相邻导致预取风险
 6. **内存规划与序列化（ABI）** ：
-7. **初始化数值装配** ：
+7. **初始化本地贡献准备** ：
 
-* 将原矩阵 A 的本地贡献填入各 node 的 frontal 初值
+* 根据 symbolic 结果提取每个 node 对应的 `A_local`
+* 对 `A_local` 进行预量化，得到 `(q_local, e_local)`，作为 assembly 输入格式 `S_format`
+* 将其与 `map_table`、`Node_Task` 一起下发到板端 DDR
 
 8. **验证与指标** ：
 
 * residual、相对误差、sat_count/裁剪统计
 
-9. **迭代求精**
+9. **迭代求精**：在硬件侧完成低精度/整数化 LU 分解后，利用硬件中已有的量化 `L/U` 作为近似因子，在软件侧执行迭代求精闭环：
 
-* iterative refinement 框架（残差、停止条件、更新）
-* 可作为“低精度 LU 的可靠性兜底”展示点
+   - 将量化后的右端项 `b` 送入硬件，利用已有 `L/U` 做前代/回代，得到初始近似解 `x_0`；
+   - 软件侧使用真实高精度 `A` 与 `b` 计算残差：$r_k = b - A x_k$  ;
+   - 对残差单独确定 residual-scale `e_{r,k}`，量化后重新送入硬件；
+   - 硬件利用已有 `L/U` 解修正方程，得到 correction `d_k`；
+   - 软件侧以较高精度更新：$x_{k+1} = x_k + d_k$
+   - 根据 residual 范数、更新量大小和最大迭代次数决定是否停止。
+
+   该模块的定位是：
+
+   - 作为低精度 LU 的可靠性兜底；
+   - 展示在无浮点矩阵核条件下，低精度分解结果仍可通过软件辅助提高最终解精度
 
 ---
 
 ## 5. 后续工作
 
-1. **软件侧闭环** ：symbolic → tasks/map_table → 初始化量化 → 生成二进制 → Python 参考验证 但目前缺少例子，等待物理院回应
-2. **硬件调度闭环** ：dep_scoreboard + buffer_mgr + task_fetch + micro_scheduler 联动跑通，暂时不需要具体计算
-3. **extend-add 正确性** ：scatter 写回父节点与依赖释放逻辑正确
-4. **迭代求精** ：展示低精度可用性增强
-5. 需要进一步明确父节点 assembly 阶段对多个 child update（各自携带 `e_child`）的装配、对齐与新 node-scale 确定流程，以及 Node_Task / ABI 对该流程的支持方式
+1. **软件侧闭环** ：symbolic → tasks/map_table → `A_local` 预量化 → 生成二进制 → Python 参考验证 → 板端数据下发
+2. **硬件调度闭环** ：dep_scoreboard + ready-task selector + buffer_mgr + task_fetch + micro_scheduler 联动跑通
+3. **assembly 正确性** ：验证多指数 source 的在线对齐装配、`e_asm` 决定、`node-scale` 重定标和 front SRAM 写入流程
+4. **迭代求精** ：验证在已有量化 `L/U` 基础上的 software-assisted refinement 是否能改善 residual 与最终解精度
+5. **风险评估** ：统计 `align_drop_count`、`asm_overflow_count`、`requant_sat_count`、迭代求精中的 residual stagnation 情况
