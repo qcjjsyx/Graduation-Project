@@ -57,6 +57,7 @@ class AssemblyStats:
 
 @dataclass
 class OperationLogEntry:
+    ### 记录硬件模型中单次算子事件
     op_type: str
     tile_i: int
     tile_j: int
