@@ -1,10 +1,5 @@
 import numpy as np
 import scipy.linalg
-'''
-16*16 -> 256*256 的分块三角求解 (Blocked TSOLVE) 调度示例
-100352个周期
-'''
-
 
 class HardwareArray16x16:
     def __init__(self):
@@ -44,8 +39,8 @@ class HardwareArray16x16:
         self.total_cycles += 256
         # 使用 scipy 模拟硬件计算出 P, L, U。
         # (注：Spatula 采用静态主元，这里我们通过构建强对角占优矩阵，确保 P=I)
-        L, U = scipy.linalg.lu(A_tile)[:2]
-        return L, U
+        P, L, U = scipy.linalg.lu(A_tile) # type: ignore
+        return P,L, U
     def run_tsolve_right(self, A_tile, U_tile):
         """
         任务 4: tsolve (右侧三角求解，用于求 L_tile)
@@ -54,6 +49,25 @@ class HardwareArray16x16:
         """
         self.total_cycles += 32
         return np.linalg.solve(U_tile.T, A_tile.T).T
+    
+    def apply_block_row_permutation(self, A, i_start, P_tile, L=None):
+        """
+        将对角块的局部置换 P_tile 应用于整个矩阵 A 的对应行区间（就地）。
+        同时可选地把置换应用到 L 的前 i 列（L[:, :i_start]），保持 L 与行交换一致。
+        增加一个简单的周期估算（按移动元素数量计）。
+        """
+        i_end = i_start + self.dim
+        # 元素移动量估算
+        num_elements_moved = self.dim * A.shape[1]
+        self.total_cycles += num_elements_moved // 16  # 简化估算，按带宽/并行度折算
+        # 应用到 A 的所有列（行置换）
+        A[i_start:i_end, :] = P_tile @ A[i_start:i_end, :]
+        # 如果传入 L，交换 L 的已完成列（0:i_start）
+        if L is not None and i_start > 0:
+            L[i_start:i_end, :i_start] = P_tile @ L[i_start:i_end, :i_start]
+
+
+
 
 def blocked_tsolve_256(L, B):
     """
@@ -130,6 +144,8 @@ def blocked_lu_256(A):
     # 初始化用于存储结果的 L 和 U 矩阵 (为了直观，我们分开存储，实际硬件可原地更新 A)
     L = np.zeros((N, N))
     U = np.zeros((N, N))
+
+    p = np.arange(N) # 全局行索引，用于模拟行交换
     
     # 按照块的对角线进行迭代 (0 到 15)
     for i in range(blocks):
@@ -139,8 +155,17 @@ def blocked_lu_256(A):
         # 步骤 1: 对角线块分解 (dlu)
         # ----------------------------------------------------
         A_ii = A[i_start:i_end, i_start:i_end]
-        L_ii, U_ii = hw.run_dlu(A_ii)
-        
+        P_ii, L_ii, U_ii = hw.run_dlu(A_ii) # type: ignore
+        hw.apply_block_row_permutation(A, i_start, P_ii, L) # 将局部置换应用到 A 和 L
+
+         # 3) 更新全局置换向量 p（block 内按 P_ii 重排）
+        # P_ii 的行 r 上 1 的列索引表示 new_row r 来自 old_row col
+        local_perm = np.argmax(P_ii, axis=1)  # length T
+        old_block_p = p[i_start:i_end].copy()
+        p[i_start:i_end] = old_block_p[local_perm]
+
+
+
         L[i_start:i_end, i_start:i_end] = L_ii
         U[i_start:i_end, i_start:i_end] = U_ii
         
@@ -174,24 +199,24 @@ def blocked_lu_256(A):
                 # 更新 A_kj
                 A[k_start:k_end, j_start:j_end] = hw.run_gemm(L_ki, U_ij, A_kj)
 
-    return L, U, hw.total_cycles
+    return p, L, U, hw.total_cycles
 
 # --- 验证测试 ---
 if __name__ == "__main__":
-    # N = 256
-    # # 构造下三角矩阵和右侧矩阵
-    # L_256 = np.tril(np.random.rand(N, N) + 1.0)
-    # B_256 = np.random.rand(N, N)
+    N = 256
+    # 构造下三角矩阵和右侧矩阵
+    L_256 = np.tril(np.random.rand(N, N) + 1.0)
+    B_256 = np.random.rand(N, N)
     
-    # # 硬件调度求解
-    # D_hw, total_hw_cycles = blocked_tsolve_256(L_256, B_256)
+    # 硬件调度求解
+    D_hw, total_hw_cycles = blocked_tsolve_256(L_256, B_256)
     
-    # # 纯软件求解 (黄金参考)
-    # D_sw = np.linalg.solve(L_256, B_256)
+    # 纯软件求解 (黄金参考)
+    D_sw = np.linalg.solve(L_256, B_256)
     
-    # print(f"逻辑矩阵维度: {N}x{N}, 物理阵列维度: 16x16")
-    # print(f"模拟硬件执行总周期数: {total_hw_cycles} Cycles")
-    # print(f"最大误差 (Max Error): {np.max(np.abs(D_hw - D_sw)):.5e}")
+    print(f"逻辑矩阵维度: {N}x{N}, 物理阵列维度: 16x16")
+    print(f"模拟硬件执行总周期数: {total_hw_cycles} Cycles")
+    print(f"最大误差 (Max Error): {np.max(np.abs(D_hw - D_sw)):.5e}")
     N = 256
     # 构造上三角矩阵和右侧矩阵
     # 右三角回代对对角元很敏感，这里需要强对角占优，否则病态会把误差放大很多倍
@@ -205,27 +230,29 @@ if __name__ == "__main__":
     print(f"模拟硬件执行总周期数: {total_hw_cycles} Cycles")
     print(f"最大误差 (Max Error): {np.max(np.abs(D_hw - D_sw)):.5e}")
 
-    # N = 256
-    # print(f"开始验证 {N}x{N} 分块 LU 分解 (硬件阵列 16x16)...")
+    N = 256
+    print(f"开始验证 {N}x{N} 分块 LU 分解 (硬件阵列 16x16)...")
     
-    # # 构造测试矩阵 (强对角占优以保证无需动态选主元)
-    # A_sw = np.random.rand(N, N)
-    # A_sw += np.eye(N) * N 
+    # 构造测试矩阵 (强对角占优以保证无需动态选主元)
+    A_sw = np.random.rand(N, N)
+    A_sw += np.eye(N) * N 
     
-    # A_hw = np.copy(A_sw)
+    A_hw = np.copy(A_sw)
     
-    # # 1. 调用硬件调度模拟器
-    # L_hw, U_hw, total_hw_cycles = blocked_lu_256(A_hw)
+    # 1. 调用硬件调度模拟器
+    p_hw, L_hw, U_hw, total_hw_cycles = blocked_lu_256(A_hw)
     
-    # # 2. 软件参考实现 (Scipy)
-    # L_sw, U_sw = scipy.linalg.lu(A_sw)[:2] # type: ignore
+    # 2. 软件参考实现 (Scipy)
+    L_sw, U_sw = scipy.linalg.lu(A_sw)[:2] # type: ignore
     
-    # # 3. 结果验证：L * U 是否能还原出原始矩阵 A
-    # A_reconstructed = np.dot(L_hw, U_hw)
-    # max_error = np.max(np.abs(A_reconstructed - A_sw))
+    # 3. 结果验证：L * U 是否能还原出原始矩阵 A
+    A_reconstructed = np.dot(L_hw, U_hw)
+    max_error = np.max(np.abs(A_reconstructed - A_sw))
     
-    # print("-" * 40)
-    # print(f"阵列计算总周期数 (理论估算): {total_hw_cycles} Cycles")
-    # print(f"重构矩阵最大误差 (Max Error): {max_error:.5e}")
-    # if max_error < 1e-10:
-    #     print("-> 验证通过：软硬件控制流一致！")
+    print("-" * 40)
+    print(f"阵列计算总周期数 (理论估算): {total_hw_cycles} Cycles")
+    print(f"重构矩阵最大误差 (Max Error): {max_error:.5e}")
+    if max_error < 1e-10:
+        print("-> 验证通过：软硬件控制流一致！")
+
+    
