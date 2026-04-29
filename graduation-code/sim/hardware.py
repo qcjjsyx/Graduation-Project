@@ -477,12 +477,14 @@ class HardwareSystem:
         y = np.zeros(n, dtype=np.int64)
         x = np.zeros(n, dtype=np.int64)
 
+        ### Ly = rhs
         for i in range(n):
             mac = 0
             for j in range(i):
                 mac += int(l_int[i, j]) * int(y[j])
             y[i] = int(rhs_int[i]) - self.quantizer.round_shift_value(mac, f)
-
+        
+        ### Ux = y
         for i in range(n - 1, -1, -1):
             mac = 0
             for j in range(i + 1, n):
