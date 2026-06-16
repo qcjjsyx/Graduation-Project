@@ -1,128 +1,224 @@
 from __future__ import annotations
 
+"""Quantization contract between the software pipeline and hardware.
+
+Software-owned work:
+- run symbolic analysis, build each node's front, and extract the local original
+  matrix contribution A_local;
+- quantize each A_local into S_format mantissa/exponent pairs;
+- write those pairs and metadata into DDR-facing binary artifacts.
+
+Hardware-owned work:
+- assemble A_local sources and child updates into the node front;
+- choose the final node-scale after assembly;
+- execute integer panel LU/TRSM/GEMM and generate child update payloads.
+
+The assembly helpers in this module are reference models for validation only.
+They do not mean the software pipeline is responsible for doing integer LU or
+producing numeric child updates.
+"""
+
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Sequence
 
 import numpy as np
 
-TILE = 32
-SUB = 16
-B_EFF = 24
-Q_MAX = 2 ** (B_EFF - 1) - 1
+from src.config import QuantConfig
 
 
-@dataclass
-class QuantResult:
-    q: np.ndarray
-    e: np.ndarray
-    orig_shape: Tuple[int, int]
-    padded_shape: Tuple[int, int]
-    tiles: Tuple[int, int]
-    sat_count: int   ## 饱和计数
-    total_elements: int   ## 总元素数
-    clip_count: int ## 裁剪计数 统计被百分位剪裁掉的数量
+@dataclass(frozen=True)
+class QuantizationStats:
+    total_elements: int
+    clip_count: int
+    sat_count: int
+    max_abs: float
+    clip_bound: float
+    q_limit: int
 
 
-def _quantize_block(x: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
-    if x.size == 0:
-        return x.astype(np.int32), 0, 0, 0, 0
-    a = np.percentile(np.abs(x), 99.5)  ## 99.5% 分位数 有待商榷，根据具体例子调整
-    if a == 0:
-        return np.zeros_like(x, dtype=np.int32), 0, 0, x.size, 0
-    clip_count = int(np.count_nonzero(np.abs(x) > a))
-    e = int(np.ceil(np.log2(a / Q_MAX)))
-    x_c = np.clip(x, -a, a)
-    q = np.clip(np.round(x_c / (2 ** e)), -Q_MAX, Q_MAX).astype(np.int32)
-    if np.count_nonzero(np.abs(q) >= 2) / q.size < 0.05:
-        e -= 1
-        q = np.clip(np.round(x_c / (2 ** e)), -Q_MAX, Q_MAX).astype(np.int32)
-    sat_count = int(np.count_nonzero(np.abs(q) == Q_MAX))
-    return q, e, sat_count, x.size, clip_count
+@dataclass(frozen=True)
+class QuantizedSource:
+    """DDR S_format source consumed by hardware front assembly.
 
-'''
-量化一个矩阵, 返回量化后的结果, 指数矩阵, 饱和计数, 总元素数
-'''
-def quantize_matrix(x: np.ndarray) -> QuantResult:
-    h, w = x.shape
-    h_pad = (TILE - h % TILE) % TILE
-    w_pad = (TILE - w % TILE) % TILE
-    padded = np.pad(x, ((0, h_pad), (0, w_pad)), mode="constant") ## 填充为32的整数倍
-    tiles_y = padded.shape[0] // TILE
-    tiles_x = padded.shape[1] // TILE
+    Values are represented as mantissa * 2**exponent. The pipeline uses this
+    for each node's local frontal contribution A_local.
+    """
 
-    q_out = np.zeros_like(padded, dtype=np.int32)
-    e_out = np.zeros((tiles_y, tiles_x, 4), dtype=np.int8)
+    mantissa: np.ndarray
+    exponent: int
+    shape: tuple[int, int]
+    stats: QuantizationStats
 
-    sat_count = 0
-    total_elements = 0
-    clip_total = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            y0 = ty * TILE
-            x0 = tx * TILE
-            tile = padded[y0 : y0 + TILE, x0 : x0 + TILE]
-            # 4 sub-blocks: (00,01,10,11)
-            blocks = [
-                tile[0:SUB, 0:SUB],
-                tile[0:SUB, SUB:TILE],
-                tile[SUB:TILE, 0:SUB],
-                tile[SUB:TILE, SUB:TILE],
-            ]
-            for bi, block in enumerate(blocks):
-                q_block, e, b_sat, b_total, b_clip = _quantize_block(block) 
-                sat_count += b_sat
-                total_elements += b_total
-                clip_total += b_clip
-                e_out[ty, tx, bi] = np.int8(e)
-                if bi == 0:
-                    q_out[y0 : y0 + SUB, x0 : x0 + SUB] = q_block
-                elif bi == 1:
-                    q_out[y0 : y0 + SUB, x0 + SUB : x0 + TILE] = q_block
-                elif bi == 2:
-                    q_out[y0 + SUB : y0 + TILE, x0 : x0 + SUB] = q_block
-                else:
-                    q_out[y0 + SUB : y0 + TILE, x0 + SUB : x0 + TILE] = q_block
 
-    return QuantResult(
-        q=q_out,
-        e=e_out,
-        orig_shape=(h, w),
-        padded_shape=padded.shape, # type: ignore
-        tiles=(tiles_y, tiles_x),
-        sat_count=sat_count,
-        total_elements=total_elements,
-        clip_count=clip_total,
+@dataclass(frozen=True)
+class AssemblyStats:
+    source_count: int
+    assembly_exponent: int
+    node_exponent: int
+    align_shift_max: int
+    align_drop_count: int
+    requant_sat_count: int
+
+
+@dataclass(frozen=True)
+class AssemblyResult:
+    mantissa: np.ndarray
+    exponent: int
+    accumulator: np.ndarray
+    stats: AssemblyStats
+
+
+def quant_limit(effective_bits: int) -> int:
+    if not 1 <= effective_bits <= 30:
+        raise ValueError(f"effective_bits must be in [1, 30], got {effective_bits}")
+    return (1 << effective_bits) - 1
+
+
+def quantize_local_contribution(
+    values: np.ndarray,
+    config: QuantConfig | None = None,
+) -> QuantizedSource:
+    """Quantize one node's local frontal contribution into S_format."""
+    config = config or QuantConfig()
+    matrix = _as_2d_float(values)
+    q_limit = quant_limit(config.effective_bits)
+    max_abs = float(np.max(np.abs(matrix))) if matrix.size else 0.0
+    clip_bound = _clip_bound(matrix, config.clip_percentile)
+
+    if clip_bound == 0.0:
+        mantissa = np.zeros(matrix.shape, dtype=np.int32)
+        exponent = 0
+        clip_count = 0
+        sat_count = 0
+    else:
+        exponent = _scale_exponent(clip_bound, q_limit)
+        clipped = np.clip(matrix, -clip_bound, clip_bound)
+        scaled = np.rint(clipped / np.ldexp(1.0, exponent))
+        mantissa = np.clip(scaled, -q_limit, q_limit).astype(np.int32)
+        clip_count = int(np.count_nonzero(np.abs(matrix) > clip_bound))
+        sat_count = int(np.count_nonzero(np.abs(mantissa) == q_limit))
+
+    return QuantizedSource(
+        mantissa=mantissa,
+        exponent=exponent,
+        shape=tuple(int(dim) for dim in matrix.shape),
+        stats=QuantizationStats(
+            total_elements=int(matrix.size),
+            clip_count=clip_count,
+            sat_count=sat_count,
+            max_abs=max_abs,
+            clip_bound=clip_bound,
+            q_limit=q_limit,
+        ),
     )
 
-'''
-反量化一个矩阵, 返回反量化后的结果
-'''
-def dequantize(q: np.ndarray, e: np.ndarray) -> np.ndarray:
-    tiles_y, tiles_x, _ = e.shape
-    out = np.zeros_like(q, dtype=np.float32)
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            y0 = ty * TILE
-            x0 = tx * TILE
-            exps = e[ty, tx]
-            blocks = [
-                (slice(0, SUB), slice(0, SUB)),
-                (slice(0, SUB), slice(SUB, TILE)),
-                (slice(SUB, TILE), slice(0, SUB)),
-                (slice(SUB, TILE), slice(SUB, TILE)),
-            ]
-            for bi, (ys, xs) in enumerate(blocks):
-                ys_abs = slice(y0 + ys.start, y0 + ys.stop)
-                xs_abs = slice(x0 + xs.start, x0 + xs.stop)
-                block = q[ys_abs, xs_abs].astype(np.float32) # type: ignore
-                out[ys_abs, xs_abs] = block * (2 ** int(exps[bi])) # type: ignore
-    return out
 
-'''
-将量化后的矩阵和指数矩阵展平为行优先的整数列表，用于二进制输出
-'''
-def flatten_tiles(q: np.ndarray, e: np.ndarray) -> Tuple[List[int], List[int]]:
-    """Flatten tiles to row-major lists for binary output."""
-    q_list = q.flatten().astype(np.int32).tolist()
-    e_list = e.flatten().astype(np.int8).tolist()
-    return q_list, e_list
+def dequantize_source(source: QuantizedSource) -> np.ndarray:
+    return source.mantissa.astype(np.float64) * np.ldexp(1.0, source.exponent)
+
+
+def flatten_quantized_source(source: QuantizedSource) -> tuple[list[int], list[int]]:
+    q_values = source.mantissa.reshape(-1).astype(np.int32).tolist()
+    return q_values, [int(source.exponent)]
+
+
+def assemble_sources(
+    sources: Sequence[QuantizedSource],
+    config: QuantConfig | None = None,
+) -> AssemblyResult:
+    """Reference model for hardware online assembly and node-scale requantization."""
+    if not sources:
+        raise ValueError("at least one source is required")
+    config = config or QuantConfig()
+    shape = sources[0].shape
+    if any(source.shape != shape for source in sources):
+        raise ValueError("all sources must have the same shape")
+
+    assembly_exponent = max(source.exponent for source in sources)
+    accumulator = np.zeros(shape, dtype=np.int64)
+    align_shift_max = 0
+    align_drop_count = 0
+
+    for source in sources:
+        shift = assembly_exponent - source.exponent
+        align_shift_max = max(align_shift_max, shift)
+        aligned = round_shift(source.mantissa.astype(np.int64), shift)
+        align_drop_count += int(
+            np.count_nonzero((source.mantissa != 0) & (aligned == 0))
+        )
+        accumulator += aligned
+
+    node_mantissa, node_exponent, sat_count = requantize_accumulator(
+        accumulator,
+        assembly_exponent,
+        config,
+    )
+
+    return AssemblyResult(
+        mantissa=node_mantissa,
+        exponent=node_exponent,
+        accumulator=accumulator,
+        stats=AssemblyStats(
+            source_count=len(sources),
+            assembly_exponent=assembly_exponent,
+            node_exponent=node_exponent,
+            align_shift_max=align_shift_max,
+            align_drop_count=align_drop_count,
+            requant_sat_count=sat_count,
+        ),
+    )
+
+
+def requantize_accumulator(
+    accumulator: np.ndarray,
+    assembly_exponent: int,
+    config: QuantConfig | None = None,
+) -> tuple[np.ndarray, int, int]:
+    config = config or QuantConfig()
+    q_limit = quant_limit(config.effective_bits)
+    max_abs = int(np.max(np.abs(accumulator))) if accumulator.size else 0
+    if max_abs == 0:
+        return np.zeros(accumulator.shape, dtype=np.int32), assembly_exponent, 0
+
+    node_exponent = assembly_exponent + _scale_exponent(float(max_abs), q_limit)
+    shift = node_exponent - assembly_exponent
+    mantissa = round_shift(accumulator.astype(np.int64), shift)
+    mantissa = np.clip(mantissa, -q_limit, q_limit).astype(np.int32)
+    sat_count = int(np.count_nonzero(np.abs(mantissa) == q_limit))
+    return mantissa, node_exponent, sat_count
+
+
+def round_shift(values: np.ndarray, shift: int) -> np.ndarray:
+    """Round signed integers while shifting right; negative shift means left shift."""
+    arr = np.asarray(values, dtype=np.int64)
+    if shift == 0:
+        return arr.copy()
+    if shift < 0:
+        return arr << abs(shift)
+
+    offset = np.int64(1 << (shift - 1))
+    positive = arr >= 0
+    rounded_abs = (np.abs(arr) + offset) >> shift
+    return np.where(positive, rounded_abs, -rounded_abs).astype(np.int64)
+
+
+def _as_2d_float(values: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim != 2:
+        raise ValueError(f"values must be a 2D matrix, got shape {matrix.shape}")
+    return matrix
+
+
+def _clip_bound(values: np.ndarray, percentile: float) -> float:
+    if values.size == 0:
+        return 0.0
+    abs_values = np.abs(values)
+    if percentile == 100:
+        return float(np.max(abs_values))
+    return float(np.percentile(abs_values, percentile))
+
+
+def _scale_exponent(max_abs: float, q_limit: int) -> int:
+    if max_abs <= 0:
+        return 0
+    return int(np.ceil(np.log2(max_abs / q_limit)))

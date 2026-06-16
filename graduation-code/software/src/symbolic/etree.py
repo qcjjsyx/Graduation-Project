@@ -7,10 +7,7 @@ import scipy.sparse as sp
 
 
 def elimination_tree(a: sp.spmatrix) -> np.ndarray:
-    """Compute elimination tree for a symmetric sparse matrix.
-
-    Simplified implementation; suitable for small demos.
-    """
+    """Compute the elimination tree for a symmetric sparse matrix pattern."""
     if not sp.isspmatrix_csc(a):
         a = a.tocsc()
     n = a.shape[0]

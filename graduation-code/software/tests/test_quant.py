@@ -1,49 +1,58 @@
-from pathlib import Path
-import logging
-
 import numpy as np
 
-from src.quant.bfp_quant import dequantize, quantize_matrix
-from src.matrix_compress.compress import read_mat_file
-
-# 创建日志目录
-log_dir = Path(__file__).parent / 'tests_log'
-log_dir.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_dir / 'test_quant.log'),
-        logging.StreamHandler()
-    ],
-    force=True
+from src.config import QuantConfig
+from src.quant.bfp_quant import (
+    assemble_sources,
+    dequantize_source,
+    flatten_quantized_source,
+    quant_limit,
+    quantize_local_contribution,
+    round_shift,
 )
-logger = logging.getLogger(__name__)
 
 
-def test_quant_dequant_mse():
-    rng = np.random.default_rng(0)
-    x = rng.standard_normal((48, 48)).astype(np.float32) * 10.0
-    qr = quantize_matrix(x)
-    x_hat = dequantize(qr.q, qr.e)[: x.shape[0], : x.shape[1]]
-    mse = np.mean((x - x_hat) ** 2)
-    assert mse > 0
-    assert mse < 5.0
+def test_local_contribution_uses_single_source_exponent():
+    values = np.array([[1.0, -2.0], [4.0, 8.0]], dtype=np.float32)
+    config = QuantConfig(effective_bits=3)
+
+    source = quantize_local_contribution(values, config)
+    restored = dequantize_source(source)
+
+    assert source.exponent == 1
+    assert source.mantissa.dtype == np.int32
+    assert source.mantissa.tolist() == [[0, -1], [2, 4]]
+    assert source.stats.q_limit == quant_limit(config.effective_bits)
+    assert source.stats.sat_count == 0
+    assert restored.shape == values.shape
 
 
-def _example_mat_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "example" / "256X256JJ.mat"
+def test_flatten_source_writes_one_exponent_per_local_front():
+    source = quantize_local_contribution(np.eye(3, dtype=np.float32))
+    q_values, e_values = flatten_quantized_source(source)
+
+    assert len(q_values) == 9
+    assert e_values == [source.exponent]
 
 
-def test_quant_dequant_on_mat():
-    mat_path = _example_mat_path()
-    a = read_mat_file(str(mat_path)).toarray().astype(np.float32)
-    # print(a)
-    qr = quantize_matrix(a)
-    logger.info(f"qr: {qr}")
-    
-    a_hat = dequantize(qr.q, qr.e)[: a.shape[0], : a.shape[1]]
-    logger.info(f"a_hat: {a_hat}")
-    assert a_hat.shape == a.shape
-    assert np.isfinite(a_hat).all()
+def test_reference_assembly_aligns_sources_with_round_shift():
+    large = quantize_local_contribution(
+        np.array([[16.0, 0.0]], dtype=np.float32),
+        QuantConfig(effective_bits=3),
+    )
+    small = quantize_local_contribution(
+        np.array([[1.0, -1.0]], dtype=np.float32),
+        QuantConfig(effective_bits=3),
+    )
+
+    assembled = assemble_sources([large, small], QuantConfig(effective_bits=3))
+
+    assert assembled.stats.source_count == 2
+    assert assembled.stats.assembly_exponent == max(large.exponent, small.exponent)
+    assert assembled.stats.align_shift_max == large.exponent - small.exponent
+    assert assembled.stats.align_drop_count >= 1
+    assert assembled.mantissa.shape == large.mantissa.shape
+
+
+def test_round_shift_is_symmetric_for_signed_values():
+    values = np.array([-3, -2, -1, 0, 1, 2, 3], dtype=np.int64)
+    assert round_shift(values, 1).tolist() == [-2, -1, -1, 0, 1, 1, 2]

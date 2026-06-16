@@ -1,31 +1,42 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-from src.io import MapTableEntry
+from src.dataStruct import MapTableEntry
 
 
 def generate_map_tables(
     node_ranges: List[Tuple[int, int]],
     parent: List[int],
+    front_indices: List[List[int]],
 ) -> List[List[MapTableEntry]]:
-    """Generate simple identity map tables between child and parent.
+    """Generate child-update to parent-front map tables."""
+    if not (len(node_ranges) == len(parent) == len(front_indices)):
+        raise ValueError("node_ranges, parent, and front_indices lengths must match")
 
-    child update rows/cols are mapped to parent frontal by matching indices.
-    """
     map_tables: List[List[MapTableEntry]] = [[] for _ in range(len(node_ranges))]
-    for child_id, p in enumerate(parent):
-        if p < 0:
+    parent_pos_cache = [
+        {global_col: local_idx for local_idx, global_col in enumerate(front)}
+        for front in front_indices
+    ]
+
+    for child_id, parent_id in enumerate(parent):
+        if parent_id < 0:
             continue
-        c_start, c_end = node_ranges[child_id]
-        p_start, p_end = node_ranges[p]
-        # Identity mapping over overlapping indices
-        overlap_start = max(c_start, p_start)
-        overlap_end = min(c_end, p_end)
+
+        child_pivot_dim = node_ranges[child_id][1] - node_ranges[child_id][0]
+        child_update_vars = front_indices[child_id][child_pivot_dim:]
+        parent_pos = parent_pos_cache[parent_id]
+
         row_map: List[int] = []
         col_map: List[int] = []
-        for idx in range(overlap_start, overlap_end):
-            row_map.append(idx - c_start)
-            col_map.append(idx - p_start)
-        map_tables[p].append(MapTableEntry(child_id=child_id, row_map=row_map, col_map=col_map))
+        for update_idx, global_col in enumerate(child_update_vars):
+            if global_col in parent_pos:
+                row_map.append(update_idx)
+                col_map.append(parent_pos[global_col])
+
+        map_tables[parent_id].append(
+            MapTableEntry(child_id=child_id, row_map=row_map, col_map=col_map)
+        )
+
     return map_tables

@@ -22,7 +22,6 @@ def _example_mat_path() -> Path:
 def test_read_mat_file_loads_csr():
     mat_path = _example_mat_path()
     a = read_mat_file(str(mat_path))
-    print(a)
     assert sp.isspmatrix_csr(a)
     assert a.shape == (256, 256)
 
@@ -53,5 +52,5 @@ def test_compress_mat_file_and_reload(tmp_path: Path):
 
     loaded = load_compressed_file(str(out_path))
     restored = decompress_sparse(loaded, out=CompressionFormat.CSR)
-    diff = (compressed.matrix.tocsr() - restored).tocoo() # type: ignore
+    diff = (compressed.matrix.tocsr() - restored).tocoo()
     assert np.allclose(diff.data, 0.0)

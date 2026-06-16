@@ -311,7 +311,7 @@ class HardwareSystem:
             self._log_op(op_log, "PANEL_FACT", panel_tile, panel_tile, panel_tile)
 
             for pivot_col in range(panel_start, panel_end):
-                pivot_row, _ = self._find_pivot(phys_sram, atu, pivot_col)
+                pivot_row, _ = self._find_pivot(phys_sram, atu, pivot_col, panel_end)
                 atu.swap_rows(pivot_col, pivot_row)
 
                 pivot_val = int(phys_sram[atu.physical_row(pivot_col), pivot_col])
@@ -321,7 +321,7 @@ class HardwareSystem:
                     )
 
                 pivot_phys = atu.physical_row(pivot_col)
-                for row in range(pivot_col + 1, n):
+                for row in range(pivot_col + 1, panel_end):
                     row_phys = atu.physical_row(row)
                     a_val = int(phys_sram[row_phys, pivot_col])
                     l_val = self.quantizer.round_div_value(a_val << f, pivot_val)
@@ -337,6 +337,10 @@ class HardwareSystem:
                 self._solve_u12(phys_sram, atu, panel_start, panel_end)
                 for tile_j in range(panel_end // TILE_SIZE, self._ceil_tiles(n)):
                     self._log_op(op_log, "TRSM_U", panel_tile, tile_j, panel_tile)
+
+                self._solve_l21(phys_sram, atu, panel_start, panel_end)
+                for tile_i in range(panel_end // TILE_SIZE, self._ceil_tiles(n)):
+                    self._log_op(op_log, "TRSM_L", tile_i, panel_tile, panel_tile)
 
                 self._update_schur(phys_sram, atu, panel_start, panel_end)
                 for tile_i in range(panel_end // TILE_SIZE, self._ceil_tiles(n)):
@@ -410,10 +414,17 @@ class HardwareSystem:
             converged=converged,
         )
 
-    def _find_pivot(self, phys_sram: np.ndarray, atu: ATU, column: int) -> tuple[int, int]:
+    def _find_pivot(
+        self,
+        phys_sram: np.ndarray,
+        atu: ATU,
+        column: int,
+        search_limit: int | None = None,
+    ) -> tuple[int, int]:
+        limit = phys_sram.shape[0] if search_limit is None else search_limit
         candidates = (
             (row, int(phys_sram[atu.physical_row(row), column]))
-            for row in range(column, phys_sram.shape[0])
+            for row in range(column, limit)
         )
         return self.hpu.select_pivot(candidates)
 
@@ -436,6 +447,34 @@ class HardwareSystem:
             mac = l_values @ u_block
             delta = self.quantizer.round_shift_array(mac, f)
             phys_sram[row_phys, col_slice] = phys_sram[row_phys, col_slice] - delta
+
+    def _solve_l21(
+        self, phys_sram: np.ndarray, atu: ATU, panel_start: int, panel_end: int
+    ) -> None:
+        if panel_end >= phys_sram.shape[0]:
+            return
+
+        f = self.config.frac_bits
+        n = phys_sram.shape[0]
+        trailing_idx = np.arange(panel_end, n, dtype=np.int64)
+
+        for pivot_col in range(panel_start, panel_end):
+            pivot_phys = atu.physical_row(pivot_col)
+            pivot_val = int(phys_sram[pivot_phys, pivot_col])
+
+            for row in range(panel_end, n):
+                row_phys = atu.physical_row(row)
+                a_val = int(phys_sram[row_phys, pivot_col])
+                l_val = self.quantizer.round_div_value(a_val << f, pivot_val)
+                phys_sram[row_phys, pivot_col] = l_val
+
+                if pivot_col + 1 < panel_end:
+                    cols = slice(pivot_col + 1, panel_end)
+                    products = l_val * phys_sram[pivot_phys, cols]
+                    delta = self.quantizer.round_shift_array(products, f)
+                    phys_sram[row_phys, cols] = (
+                        phys_sram[row_phys, cols] - delta
+                    )
 
     def _update_schur(
         self, phys_sram: np.ndarray, atu: ATU, panel_start: int, panel_end: int
@@ -511,6 +550,8 @@ class HardwareSystem:
         elif op_type == "PANEL_FACT":
             cycles = self.config.panel_fact_cycles
         elif op_type == "TRSM_U":
+            cycles = self.config.trsm_cycles
+        elif op_type == "TRSM_L":
             cycles = self.config.trsm_cycles
         elif op_type == "GEMM_SCHUR":
             cycles = self.config.gemm_cycles

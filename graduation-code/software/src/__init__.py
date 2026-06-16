@@ -1,2 +1,2 @@
-"""Multifrontal LU software-side prototype package."""
+"""Multifrontal LU software-side pipeline."""
 __all__ = ["main"]
