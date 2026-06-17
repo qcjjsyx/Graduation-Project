@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from src.dataStruct import NODE_TASK_BYTE_SIZE, ROOT_PARENT_ID
 from src.io import read_map_tables, read_tasks
 
 
 class ManifestValidationError(ValueError):
     pass
+
+
+def _as_int(value: Any, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ManifestValidationError(f"{label}: expected integer, got {value!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -26,7 +34,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
     _validate_abi(manifest)
     _validate_output_sizes(out_dir, manifest)
 
-    node_count = int(manifest["symbolic"]["node_count"])
+    node_count = _as_int(manifest["symbolic"]["node_count"], "node_count")
     nodes = manifest["nodes"]
     if len(nodes) != node_count:
         raise ManifestValidationError("nodes section length does not match node_count")
@@ -50,7 +58,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
     _validate_task_fields(tasks, parent, nodes)
     _validate_quantization(nodes)
     _validate_node_file_ranges(out_dir, manifest)
-    _validate_memory_regions(nodes, int(manifest["config"]["memory"]["alignment"]))
+    _validate_memory_regions(nodes, _as_int(manifest["config"]["memory"]["alignment"], "alignment"))
     map_tables = _validate_map_tables(out_dir, manifest)
 
     return ManifestValidationResult(
@@ -62,7 +70,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
 
 def _validate_abi(manifest: dict) -> None:
     abi = manifest.get("abi", {})
-    if int(abi.get("node_task_byte_size", -1)) != NODE_TASK_BYTE_SIZE:
+    if _as_int(abi.get("node_task_byte_size", -1), "node_task_byte_size") != NODE_TASK_BYTE_SIZE:
         raise ManifestValidationError("manifest NodeTask byte size does not match code")
 
 
@@ -72,7 +80,7 @@ def _validate_output_sizes(out_dir: Path, manifest: dict) -> None:
         if not path.exists():
             raise ManifestValidationError(f"missing output file: {name}")
         actual_size = path.stat().st_size
-        if actual_size != int(expected_size):
+        if actual_size != _as_int(expected_size, f"output_size[{name}]"):
             raise ManifestValidationError(
                 f"{name} size mismatch: manifest={expected_size}, actual={actual_size}"
             )
@@ -84,7 +92,7 @@ def _validate_task_fields(tasks, parent: list[int], nodes: dict) -> None:
         task = by_id[node_id]
         node = nodes[str(node_id)]
         node_range = node["range"]
-        pivot_dim = int(node_range["end"]) - int(node_range["start"])
+        pivot_dim = _as_int(node_range["end"], "range.end") - _as_int(node_range["start"], "range.start")
         total_dim = len(node.get("front_indices", [])) or pivot_dim
 
         if task.total_dim != total_dim or task.pivot_dim != pivot_dim:
@@ -101,21 +109,21 @@ def _validate_node_file_ranges(out_dir: Path, manifest: dict) -> None:
     for node_id, node in manifest["nodes"].items():
         _check_file_range(
             f"node {node_id} front_q",
-            int(node["front_q_file_offset"]),
-            int(node["front_q"]["size"]),
-            int(file_sizes["front_q.bin"]),
+            _as_int(node["front_q_file_offset"], f"node_{node_id}_front_q_offset"),
+            _as_int(node["front_q"]["size"], f"node_{node_id}_front_q_size"),
+            _as_int(file_sizes["front_q.bin"], "front_q.bin_size"),
         )
         _check_file_range(
             f"node {node_id} front_e",
-            int(node["front_e_file_offset"]),
-            int(node["front_e"]["size"]),
-            int(file_sizes["front_e.bin"]),
+            _as_int(node["front_e_file_offset"], f"node_{node_id}_front_e_offset"),
+            _as_int(node["front_e"]["size"], f"node_{node_id}_front_e_size"),
+            _as_int(file_sizes["front_e.bin"], "front_e.bin_size"),
         )
         _check_file_range(
             f"node {node_id} map_table",
-            int(node["map_table_file_offset"]),
-            int(node["map_table"]["size"]),
-            int(file_sizes["map_table.bin"]),
+            _as_int(node["map_table_file_offset"], f"node_{node_id}_map_offset"),
+            _as_int(node["map_table"]["size"], f"node_{node_id}_map_size"),
+            _as_int(file_sizes["map_table.bin"], "map_table.bin_size"),
         )
 
 
@@ -138,8 +146,8 @@ def _validate_memory_regions(nodes: dict, alignment: int) -> None:
             "task_desc",
         ):
             region = node[region_name]
-            offset = int(region["offset"])
-            size = int(region["size"])
+            offset = _as_int(region["offset"], f"node_{node_id}_{region_name}_offset")
+            size = _as_int(region["size"], f"node_{node_id}_{region_name}_size")
             if offset % alignment != 0:
                 raise ManifestValidationError(
                     f"node {node_id} {region_name} offset is not aligned"
@@ -155,11 +163,11 @@ def _validate_memory_regions(nodes: dict, alignment: int) -> None:
 
 def _validate_map_tables(out_dir: Path, manifest: dict):
     offsets = [
-        int(manifest["nodes"][str(node_id)]["map_table_file_offset"])
-        for node_id in range(int(manifest["symbolic"]["node_count"]))
+        _as_int(manifest["nodes"][str(node_id)]["map_table_file_offset"], f"node_{node_id}_map_table_offset")
+        for node_id in range(_as_int(manifest["symbolic"]["node_count"], "node_count"))
     ]
     map_tables = read_map_tables(str(out_dir / "map_table.bin"), offsets)
-    node_count = int(manifest["symbolic"]["node_count"])
+    node_count = _as_int(manifest["symbolic"]["node_count"], "node_count")
     for parent_id, entries in enumerate(map_tables):
         parent_front = set(manifest["nodes"][str(parent_id)].get("front_indices", []))
         for entry in entries:
@@ -187,8 +195,8 @@ def _validate_quantization(nodes: dict) -> None:
         if shape != [front_dim, front_dim]:
             raise ManifestValidationError(f"node {node_id} local_source shape mismatch")
 
-        front_q_size = int(node["front_q"]["size"])
+        front_q_size = _as_int(node["front_q"]["size"], f"node_{node_id}_front_q_size")
         if front_q_size != front_dim * front_dim * 4:
             raise ManifestValidationError(f"node {node_id} front_q size mismatch")
-        if int(node["front_e"]["size"]) != 2:
+        if _as_int(node["front_e"]["size"], f"node_{node_id}_front_e_size") != 2:
             raise ManifestValidationError(f"node {node_id} front_e must store one int16 exponent")

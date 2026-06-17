@@ -1,210 +1,204 @@
-# 项目总体介绍（Project Overview）
+# 基于张量计算的大型稀疏矩阵求解系统
+
+本项目是研究生毕业设计代码与文档仓库，目标是构建一个面向大型稀疏矩阵 LU 分解的
+软硬件协同原型系统。整体思路参考 multifrontal 方法：软件侧完成矩阵前处理和硬件输入
+生成，硬件侧完成节点级 front 装配、整数化 LU/TRSM/GEMM 和 child update 生成。
+
+当前项目重点在硬件侧；软件侧的定位是 **硬件执行前的数据准备工具链**，不是完整的软件求解器。
+
+## 仓库结构
+
+```text
+Graduation-Project/
+  graduation-code/
+    hardware/                 硬件 RTL/HLS 相关代码
+    sim/                      硬件行为仿真与实验展示代码
+    software/                 软件侧前处理与硬件输入生成代码
+    software_legacy_before_refactor/
+                              软件侧重构前代码快照
+  graduation-project/
+    src/                      设计文档、方案说明
+    参考文献/                 论文与参考资料
+    中期/                     中期答辩材料
+```
 
-## 1. 项目目标与约束
+## 系统执行流
 
-### 1.1 总体目标
+```text
+稀疏矩阵
+  -> 软件侧符号分析
+  -> 任务与映射生成
+  -> A_local 预量化
+  -> DDR 输入产物
+  -> 硬件侧装配与整数 LU
+  -> L/U 因子与 child update
+```
 
-构建一个面向 **稀疏线性方程组求解** 的软硬件协同系统，参考 **MUMPS / multifrontal** 思路，在硬件端完成节点级（node-level）的 **frontal matrix** 分解与更新，输出全局 LU 的一部分与对父节点的更新矩阵，最后生成全局矩阵的LU分解，
+## 软件侧当前实现
 
-核心展示点：
+软件侧代码位于：
 
-* **节点级波前矩阵处理** ：主元块分解 + TRSM + Schur 更新（GEMM）+ update 写回父节点（extend-add/scatter）
-* **全局调度** ：依赖感知的预取与双缓冲，保证计算核心不断供
-* **低精度/整数路径** ：在缺乏浮点矩阵核的条件下，通过 量化与（可选）迭代求精实现可控误差
+```text
+graduation-code/software/
+```
 
-### 1.2 硬件约束
+当前已完成的主要功能：
 
-* **矩阵计算核心（GEMM/TPU 核）** ：支持int32 的 + - * 。能够支持一般的矩阵与向量的运算
+- 支持 `.mat`、MatrixMarket 文件输入，也支持随机 SPD 矩阵生成
+- 支持 `amd`、`rcm`、`identity` 三种排序入口
+- 构建 elimination tree
+- 根据排序后矩阵图的闭邻接集合合并连续超节点
+- 生成每个 node 的 `front_indices`
+- 生成硬件任务描述符 `NodeTask`
+- 生成 child update 到 parent front 的 `map_table`
+- 根据 front 维度规划 DDR 区域
+- 提取每个 node 的本地矩阵贡献 `A_local`
+- 将每个 `A_local` 独立量化为 `S_format`
+- 输出 `tasks.bin`、`map_table.bin`、`front_q.bin`、`front_e.bin` 和 `manifest.json`
+- 对 manifest、ABI、文件大小、内存对齐、map table 等进行自动校验
 
----
+软件侧运行示例：
 
-## 2. 算法与执行流
+```bash
+python graduation-code/software/src/main.py \
+  -mtx graduation-code/software/example/1024X1024JJ.mat \
+  --out out
+```
 
-### 2.1 Multifrontal 节点处理（单 node）
+或：
 
-每个 node 的 frontal matrix $F$ 包含：
+```bash
+cd graduation-code/software
+python -m src.main --mtx example/1024X1024JJ.mat --out out
+```
 
-* node 本身变量对应的条目（来自原矩阵 A）
-* 子节点上传的更新矩阵（contribution/update），通过 **extend-add** 累加装配到 $F$
+常用参数：
 
-处理流程：
+```text
+--ordering amd|rcm|identity
+--max-supernode-size 256
+--effective-bits 27
+--clip-percentile 100.0
+```
 
-1. **装配（assembly）** ：$F\leftarrow extend\_add(F_A, Update)$
-2. **主元块分解（pivot / factorization）** ：对 $F_{pivot}(F_{11})$ 做（块）LU，产生 L/U 因子（全局 LU 的一部分）
-3. **TRSM** ：求解 $F_{21}←F_{21}U_{11}^{−1}$   $F_{12} \leftarrow L_{11}^{-1}F_{12}$三角求解步骤
-4. **Schur 更新（GEMM）** ：$F_{22}\leftarrow F_{22} - F_{21}F_{12}$,生成对父节点的更新矩阵
-5. **输出** ：
+更详细的软件侧说明见：
 
-* 写回 L/U 因子到 DDR（factor_writer）
-* 当前节点执行完成后，生成面向父节点的 update payload，并写入独立 update 区；父节点进入执行前，再由 front_loader / assembly 路径结合本地贡献与所有子节点 update 完成装配，并确定该父节点的 node-scale
+```text
+graduation-code/software/README.md
+```
 
-### 2.1.1
+## 软件侧量化职责
 
-父节点进入执行前，不直接使用软件侧预装配好的统一 front，而是由硬件侧根据本地贡献 `A_local` 与所有子节点 update payload 完成装配，并在装配完成后决定该父节点的统一 `node-scale`。
+本项目的量化方案主要是硬件侧方案。软件侧只负责生成硬件 DDR 中的初始量化输入。
 
-为此，区分三类数值格式：
+软件侧负责：
 
-1. **S_format（assembly 输入格式）**
+- 根据符号分析结果确定每个 node 的 `front_indices`
+- 从原始矩阵中提取每个 node 的本地贡献 `A_local`
+- 对每个 `A_local` 独立量化：
 
-   $$
-   x\approx q_x \cdot 2^{e_s}
-   $$
+```text
+A_local ~= q_local * 2^e_local
+q_local: int32 mantissa
+e_local: int16 source exponent
+```
 
-   其中：
-   \- `q_x` 为 int32 mantissa
-   \- `e_s` 为 source 自带指数
-   \- source 可以是：
-   \- 当前节点本地贡献 `A_local`
-   \- 某个子节点 update payload
-2. **M_format（node 内矩阵值格式）**
-   $x \approx q_x \cdot 2^{e_n}$
-   其中：
-   \- `e_n` 为当前 node 的统一指数
-   \- node 执行期间 `e_n` 固定
-3. **QF_format（乘子格式）**
-   $l \approx \frac{m}{2^F}$
-   用于 node 内 LU / TRSM 中的乘子表示。
+- 将 mantissa、exponent、任务描述符和 map table 写入输出产物
 
-父节点装配流程如下：
+硬件侧负责：
 
-1. `dep_scoreboard` 判断所有子节点 update 已就绪，允许父节点进入装配阶段；
-2. `front_loader` 先读取本地贡献和各 child update 的 exponent metadata；
-3. 确定统一装配参考指数 `e_asm`；
-4. 各 source 按 `e_asm` 做指数对齐后，通过 `map_table` 在线装配到 assembly buffer；
-5. 在 assembly buffer 中统计 `maxabs_acc`；
-6. 装配完成后根据 `maxabs_acc` 决定最终 node-scale `e_n`；
-7. 将 assembly buffer 重新量化写入 front SRAM，得到 node 内执行所需的 `M_format` 数据。
+- 读取软件准备的 `A_local` source 和 child update source
+- 在父节点装配阶段完成 exponent 对齐和累加
+- 根据装配结果选择最终 node-scale
+- 执行整数 panel LU、TRSM、GEMM/Schur update
+- 生成 child update payload 并写回 DDR
 
-当前原型版建议使用：
-$e_{asm} = \max(e_{local}, e_{child,1}, e_{child,2}, \dots)$
+因此，软件侧不会生成整数 LU 数值结果，也不会生成 child update 数值 payload。
 
-该方案实现简单，但可能导致较小 source 在右移对齐时丢失。因此测试使用的矩阵会性质比较良好
+## 符号分析与超节点说明
 
-### 2.2 依赖与预取风险（父子数据冒险）
+当前 `amd` 入口是简化的最小度排序启发式算法，用显式对称图模拟消元和 fill-in。
+它不是论文中的完整 quotient-graph AMD，也不等价于 SuiteSparse AMD。
 
-若父节点任务被预取到 Buffer B，而子节点 update 尚未写回父节点区域，则父节点使用过期数据。
+当前超节点合并作为排序后的后处理执行：
 
-体系化解决：
+```text
+ordering -> elimination tree -> supernode grouping -> front_indices
+```
 
-* **软件侧** ：任务队列排序（sibling scheduling）尽量插入无依赖节点填充空隙
-* **硬件侧** ：dep_scoreboard 维护 `pending_children`，仅当父节点 `front_ready` 才允许 task_fetch 发射与 buffer_mgr 预取
+超节点合并规则：
 
-### 2.3 轻量级 ready-task 选择（机会发现）
+- 只合并当前排序中连续的列
+- 若两列的闭邻接集合相同，则可合并：
 
-当前系统中，`dep_scoreboard` 首先保证任务发射的正确性：只有当 `pending_children = 0` 且 `front_ready = 1` 时，节点才进入 ready 集合。
+```text
+Adj(i) U {i} == Adj(j) U {j}
+```
 
-在此基础上，为了提高双缓冲下预取与计算的重叠概率，引入轻量级 ready-task selector。其目标不是做全局最优调度，而是在多个合法可发节点中，优先选择当前更适合预取的节点。
+- 合并列数受 `--max-supernode-size` 限制，默认 256
 
-当前原型版采用简单启发式：
+这个规则参考 AMD 论文中 indistinguishable variables / supervariables 的描述，但没有实现
+完整 AMD 中的动态 quotient graph supervariable 检测。这样做的原因是当前软件侧更关注为硬件
+生成稳定、紧凑、易解码的 node 任务。
 
-1. 优先选择 `front_size_class` 与当前计算窗口更匹配的节点；
-2. 若接近，则优先选择 `critical_level` 更高的节点；
-3. 若仍接近，则优先选择 `child_update_count` 更小、assembly 成本更低的节点。
+## 输出产物
 
-其中，以下字段由软件侧在 `Node_Task` 中预先给出：
+软件侧输出目录中包含：
 
-- `front_size_class`
-- `critical_level`
-- `child_update_count`
+| 文件 | 说明 |
+|---|---|
+| `tasks.bin` | 硬件节点任务描述符 |
+| `map_table.bin` | child update 到 parent front 的映射表 |
+| `front_q.bin` | 每个 node 的 `A_local` 量化 mantissa |
+| `front_e.bin` | 每个 node 的 source exponent |
+| `manifest.json` | 输出元数据、内存布局、量化统计和校验信息 |
 
-该机制的定位是“在正确性 gating 之上增加轻量机会发现”，不宣称全局最优，也不直接承诺整体性能一定提升。
+`manifest.json` 中会记录软件和硬件的量化职责边界，以及哪些区域由硬件运行时写入。
 
----
+## 硬件侧目标
 
-## 3. 硬件架构总览
+硬件侧围绕 node-level multifrontal 执行展开，核心模块包括：
 
-### 3.1 主要模块
+- `GCU`：任务获取、依赖检查、buffer 管理和节点内调度
+- `ATU`：逻辑行到物理存储位置的地址映射，支持低成本行交换
+- `HPU`：主元选择，当前设计采用层级/锦标赛式比较结构
+- `SFU`：标量和控制路径计算，包括除法、缩放、TRSM 相关操作
+- `TPU/GEMM core`：高吞吐整数矩阵乘加，用于 Schur update
+- `front_loader / assembly`：读取本地贡献和 child update，完成多 source 在线装配
+- `update_writer / factor_writer`：写回 child update 和 L/U 因子
 
-* **GCU（Global Control Unit）**
+硬件行为仿真和实验展示代码位于：
 
-  * `task_fetch`：从 DDR 读取 `Node_Task` 描述符，做 decode
-  * `dep_scoreboard`：
-    - 维护 `pending_children / front_ready`
-    - 仅当父节点依赖满足时，允许其进入 ready 集合
-    - 向 `task_fetch / buffer_mgr` 输出 ready 节点集合，供轻量级任务选择器进一步决定“先发谁”
-  * `buffer_mgr`：双缓冲管理，状态机（IDLE/LOAD/READY/PROC/WB），逻辑上对节点进行一个宏观的管理，包括加载数据，可以开始计算，确定更新矩阵写回等任务。
-  * `micro_scheduler`：节点内调度，驱动 SFU/HPU/ATU/矩阵核协作，完成节点对应的frontal matrix的全部计算
-* **ATU（地址变化单元）**
+```text
+graduation-code/sim/
+```
 
-  * 该模块负责逻辑行与物理行的映射。LU分解涉及除法，我们希望主元尽可能大，需要进行行置换等操作。为了避免大规模搬移数据，设计了该模块。
-* **HPU（层级主元单元）**
+## 测试
 
-  * 进行LU分解时的主元选择
-  * 当前版本采用了锦标赛树的形式来筛选出主元
-* **SFU（Signed Functional Unit）**
+软件侧测试：
 
-  * signed `+ - * /`：定点乘子、缩放/对齐、TRSM 相关运算、控制路径、简单LU相关运算、控制路径
-  * 实际上为一简单的CPU核
-* **矩阵计算核心（TPU/GEMM core）**
+```bash
+cd graduation-code/software
+python -m pytest
+```
 
-  * signed `+ - *`：用于 Schur 更新 GEMM 等高吞吐部分
-* **辅助模块**
+当前测试覆盖：
 
-  * `dma_front_loader`：
-    - 读取 parent node 的本地贡献与 child update payload
-    - 预读 exponent metadata
-    - 配合 assembly 单元完成多 source 在线装配
-    - 统计 assembly buffer 的 `maxabs`
-    - 根据 `node-scale` 对装配结果重新量化并写入 front SRAM
-  * `update_writer`：update 写更新区；
-  * `dma_factor_writer`：写回 L/U
-  * 其他一些必要的辅助模块，目前还没有确定
+- `NodeTask` ABI 编解码
+- map table 编解码
+- 内存规划对齐和不重叠
+- 排序输出合法性
+- 超节点多列合并与上限控制
+- `A_local` 量化与硬件装配参考模型
+- 端到端 pipeline 与 manifest 一致性
 
----
+## 当前状态
 
-## 4. 软件架构与工作内容
+软件侧已经形成从输入矩阵到硬件输入产物的完整链路。后续工作的重点应放在：
 
-### 4.1 软件侧
+- 硬件侧 front assembly 与 node-scale 选择
+- 整数 LU/TRSM/GEMM 数据通路
+- child update 写回和父节点装配联动
+- 软硬件联合仿真与实验结果展示
 
-1. **I/O 与置换管理** ：读取矩阵（CSR/CSC/mtx）
-2. **符号分析（Symbolic）** ：
-
-* ordering（AMD/METIS/SCOTCH 或替代）
-* elimination tree构建
-* supernode (超节点，目前限制最大为256*256)形成
-
-3. **任务生成（Node_Task）** ：`Node_Task` 除 front 尺寸、地址、映射等必要字段外，还需要补充以下元数据：
-
-   - `front_size_class`：当前 node 前沿矩阵规模类别，用于轻量调度
-   - `critical_level`：节点关键级别，用于 ready-task 选择
-   - `child_update_count`：子节点 update 数量，用于粗略估计 assembly 成本
-   - `e_local` 或本地贡献 exponent metadata 地址
-   - child update descriptor / exponent metadata 地址
-4. **map_table 生成（extend-add 映射）**
-
-   确定子节点的更新矩阵应该加到父节点的哪一行/列中
-5. **任务队列排序（sibling scheduling）** ：避免父子相邻导致预取风险
-6. **内存规划与序列化（ABI）** ：
-7. **初始化本地贡献准备** ：
-
-* 根据 symbolic 结果提取每个 node 对应的 `A_local`
-* 对 `A_local` 进行预量化，得到 `(q_local, e_local)`，作为 assembly 输入格式 `S_format`
-* 将其与 `map_table`、`Node_Task` 一起下发到板端 DDR
-
-8. **验证与指标** ：
-
-* residual、相对误差、sat_count/裁剪统计
-
-9. **迭代求精**：在硬件侧完成低精度/整数化 LU 分解后，利用硬件中已有的量化 `L/U` 作为近似因子，在软件侧执行迭代求精闭环：
-
-   - 将量化后的右端项 `b` 送入硬件，利用已有 `L/U` 做前代/回代，得到初始近似解 `x_0`；
-   - 软件侧使用真实高精度 `A` 与 `b` 计算残差：$r_k = b - A x_k$  ;
-   - 对残差单独确定 residual-scale `e_{r,k}`，量化后重新送入硬件；
-   - 硬件利用已有 `L/U` 解修正方程，得到 correction `d_k`；
-   - 软件侧以较高精度更新：$x_{k+1} = x_k + d_k$
-   - 根据 residual 范数、更新量大小和最大迭代次数决定是否停止。
-
-   该模块的定位是：
-
-   - 作为低精度 LU 的可靠性兜底；
-   - 展示在无浮点矩阵核条件下，低精度分解结果仍可通过软件辅助提高最终解精度
-
----
-
-## 5. 后续工作
-
-1. **软件侧闭环** ：symbolic → tasks/map_table → `A_local` 预量化 → 生成二进制 → Python 参考验证 → 板端数据下发
-2. **硬件调度闭环** ：dep_scoreboard + ready-task selector + buffer_mgr + task_fetch + micro_scheduler 联动跑通
-3. **assembly 正确性** ：验证多指数 source 的在线对齐装配、`e_asm` 决定、`node-scale` 重定标和 front SRAM 写入流程
-4. **迭代求精** ：验证在已有量化 `L/U` 基础上的 software-assisted refinement 是否能改善 residual 与最终解精度
-5. **风险评估** ：统计 `align_drop_count`、`asm_overflow_count`、`requant_sat_count`、迭代求精中的 residual stagnation 情况
+最后更新：2026-06-17

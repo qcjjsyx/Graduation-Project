@@ -273,7 +273,7 @@ def build_node_tasks(
                 l_factor_addr=plan.l_factor.offset,
                 u_factor_addr=plan.u_factor.offset,
                 p_vector_addr=0,
-                reversed=0,
+                reserved=0,
             )
         )
 
@@ -389,7 +389,7 @@ def _sizes_from_offsets(offsets: List[int], total_size: int) -> List[int]:
 def _reference_residual(matrix) -> float:
     b = np.ones(matrix.shape[0], dtype=np.float32)
     x = spla.spsolve(matrix.tocsr(), b)
-    return residual_norm(matrix, x, b)
+    return residual_norm(matrix, x, b) # type: ignore
 
 
 def _ceil_div(value: int, divisor: int) -> int:

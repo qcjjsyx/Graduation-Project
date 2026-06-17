@@ -25,3 +25,10 @@ def test_block_diagonal_supernodes_stay_separate_by_component():
     supernodes = build_supernodes(parent, a)
     assert supernodes == [[0, 1, 2], [3, 4, 5]]
     assert build_supernode_parent(parent, supernodes) == [-1, -1]
+
+
+def test_supernode_merge_respects_max_size_for_large_equal_pattern():
+    a = sp.csr_matrix(np.ones((300, 300), dtype=np.float64))
+    parent = elimination_tree(a)
+    supernodes = build_supernodes(parent, a, max_size=256)
+    assert [len(node) for node in supernodes] == [256, 44]

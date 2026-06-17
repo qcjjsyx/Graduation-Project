@@ -63,7 +63,7 @@ def apply_permutation(a: sp.spmatrix, perm: np.ndarray) -> sp.spmatrix:
     perm = np.asarray(perm, dtype=np.int32)
     if perm.ndim != 1 or len(perm) != a.shape[0]:
         raise ValueError("permutation length must match matrix dimension")
-    return a[perm][:, perm]
+    return a[perm][:, perm] # type: ignore
 
 
 def _validate_square_sparse(a: sp.spmatrix) -> None:
@@ -74,7 +74,7 @@ def _validate_square_sparse(a: sp.spmatrix) -> None:
 
 
 def _symmetric_adjacency(a: sp.spmatrix) -> list[set[int]]:
-    pattern = (a != 0).astype(np.int8)
+    pattern = (a != 0).astype(np.int8) # type: ignore
     pattern = (pattern + pattern.T).astype(bool).tocsr()
     pattern.setdiag(False)
     pattern.eliminate_zeros()

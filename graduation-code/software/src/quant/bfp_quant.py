@@ -101,7 +101,7 @@ def quantize_local_contribution(
     return QuantizedSource(
         mantissa=mantissa,
         exponent=exponent,
-        shape=tuple(int(dim) for dim in matrix.shape),
+        shape=(int(matrix.shape[0]), int(matrix.shape[1])),
         stats=QuantizationStats(
             total_elements=int(matrix.size),
             clip_count=clip_count,

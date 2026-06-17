@@ -20,7 +20,7 @@ def test_node_task_abi_roundtrip():
         l_factor_addr=256,
         u_factor_addr=320,
         p_vector_addr=384,
-        reversed=9,
+        reserved=9,
     )
 
     encoded = task.to_bytes()
@@ -56,7 +56,7 @@ def test_node_task_file_decode(tmp_path: Path):
             l_factor_addr=0,
             u_factor_addr=0,
             p_vector_addr=0,
-            reversed=0,
+            reserved=0,
         ),
         NodeTask(
             node_id=1,
@@ -73,7 +73,7 @@ def test_node_task_file_decode(tmp_path: Path):
             l_factor_addr=0,
             u_factor_addr=0,
             p_vector_addr=0,
-            reversed=0,
+            reserved=0,
         ),
     ]
     path = tmp_path / "tasks.bin"

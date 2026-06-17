@@ -25,7 +25,7 @@ _NODE_TASK_FIELDS = [
     ("l_factor_addr",        "Q"),
     ("u_factor_addr",        "Q"),
     ("p_vector_addr",        "Q"),
-    ("reversed",              "H"),
+    ("reserved",              "H"),
 ]
 
 NODE_TASK_PACK_FMT = "<" + "".join(fmt for _, fmt in _NODE_TASK_FIELDS)
@@ -85,7 +85,7 @@ class NodeTask:
     l_factor_addr: int
     u_factor_addr: int
     p_vector_addr: int
-    reversed: int = 0
+    reserved: int = 0
 
     PACK_FMT: ClassVar[str] = NODE_TASK_PACK_FMT
     PACKED_SIZE: ClassVar[int] = NODE_TASK_PACKED_SIZE
@@ -112,7 +112,7 @@ class NodeTask:
             self.l_factor_addr,
             self.u_factor_addr,
             self.p_vector_addr,
-            self.reversed,
+            self.reserved,
         )
         return packed + (b"\x00" * (self.BYTE_SIZE - len(packed)))
 

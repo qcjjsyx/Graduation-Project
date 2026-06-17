@@ -16,14 +16,14 @@ def load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_m
     else:
         matrix = sp.csr_matrix(scipy.io.mmread(path))
 
-    if matrix.shape[0] != matrix.shape[1]:
+    if matrix.shape[0] != matrix.shape[1]: # type: ignore
         raise ValueError("matrix must be square")
     return matrix.tocsr()
 
 
 def generate_random_spd(n: int, density: float, seed: int) -> sp.csr_matrix:
     rng = np.random.default_rng(seed)
-    random = sp.random(n, n, density=density, format="csr", random_state=rng)
+    random = sp.random(n, n, density=density, format="csr", random_state=rng) # type: ignore
     matrix = random + random.T
     matrix = matrix + sp.eye(n, format="csr") * n
     return matrix.tocsr()

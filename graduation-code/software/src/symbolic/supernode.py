@@ -11,29 +11,31 @@ def build_supernodes(
     matrix: sp.spmatrix | None = None,
     max_size: int = 256,
 ) -> List[List[int]]:
-    """Build relaxed supernodes from consecutive columns.
+    """Build supernodes from consecutive indistinguishable columns.
 
-    Consecutive columns are merged when they form an elimination-tree chain and
-    their lower-triangular sparsity patterns match after removing the next pivot
-    row. The implementation is dependency-free and intentionally conservative.
+    The merge rule follows the closed-neighborhood criterion used for
+    indistinguishable variables in AMD-style quotient graph descriptions:
+    two columns can be merged when Adj(i) U {i} == Adj(j) U {j}. The pipeline
+    keeps the additional engineering restriction that merged columns must be
+    consecutive in the current ordering, so NodeTask ranges remain compact.
     """
     n = len(parent)
     if n == 0:
         return []
+    if max_size <= 0:
+        raise ValueError(f"max_size must be positive, got {max_size}")
     if matrix is None:
-        return [[i] for i in range(n)]
+        raise ValueError("matrix is required to build supernodes")
+    if matrix.shape != (n, n):
+        raise ValueError("matrix shape must match parent length")
 
-    lower_patterns = _lower_column_patterns(matrix)
+    closed_adj = _closed_graph_adjacency(matrix)
     supernodes: List[List[int]] = []
     col = 0
     while col < n:
+        signature = closed_adj[col]
         current = [col]
-        while (
-            col + 1 < n
-            and len(current) < max_size
-            and int(parent[col]) == col + 1
-            and _can_merge(lower_patterns[col], lower_patterns[col + 1], col + 1)
-        ):
+        while col + 1 < n and len(current) < max_size and closed_adj[col + 1] == signature:
             col += 1
             current.append(col)
         supernodes.append(current)
@@ -81,22 +83,10 @@ def build_column_to_supernode(supernodes: List[List[int]], n: int) -> np.ndarray
     return column_to_node
 
 
-def _can_merge(left_pattern: set[int], right_pattern: set[int], next_col: int) -> bool:
-    return (left_pattern - {next_col}) == right_pattern
-
-
-def _lower_column_patterns(matrix: sp.spmatrix) -> List[set[int]]:
-    csc = matrix.tocsc()
-    patterns: List[set[int]] = []
-    for col in range(csc.shape[1]):
-        start, end = csc.indptr[col], csc.indptr[col + 1]
-        rows = csc.indices[start:end]
-        patterns.append(set(int(row) for row in rows if row > col))
-    return patterns
-
-
 def _closed_column_patterns(matrix: sp.spmatrix) -> List[set[int]]:
-    csc = matrix.tocsc()
+    if matrix is None:
+        raise ValueError("matrix is required to build supernodes")
+    csc = matrix.tocsc() # type: ignore
     patterns: List[set[int]] = []
     for col in range(csc.shape[1]):
         start, end = csc.indptr[col], csc.indptr[col + 1]
@@ -104,3 +94,16 @@ def _closed_column_patterns(matrix: sp.spmatrix) -> List[set[int]]:
         rows.add(col)
         patterns.append(rows)
     return patterns
+
+
+def _closed_graph_adjacency(matrix: sp.spmatrix) -> List[tuple[int, ...]]:
+    pattern = (matrix != 0).astype(np.int8) # type: ignore
+    graph = (pattern + pattern.T).astype(bool).tocsr()
+    graph.setdiag(True)
+    graph.eliminate_zeros()
+
+    adjacency: List[tuple[int, ...]] = []
+    for row in range(graph.shape[0]):
+        start, end = graph.indptr[row], graph.indptr[row + 1]
+        adjacency.append(tuple(int(col) for col in graph.indices[start:end]))
+    return adjacency

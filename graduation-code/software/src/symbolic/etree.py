@@ -9,13 +9,13 @@ import scipy.sparse as sp
 def elimination_tree(a: sp.spmatrix) -> np.ndarray:
     """Compute the elimination tree for a symmetric sparse matrix pattern."""
     if not sp.isspmatrix_csc(a):
-        a = a.tocsc()
+        a = a.tocsc() # type: ignore
     n = a.shape[0]
     parent = np.full(n, -1, dtype=np.int32)
     ancestor = np.full(n, -1, dtype=np.int32)
 
-    indptr = a.indptr
-    indices = a.indices
+    indptr = a.indptr # type: ignore
+    indices = a.indices # type: ignore
 
     for k in range(n):
         ancestor[k] = -1
