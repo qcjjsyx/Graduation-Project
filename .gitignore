@@ -1,0 +1,29 @@
+# macOS and editor files
+.DS_Store
+**/.DS_Store
+.vscode/*.log
+~$*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# CMake / SystemC local build products
+graduation-code/systemc/build/
+graduation-code/systemc/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Tool inspection and scratch artifacts
+*.inspect.ndjson
+*.log
+tmp/
+

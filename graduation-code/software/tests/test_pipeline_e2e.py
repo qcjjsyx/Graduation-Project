@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from src.config import MatrixInputConfig, OrderingConfig, PipelineConfig
@@ -22,6 +23,9 @@ def test_pipeline_outputs_are_manifest_consistent(tmp_path: Path):
     assert outputs.map_table_path.exists()
     assert outputs.front_q_path.exists()
     assert outputs.front_e_path.exists()
+    assert outputs.original_matrix_reference_path.exists()
+    assert outputs.original_rhs_reference_path.exists()
+    assert outputs.row_scale_exponents_path.exists()
     assert outputs.task_count == outputs.node_count
     assert validation.node_count == outputs.node_count
     assert validation.task_count == outputs.task_count
@@ -31,6 +35,9 @@ def test_pipeline_outputs_are_manifest_consistent(tmp_path: Path):
     assert manifest["symbolic"]["node_count"] == outputs.node_count
     assert manifest["quantization"]["format"] == "S_format_local_contribution"
     assert manifest["quantization"]["exponent_dtype"] == "int16"
+    assert manifest["equilibration"]["mode"] == "pow2-row"
+    assert manifest["equilibration"]["solution_requires_unscale"] is False
+    assert outputs.row_scale_exponents_path.stat().st_size == 12 * 2
     assert manifest["output_sizes"]["tasks.bin"] == outputs.tasks_path.stat().st_size
     assert manifest["output_sizes"]["front_q.bin"] == outputs.front_q_path.stat().st_size
     assert manifest["output_sizes"]["front_e.bin"] == outputs.front_e_path.stat().st_size
@@ -59,3 +66,32 @@ def test_pipeline_outputs_are_manifest_consistent(tmp_path: Path):
     for child, parent in enumerate(manifest["symbolic"]["parent"]):
         if parent >= 0:
             assert positions[child] < positions[parent]
+
+
+def test_pipeline_artifacts_are_reproducible(tmp_path: Path):
+    base = PipelineConfig(
+        matrix=MatrixInputConfig(path=None, n=10, density=0.3, seed=9),
+        ordering=OrderingConfig(method="amd"),
+        out_dir=tmp_path / "first",
+    )
+    first = run_pipeline(base)
+    second = run_pipeline(replace(base, out_dir=tmp_path / "second"))
+    for filename in (
+        "tasks.bin",
+        "map_table.bin",
+        "front_q.bin",
+        "front_e.bin",
+        "rhs_q.bin",
+        "rhs_e.bin",
+        "memory_image.bin",
+        "reference_front_f64.bin",
+        "rhs_f64.bin",
+        "original_matrix_f64.bin",
+        "original_rhs_f64.bin",
+        "row_scale_e.bin",
+        "x_reference_f64.bin",
+        "manifest.json",
+    ):
+        assert (first.out_dir / filename).read_bytes() == (
+            second.out_dir / filename
+        ).read_bytes()

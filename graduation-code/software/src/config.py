@@ -35,7 +35,7 @@ class OrderingConfig:
 
 @dataclass(frozen=True)
 class QuantConfig:
-    effective_bits: int = 27
+    effective_bits: int = 30
     clip_percentile: float = 100.0
 
     def __post_init__(self) -> None:
@@ -45,6 +45,26 @@ class QuantConfig:
             )
         if not 0 < self.clip_percentile <= 100:
             raise ValueError(f"clip_percentile must be in (0, 100], got {self.clip_percentile}")
+
+
+@dataclass(frozen=True)
+class EquilibrationConfig:
+    mode: str = "pow2-row"
+    max_scale_exponent: int = 60
+
+    _VALID_MODES: ClassVar[frozenset[str]] = frozenset({"none", "pow2-row"})
+
+    def __post_init__(self) -> None:
+        if self.mode not in self._VALID_MODES:
+            raise ValueError(
+                f"equilibration mode must be one of "
+                f"{sorted(self._VALID_MODES)}, got {self.mode!r}"
+            )
+        if not 0 <= self.max_scale_exponent <= 1023:
+            raise ValueError(
+                "max_scale_exponent must be in [0, 1023], got "
+                f"{self.max_scale_exponent}"
+            )
 
 
 @dataclass(frozen=True)
@@ -59,9 +79,17 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class SolveInputConfig:
+    rhs_path: str | None = None
+    seed: int = 1
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     matrix: MatrixInputConfig = MatrixInputConfig()
     ordering: OrderingConfig = OrderingConfig()
     quant: QuantConfig = QuantConfig()
+    equilibration: EquilibrationConfig = EquilibrationConfig()
     memory: MemoryConfig = MemoryConfig()
+    solve: SolveInputConfig = SolveInputConfig()
     out_dir: Path = Path("out")

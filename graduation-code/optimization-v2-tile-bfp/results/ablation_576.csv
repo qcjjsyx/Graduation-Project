@@ -1,0 +1,6 @@
+variant,tile_size,q_use_bits,guard_bits,factor_check_tol,residual,initial_residual,scaled_residual,rescue_nodes,total_cycles,interpretation
+v1_B1,0,26,8,none,0.004593448288824188,0.017656038380282072,not_recorded,13,1700662,scalar baseline
+tile_initial,16,26,8,none,14.013654867274994,199.1333990957287,0.015391213063616946,13,1724861,tile alone is unstable on 576
+tile_wide_workspace,16,30,20,none,0.002735507423266759,0.035725451272685345,2.0110161455701103e-06,13,1782160,wider mantissa and guard improve but miss target
+tile_gate_5e-7,16,30,20,5e-7,0.0008032149796698166,0.011054494069034242,8.003376891806148e-07,110,1730893,meets residual target with many rescues
+tile_gate_2e-7,16,30,20,2e-7,0.000325154759922243,0.0012285304750348624,2.929935877519001e-07,150,1693321,selected default for all three matrices

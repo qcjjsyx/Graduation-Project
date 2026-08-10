@@ -1,210 +1,131 @@
-# 软件侧代码说明
+# 软件侧符号分析与 SystemC 产物生成
 
-本目录是毕业设计中软件侧的当前实现。它的定位不是完整的软件 LU 求解器，而是
-**面向硬件加速器的稀疏矩阵前处理与硬件输入生成工具链**。
-
-软件侧完成从输入稀疏矩阵到硬件 DDR 输入数据的生成流程，包括排序、消去树、超节点、
-任务描述符、map table、本地贡献量化和 manifest 校验。
+软件侧负责把结构对称的稀疏矩阵转换为 ABI v2 DDR 镜像。数值可以非对称；若稀疏结构
+不对称会明确拒绝。SystemC 只依赖 `manifest.json` 和 `memory_image.bin`，其余独立
+二进制文件用于调试、黄金验证和跨语言测试。
 
 ## 当前流程
 
 ```text
-稀疏矩阵
-  -> 排序
-  -> 消去树
-  -> 超节点合并
-  -> Front Indices / A_local
-  -> S_format 量化
-  -> 产物
-  -> 硬件所需数据
+矩阵与 RHS
+  -> 2 的整数次幂行均衡 D_r A x = D_r b
+  -> ordering
+  -> 显式消元图 fill-in
+  -> elimination forest / supernode / front
+  -> 唯一 A_local 归属
+  -> child update map
+  -> S-format 量化
+  -> ABI v2 地址规划
+  -> memory_image.bin + manifest
 ```
 
-其中 `A_local` 表示每个消去树节点在原始矩阵中的本地前沿贡献。软件侧只负责把
-`A_local` 量化并写入 DDR 输入文件；节点装配、node-scale 选择、整数 LU/TRSM/GEMM
-和 child update 生成均由硬件侧完成。
+每个原始元素只在最早消去它的节点中出现。`A_local` 的 `F11/F12/F21` 来自原矩阵，
+`F22` 初始化为零，避免跨 front 重复装配。多根消去森林会原样保留。
 
-## 运行方式
+默认使用稀疏结构不变的 2 的整数次幂行均衡。第 `i` 行的缩放为
+`2^row_scale_e[i]`，因此硬件只需要调整 exponent，不需要增加浮点乘法器。该变换只缩放
+方程、不缩放未知量，所以求得的 `x` 无需反变换。软件同时保留原始 `A` 和 `b`，最终
+正确性始终按原方程 `A*x=b` 计算，而不是只检查均衡后的方程。
 
-推荐在 `graduation-code/software` 目录下以包方式运行：
+## 运行
 
 ```bash
 cd graduation-code/software
-python -m src.main --mtx example/1024X1024JJ.mat --out out
+python -m src.main \
+  -mtx example/256X256JJ.mat \
+  --rhs example/256fuv.mat \
+  --ordering amd \
+  --out /tmp/mf-256
 ```
 
-也支持从项目根目录直接运行脚本：
+未提供 `--rhs` 时，程序使用固定 `--rhs-seed` 生成 `x_true`，再计算 `b=A*x_true`：
 
 ```bash
-python graduation-code/software/src/main.py \
-  -mtx graduation-code/software/example/1024X1024JJ.mat \
-  --out out
+python -m src.main \
+  --n 32 --density 0.1 --seed 3 --rhs-seed 11 \
+  --out /tmp/mf-random
 ```
 
-如果不提供 `--mtx`，程序会根据 `--n`、`--density` 和 `--seed` 生成随机 SPD 矩阵：
+主要参数：
 
-```bash
-python -m src.main --n 128 --density 0.05 --seed 0 --out out_random
-```
-
-## 主要参数
-
-| 参数 | 默认值 | 说明 |
+| 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `-mtx`, `--mtx` | `None` | 输入 `.mat` 或 MatrixMarket 文件 |
-| `--out` | `out` | 输出目录 |
-| `--ordering` | `amd` | 排序方法，可选 `amd`、`rcm`、`identity` |
-| `--max-supernode-size` | `256` | 超节点最大合并列数 |
-| `--effective-bits` | `27` | 量化 mantissa 有效位数，`Q_use = 2^bits - 1` |
-| `--clip-percentile` | `100.0` | `A_local` 量化裁剪分位数，默认使用最大绝对值 |
-| `--n` | `64` | 随机矩阵维度 |
-| `--density` | `0.1` | 随机矩阵稀疏密度 |
-| `--seed` | `0` | 随机种子 |
+| `-mtx`, `--mtx` | 无 | `.mat` 或 MatrixMarket 输入 |
+| `--rhs` | 无 | 可选 `.mat`/`.npy` RHS |
+| `--rhs-seed` | 0 | 生成参考解/RHS 的 seed |
+| `--ordering` | `amd` | `amd`、`rcm` 或 `identity` |
+| `--max-supernode-size` | 256 | 最大 pivot supernode |
+| `--effective-bits` | 30 | 软件输入源量化有效位 |
+| `--clip-percentile` | 100 | 输入源裁剪分位数 |
+| `--equilibrate` | `pow2-row` | `pow2-row` 或 `none` |
+| `--max-scale-exponent` | 60 | 行缩放 exponent 的绝对值上限 |
 
-说明：当前 `amd` 是 dependency-free 的简化最小度排序启发式算法，并不是 SuiteSparse AMD
-或论文中完整的 quotient-graph AMD 实现。它用于当前软件 pipeline 的功能验证和硬件输入生成。
+这里的 `amd` 是仓库内的确定性最小度启发式实现，不等同于 SuiteSparse AMD。
 
-## 输出产物
+## 输出
 
-运行后会在 `--out` 目录生成：
+硬件/SystemC 主入口：
 
-| 文件 | 作用 |
+| 文件 | 内容 |
 |---|---|
-| `tasks.bin` | 硬件节点任务描述符 `NodeTask` |
-| `map_table.bin` | child update 到 parent front 的映射表 |
-| `front_q.bin` | 每个 node 的 `A_local` 量化 mantissa，`int32` |
-| `front_e.bin` | 每个 node 的 source exponent，`int16` |
-| `manifest.json` | 输出元数据、内存布局、量化信息和校验信息 |
+| `manifest.json` | ABI、符号结构、量化信息、地址和文件索引 |
+| `memory_image.bin` | 与地址规划完全一致的完整 DDR 镜像 |
 
-`manifest.json` 会在生成后自动校验。当前校验内容包括：
+调试镜像：
 
-- 输出文件大小是否一致
-- `NodeTask` ABI 大小是否一致
-- node/task 数量是否一致
-- `front_q` / `front_e` 与 `A_local` 维度是否匹配
-- DDR 内存区域是否按配置对齐且不重叠
-- `map_table.bin` 是否可解码
-- task order 是否满足 child-before-parent 的依赖顺序
+| 文件 | 内容 |
+|---|---|
+| `tasks.bin` | 128 字节 ABI v2 NodeTask 队列 |
+| `map_table.bin` | child update 到 parent front 的映射 |
+| `front_q.bin` / `front_e.bin` | 软件量化的唯一 A_local |
+| `rhs_q.bin` / `rhs_e.bin` | 定点 RHS |
 
-## 量化职责边界
+黄金验证旁路：
 
-本项目的量化方案主要面向硬件侧。软件侧只生成硬件执行所需的初始 DDR 输入。
+| 文件 | 内容 |
+|---|---|
+| `reference_front_f64.bin` | 均衡后 FP64 A_local |
+| `rhs_f64.bin` | 均衡且排序后的 FP64 RHS |
+| `x_reference_f64.bin` | 排序后的参考解 |
+| `original_matrix_f64.bin` | 原始坐标、未均衡的稠密 FP64 矩阵 |
+| `original_rhs_f64.bin` | 原始坐标、未均衡的 FP64 RHS |
+| `row_scale_e.bin` | 原始行编号顺序的 int16 行缩放 exponent |
 
-软件侧负责：
+黄金文件不属于硬件 DDR 输入。
 
-- 根据排序和消去树结果确定每个 node 的 `front_indices`
-- 从原始矩阵中提取每个 node 的本地贡献 `A_local`
-- 将每个 `A_local` 独立量化为 `S_format`
-- 写出 `front_q.bin`、`front_e.bin`、`tasks.bin`、`map_table.bin` 和 `manifest.json`
+## ABI 与校验
 
-硬件侧负责：
+ABI v2 使用小端 128 字节 `NodeTask`，不兼容 v1。软件生成结束后会校验：
 
-- 读取软件准备的 `A_local` source 和 child update source
-- 在父节点装配阶段完成 exponent 对齐和累加
-- 根据装配结果选择最终 node-scale
-- 执行整数 panel LU、TRSM、GEMM/Schur update
-- 生成 child update payload 并写回 DDR
+- 实际矩阵维度、任务数和文件大小；
+- task order、parent/children/flags 和 tile metadata；
+- 所有 DDR 地址的对齐、边界和不重叠；
+- map table 的父子关系和 child update 完整覆盖；
+- `memory_image.bin` 与独立调试文件逐区域一致；
+- RHS、参考 front、参考解、原始矩阵/RHS 和行缩放 exponent 长度；
+- 行均衡方程、模式及“解不需要反缩放”语义。
 
-当前软件侧的 `S_format` 为：
-
-```text
-x ~= q_x * 2^e_s
-q_x: int32 mantissa
-e_s: int16 source exponent
-```
-
-注意：软件侧不会生成整数 LU 数值结果，也不会生成 child update 数值 payload。
-
-## 符号分析与超节点
-
-当前符号分析流程为：
-
-```text
-ordering -> elimination tree -> supernode grouping -> front indices
-```
-
-排序方法：
-
-- `amd`：简化最小度排序启发式算法
-- `rcm`：Reverse Cuthill-McKee
-- `identity`：不重排
-
-超节点合并规则：
-
-- 在当前排序后的矩阵图上，只合并连续列
-- 若相邻列满足闭邻接集合相同，则可以合并：
-
-```text
-Adj(i) U {i} == Adj(j) U {j}
-```
-
-- 合并大小受 `--max-supernode-size` 限制，默认 256
-
-该规则参考 AMD 论文中 indistinguishable variables / supervariables 的描述，但这里作为排序后的
-后处理使用，不是完整 AMD 过程中的动态 quotient graph supervariable 检测。
-
-## 代码结构
-
-```text
-src/
-  config.py                 配置对象
-  dataStruct.py             NodeTask、MapTableEntry、内存区域和 ABI 定义
-  io.py                     二进制 tasks/map_table/front 数据读写
-  main.py                   命令行入口
-  matrix_io.py              矩阵加载和随机矩阵生成
-  pipeline.py               端到端生成流程
-  matrix_compress/
-    compress.py             .mat 读取和稀疏格式转换
-  memory/
-    planner.py              DDR 区域规划
-  quant/
-    bfp_quant.py            A_local 的 S_format 量化和硬件装配参考模型
-  scheduler/
-    map_gen.py              child update 到 parent front 的映射表生成
-    task_queue.py           child-before-parent 任务顺序生成
-  symbolic/
-    ordering.py             排序
-    etree.py                消去树
-    supernode.py            超节点合并和 front_indices 生成
-  verify/
-    manifest.py             manifest 校验
-    metrics.py              基础 residual 指标
-```
+完整布局见 [../systemc/docs/ABI_v2.md](../systemc/docs/ABI_v2.md)。
 
 ## 测试
 
-在 `graduation-code/software` 目录运行：
-
 ```bash
-python -m pytest
+cd graduation-code/software
+python -m pytest -q
 ```
 
-当前测试覆盖：
+当前 30 个测试覆盖 ABI、map、地址规划、ordering、fill/supernode、量化、2 的整数次幂
+行均衡、原方程验证、产物可复现性和端到端产物。
+SystemC 的 CTest 会再次调用此工具链生成真实产物，并进行 C++ 侧独立校验。
 
-- `NodeTask` ABI 编解码
-- `map_table` 编解码
-- 内存规划不重叠
-- 排序输出合法性
-- 超节点多列合并与上限控制
-- `A_local` 量化与装配参考模型
-- 端到端 pipeline 与 manifest 一致性
+## 当前规模
 
-## 示例结果
+当前 ordering 与 supernode 规则下：
 
-在项目根目录运行：
+| 矩阵 | 节点数 | 最大 pivot | 最大 front |
+|---|---:|---:|---:|
+| 256JJ | 73 | 72 | 72 |
+| 576JJ | 157 | 156 | 156 |
+| 1024JJ | 274 | 256 | 272 |
 
-```bash
-python graduation-code/software/src/main.py \
-  -mtx graduation-code/software/example/1024X1024JJ.mat \
-  --out /tmp/software_demo
-```
-
-示例输出：
-
-```text
-residual_norm: 9.259e-06
-nodes: 784, tasks: 784
-out_dir: /tmp/software_demo
-```
-
-`residual_norm` 当前是对输入矩阵进行高精度参考求解得到的 sanity check，不代表硬件整数 LU
-执行结果。
+这也是 SystemC HPU 保留 256 个候选、ATU 使用 9 bit 行索引的依据。
