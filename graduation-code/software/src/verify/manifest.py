@@ -32,6 +32,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     _validate_abi(manifest)
+    _validate_symbolic_metadata(manifest)
     _validate_output_sizes(out_dir, manifest)
     _validate_equilibration(out_dir, manifest)
 
@@ -84,6 +85,27 @@ def _validate_abi(manifest: dict) -> None:
         raise ManifestValidationError("manifest NodeTask byte size does not match code")
     if abi.get("endianness") != "little":
         raise ManifestValidationError("only little-endian artifacts are supported")
+
+
+def _validate_symbolic_metadata(manifest: dict) -> None:
+    matrix = manifest.get("matrix", {})
+    if not isinstance(matrix.get("structurally_symmetric"), bool):
+        raise ManifestValidationError(
+            "matrix.structurally_symmetric must describe the input pattern"
+        )
+
+    symbolic = manifest.get("symbolic", {})
+    if (
+        symbolic.get("pattern_source")
+        != "union_of_A_and_transpose_nonzero_patterns"
+    ):
+        raise ManifestValidationError(
+            "symbolic pattern must come from pattern(A) union pattern(A.T)"
+        )
+    if symbolic.get("pattern_structurally_symmetric") is not True:
+        raise ManifestValidationError(
+            "symbolic pattern must be marked structurally symmetric"
+        )
 
 
 def _validate_output_sizes(out_dir: Path, manifest: dict) -> None:

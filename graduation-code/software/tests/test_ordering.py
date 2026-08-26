@@ -29,6 +29,25 @@ def test_ordering_amd_returns_valid_permutation():
     _assert_permutation(perm, 4)
 
 
+def test_orderings_use_same_envelope_for_asymmetric_pattern_and_transpose():
+    matrix = sp.csr_matrix(
+        [
+            [5, 1, 0, 0, 0],
+            [0, 5, 1, 0, 0],
+            [1, 0, 5, 1, 0],
+            [0, 0, 0, 5, 1],
+            [0, 1, 0, 0, 5],
+        ],
+        dtype=np.float64,
+    )
+
+    for method in ("amd", "rcm"):
+        permutation = compute_ordering(matrix, method)
+        transpose_permutation = compute_ordering(matrix.T.tocsr(), method)
+        _assert_permutation(permutation, 5)
+        np.testing.assert_array_equal(permutation, transpose_permutation)
+
+
 def test_ordering_rejects_unknown_method():
     a = sp.eye(3, format="csr")
     try:

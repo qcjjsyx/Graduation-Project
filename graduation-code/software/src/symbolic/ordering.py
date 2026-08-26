@@ -4,8 +4,12 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 
+from src.symbolic.pattern import symmetric_sparsity_pattern
+
 
 def compute_ordering(a: sp.spmatrix, method: str = "amd") -> np.ndarray:
+    """Order the symmetric envelope of a square sparse matrix."""
+
     method = method.lower()
     if method == "amd":
         return approximate_minimum_degree(a)
@@ -23,7 +27,8 @@ def identity_ordering(a: sp.spmatrix) -> np.ndarray:
 
 def reverse_cuthill_mckee_ordering(a: sp.spmatrix) -> np.ndarray:
     _validate_square_sparse(a)
-    perm = reverse_cuthill_mckee(a, symmetric_mode=True)
+    pattern = symmetric_sparsity_pattern(a)
+    perm = reverse_cuthill_mckee(pattern, symmetric_mode=True)
     return np.asarray(perm, dtype=np.int32)
 
 
@@ -74,8 +79,7 @@ def _validate_square_sparse(a: sp.spmatrix) -> None:
 
 
 def _symmetric_adjacency(a: sp.spmatrix) -> list[set[int]]:
-    pattern = (a != 0).astype(np.int8) # type: ignore
-    pattern = (pattern + pattern.T).astype(bool).tocsr()
+    pattern = symmetric_sparsity_pattern(a)
     pattern.setdiag(False)
     pattern.eliminate_zeros()
 

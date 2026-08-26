@@ -6,10 +6,12 @@ from typing import List
 import numpy as np
 import scipy.sparse as sp
 
+from src.symbolic.pattern import symmetric_sparsity_pattern
+
 
 @dataclass(frozen=True)
 class FilledPattern:
-    """Symbolic factor pattern for a structurally symmetric matrix.
+    """Symbolic factor pattern for a symmetric sparsity envelope.
 
     ``columns[k]`` contains ``k`` followed by the filled row indices below the
     diagonal in column ``k``.  The implementation uses an explicit elimination
@@ -22,28 +24,17 @@ class FilledPattern:
     fill_edge_count: int
 
 
-def require_structurally_symmetric(matrix: sp.spmatrix) -> None:
-    if matrix.shape[0] != matrix.shape[1]:
-        raise ValueError("matrix must be square")
-    pattern = (matrix != 0).astype(np.int8).tocsr()
-    difference = pattern != pattern.T
-    if difference.nnz:
-        raise ValueError(
-            "ABI v2 currently requires a structurally symmetric sparsity pattern; "
-            f"found {difference.nnz} asymmetric pattern entries"
-        )
-
-
 def symbolic_fill_pattern(matrix: sp.spmatrix) -> FilledPattern:
-    """Build the filled lower-column pattern and elimination forest.
+    """Build the filled pattern and forest from a symmetric envelope.
 
-    Numeric values are deliberately ignored.  At elimination step ``k`` the
-    higher-numbered neighbours form the filled column of L and are connected
-    into a clique.  The first higher neighbour is the etree parent.
+    The input may have an asymmetric nonzero structure.  Numeric values are
+    discarded and ``pattern(A) union pattern(A.T)`` is formed first.  At
+    elimination step ``k`` the higher-numbered neighbours form the filled
+    column and are connected into a clique.  The first higher neighbour is the
+    etree parent.
     """
 
-    require_structurally_symmetric(matrix)
-    pattern = ((matrix != 0) + (matrix.T != 0)).astype(bool).tocsr()
+    pattern = symmetric_sparsity_pattern(matrix)
     n = int(pattern.shape[0])
     adjacency: List[set[int]] = []
     for row in range(n):
@@ -79,4 +70,3 @@ def symbolic_fill_pattern(matrix: sp.spmatrix) -> FilledPattern:
         columns=columns,
         fill_edge_count=fill_edge_count,
     )
-

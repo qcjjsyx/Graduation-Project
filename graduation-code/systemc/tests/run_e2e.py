@@ -154,6 +154,67 @@ def main() -> int:
         ):
             assert (result / filename).stat().st_size > 0
 
+        asymmetric_matrix = root / "asymmetric.mtx"
+        asymmetric_matrix.write_text(
+            """%%MatrixMarket matrix coordinate real general
+6 6 14
+1 1 10
+1 2 2
+2 2 11
+2 3 3
+3 1 1
+3 3 12
+3 4 4
+4 4 13
+4 5 5
+5 2 1
+5 5 14
+5 6 6
+6 3 1
+6 6 15
+"""
+        )
+        asymmetric_artifact = root / "asymmetric-artifact"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "src.main",
+                "-mtx",
+                str(asymmetric_matrix),
+                "--out",
+                str(asymmetric_artifact),
+                "--rhs-seed",
+                "17",
+                "--ordering",
+                "rcm",
+                "--equilibrate",
+                "none",
+            ],
+            cwd=software_dir,
+        )
+        asymmetric_manifest = json.loads(
+            (asymmetric_artifact / "manifest.json").read_text()
+        )
+        assert asymmetric_manifest["matrix"]["structurally_symmetric"] is False
+        assert (
+            asymmetric_manifest["symbolic"]["pattern_source"]
+            == "union_of_A_and_transpose_nonzero_patterns"
+        )
+        asymmetric_summary = run_simulator(
+            simulator,
+            asymmetric_artifact,
+            config,
+            root / "asymmetric-result",
+        )
+        assert asymmetric_summary["status"] == "ok"
+        assert (
+            asymmetric_summary["completed_nodes"]
+            == asymmetric_summary["node_count"]
+        )
+        assert asymmetric_summary["solve"]["fp64"]["relative_residual"] <= 1e-10
+        assert asymmetric_summary["solve"]["fixed"]["relative_residual"] <= 1e-3
+
         base_config = json.loads(config.read_text())
         pressure_config = root / "pressure.json"
         pressure_values = dict(base_config)
@@ -225,6 +286,22 @@ def main() -> int:
         (bad_version / "manifest.json").write_text(json.dumps(bad_manifest))
         expect_rejected(
             simulator, bad_version, config, root / "bad-version-result"
+        )
+
+        bad_symbolic_pattern = root / "bad-symbolic-pattern"
+        shutil.copytree(artifact, bad_symbolic_pattern)
+        bad_symbolic_manifest = json.loads(
+            (bad_symbolic_pattern / "manifest.json").read_text()
+        )
+        bad_symbolic_manifest["symbolic"]["pattern_source"] = "original_matrix"
+        (bad_symbolic_pattern / "manifest.json").write_text(
+            json.dumps(bad_symbolic_manifest)
+        )
+        expect_rejected(
+            simulator,
+            bad_symbolic_pattern,
+            config,
+            root / "bad-symbolic-pattern-result",
         )
 
         truncated = root / "truncated"

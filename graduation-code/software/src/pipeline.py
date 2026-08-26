@@ -33,8 +33,12 @@ from src.quant.bfp_quant import (
 from src.scheduler.map_gen import generate_map_tables
 from src.scheduler.task_queue import sibling_friendly_order
 from src.symbolic.etree import children_from_parent
-from src.symbolic.fill import require_structurally_symmetric, symbolic_fill_pattern
+from src.symbolic.fill import symbolic_fill_pattern
 from src.symbolic.ordering import apply_permutation, compute_ordering
+from src.symbolic.pattern import (
+    is_structurally_symmetric,
+    symmetric_sparsity_pattern,
+)
 from src.symbolic.supernode import (
     build_front_indices_from_filled,
     build_supernode_parent,
@@ -46,37 +50,59 @@ from src.verify.metrics import residual_norm
 
 @dataclass(frozen=True)
 class PipelineOutputs:
+    # 输出目录：流水线全部产物所在目录
     out_dir: Path
+    # 任务文件路径：供硬件执行的任务列表 (tasks.bin)
     tasks_path: Path
+    # 映射表路径：全局列索引到超节点内部的映射表 (map_table.bin)
     map_table_path: Path
+    # 超节点 Q 数据文件路径：各超节点分解得到的 Q 系数数据 (front_q.bin)
     front_q_path: Path
+    # 超节点 E 数据文件路径：各超节点分解得到的 E 系数数据 (front_e.bin)
     front_e_path: Path
+    # 内存镜像文件路径：硬件初始化所需的预分配内存镜像 (memory_image.bin)
     memory_image_path: Path
+    # 参考超节点文件路径：软件侧浮点64超节点结果，用于硬件比对 (reference_front_f64.bin)
     reference_front_path: Path
+    # RHS 参考文件路径：置换后的浮点64右端项参考 (rhs_f64.bin)
     rhs_reference_path: Path
+    # 原始矩阵参考文件路径：未经均衡化的浮点64原始矩阵 (original_matrix_f64.bin)
     original_matrix_reference_path: Path
+    # 原始 RHS 参考文件路径：未经均衡化的浮点64右端项 (original_rhs_f64.bin)
     original_rhs_reference_path: Path
+    # 行缩放指数文件路径：pow2 均衡化得到的每行缩放幂指数 (row_scale_e.bin)
     row_scale_exponents_path: Path
+    # 参考解文件路径：软件侧浮点64求得的精确解 x (x_reference_f64.bin)
     solution_reference_path: Path
+    # 清单文件路径：描述全部产物与流水线配置的 JSON 清单 (manifest.json)
     manifest_path: Path
+    # 缩放后残差范数：|Ax - b| / |b|，基于均衡化后的矩阵
     residual_norm: float
+    # 原始残差范数：|Ax - b| / |b|，基于原始矩阵与原始 RHS
     original_residual_norm: float
+    # 节点数量：符号分解产生的超节点总数
     node_count: int
+    # 任务数量：调度生成的任务总数
     task_count: int
 
 
 def run_pipeline(config: PipelineConfig) -> PipelineOutputs:
+    ## 1. Load the original numeric matrix; symbolic analysis uses its
+    ## symmetric nonzero-pattern envelope and does not require A itself to be
+    ## structurally symmetric.
     original_matrix = load_matrix(
         path=config.matrix.path,
         n=config.matrix.n,
         density=config.matrix.density,
         seed=config.matrix.seed,
     )
-    require_structurally_symmetric(original_matrix)
+    input_structurally_symmetric = is_structurally_symmetric(original_matrix)
 
     rhs_original, solution_original, rhs_source_kind = _prepare_rhs(
         original_matrix, config
     )
+
+    ## 2. Equilibrate the system
     equilibration = equilibrate_system(
         original_matrix,
         rhs_original,
@@ -273,6 +299,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineOutputs:
         residual=residual,
         original_residual=original_residual,
         actual_matrix_dim=matrix_dim,
+        input_structurally_symmetric=input_structurally_symmetric,
         rhs_source=rhs_source,
         rhs_source_kind=rhs_source_kind,
         equilibration=equilibration,
@@ -318,9 +345,10 @@ def run_pipeline(config: PipelineConfig) -> PipelineOutputs:
 
 
 def run_symbolic_analysis(matrix, config: PipelineConfig) -> SymbolicResult:
-    permutation = compute_ordering(matrix, config.ordering.method)
-    permuted = apply_permutation(matrix, permutation)
-    filled = symbolic_fill_pattern(permuted)
+    symbolic_pattern = symmetric_sparsity_pattern(matrix)
+    permutation = compute_ordering(symbolic_pattern, config.ordering.method)
+    permuted_pattern = apply_permutation(symbolic_pattern, permutation)
+    filled = symbolic_fill_pattern(permuted_pattern)
     supernodes = build_supernodes_from_filled(
         filled.parent,
         filled.columns,
@@ -486,6 +514,7 @@ def build_manifest(
     residual: float,
     original_residual: float,
     actual_matrix_dim: int,
+    input_structurally_symmetric: bool,
     rhs_source,
     rhs_source_kind: str,
     equilibration: EquilibrationResult,
@@ -509,7 +538,7 @@ def build_manifest(
             "n": actual_matrix_dim,
             "density": config.matrix.density,
             "seed": config.matrix.seed,
-            "structurally_symmetric": True,
+            "structurally_symmetric": input_structurally_symmetric,
         },
         "total_bytes": total_bytes,
         "memory_image": {
@@ -554,6 +583,8 @@ def build_manifest(
             },
         },
         "symbolic": {
+            "pattern_source": "union_of_A_and_transpose_nonzero_patterns",
+            "pattern_structurally_symmetric": True,
             "node_count": len(symbolic.node_ranges),
             "supernode_count": len(symbolic.supernodes),
             "permutation": symbolic.permutation,

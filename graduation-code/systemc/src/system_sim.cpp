@@ -112,21 +112,24 @@ int sc_main(int argc, char** argv) {
             "registered_tasks", config.fifo_depth);
         sc_core::sc_fifo<hw::NodeTask> ready_tasks(
             "ready_tasks", config.fifo_depth);
+        // 各流水级之间的数据通道（FIFO），深度取自配置文件
         sc_core::sc_fifo<hw::WorkItem> loaded_work(
-            "loaded_work", config.fifo_depth);
+            "loaded_work", config.fifo_depth);  // 内存加载级输出
         sc_core::sc_fifo<hw::WorkItem> assembled_work(
-            "assembled_work", config.fifo_depth);
+            "assembled_work", config.fifo_depth);  // 装配级输出
         sc_core::sc_fifo<hw::ComputeDone> compute_results(
-            "compute_results", config.fifo_depth);
+            "compute_results", config.fifo_depth);  // 计算级结果
         sc_core::sc_fifo<hw::NodeCommit> commit_events(
-            "commit_events", config.fifo_depth);
+            "commit_events", config.fifo_depth);  // 提交事件
         sc_core::sc_fifo<hw::BufferRelease> release_events(
-            "release_events", config.fifo_depth);
+            "release_events", config.fifo_depth);  // 缓冲区释放事件
 
+        // ATU（地址转换单元）初始化握手信号
         sc_core::sc_signal<bool> atu_init_identity{"atu_init_identity"};
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>> atu_init_rows{
             "atu_init_rows"};
         sc_core::sc_signal<bool> atu_init_done{"atu_init_done"};
+        // ATU 逻辑行->物理行 查询请求/响应（valid/ready 握手）
         sc_core::sc_signal<bool> atu_q_req_valid{"atu_q_req_valid"};
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>>
             atu_q_req_row_logic{"atu_q_req_row_logic"};
@@ -134,6 +137,7 @@ int sc_main(int argc, char** argv) {
         sc_core::sc_signal<bool> atu_q_resp_valid{"atu_q_resp_valid"};
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>>
             atu_q_resp_row_physical{"atu_q_resp_row_physical"};
+        // ATU 主元（pivot）行请求与完成信号
         sc_core::sc_signal<bool> atu_pivot_req_valid{
             "atu_pivot_req_valid"};
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>> atu_pivot_row_i{
@@ -144,8 +148,10 @@ int sc_main(int argc, char** argv) {
             "atu_pivot_req_ready"};
         sc_core::sc_signal<bool> atu_pivot_done{"atu_pivot_done"};
 
+        // HPU（主元计算单元）接口信号
         sc_core::sc_signal<bool> hpu_pivot_start{"hpu_pivot_start"};
         sc_core::sc_signal<bool> hpu_pivot_busy{"hpu_pivot_busy"};
+        // HPU 数据输入（valid/ready 握手 + 数值/行号/末元素标志）
         sc_core::sc_signal<bool> hpu_in_valid{"hpu_in_valid"};
         sc_core::sc_signal<bool> hpu_in_ready{"hpu_in_ready"};
         sc_core::sc_signal<sc_dt::sc_int<hw::HPU::DATA_W>> hpu_in_value{
@@ -153,6 +159,7 @@ int sc_main(int argc, char** argv) {
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>>
             hpu_in_row_logical{"hpu_in_row_logical"};
         sc_core::sc_signal<bool> hpu_in_last{"hpu_in_last"};
+        // HPU 主元结果输出及失败标志
         sc_core::sc_signal<bool> hpu_pivot_valid{"hpu_pivot_valid"};
         sc_core::sc_signal<bool> hpu_pivot_ready{"hpu_pivot_ready"};
         sc_core::sc_signal<sc_dt::sc_uint<hw::ROW_IDX_W>> hpu_pivot_row{

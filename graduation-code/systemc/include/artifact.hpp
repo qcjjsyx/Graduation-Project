@@ -139,9 +139,21 @@ inline ArtifactManifest load_manifest(const std::filesystem::path& path) {
     ArtifactManifest manifest{};
     manifest.manifest_path = std::filesystem::absolute(path);
     manifest.directory = manifest.manifest_path.parent_path();
-    manifest.matrix_dim = json.at("matrix").at("n").get<std::uint32_t>();
-    manifest.node_count =
-        json.at("symbolic").at("node_count").get<std::uint32_t>();
+    const auto& matrix = json.at("matrix");
+    if (!matrix.at("structurally_symmetric").is_boolean()) {
+        throw std::runtime_error(
+            "matrix.structurally_symmetric must describe the input pattern");
+    }
+    manifest.matrix_dim = matrix.at("n").get<std::uint32_t>();
+
+    const auto& symbolic = json.at("symbolic");
+    if (symbolic.at("pattern_source").get<std::string>() !=
+            "union_of_A_and_transpose_nonzero_patterns" ||
+        !symbolic.at("pattern_structurally_symmetric").get<bool>()) {
+        throw std::runtime_error(
+            "unsupported symbolic pattern (requires pattern(A) union pattern(A.T))");
+    }
+    manifest.node_count = symbolic.at("node_count").get<std::uint32_t>();
     manifest.total_bytes = json.at("total_bytes").get<std::uint64_t>();
     manifest.alignment =
         json.at("config").at("memory").at("alignment").get<std::uint32_t>();
@@ -152,9 +164,9 @@ inline ArtifactManifest load_manifest(const std::filesystem::path& path) {
     }
 
     manifest.parent =
-        json.at("symbolic").at("parent").get<std::vector<std::int32_t>>();
+        symbolic.at("parent").get<std::vector<std::int32_t>>();
     manifest.permutation =
-        json.at("symbolic").at("permutation").get<std::vector<std::uint32_t>>();
+        symbolic.at("permutation").get<std::vector<std::uint32_t>>();
     const auto raw_order =
         json.at("task_order").get<std::vector<std::uint32_t>>();
     if (manifest.parent.size() != manifest.node_count ||

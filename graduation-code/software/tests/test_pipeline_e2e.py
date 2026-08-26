@@ -2,10 +2,20 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from src.config import MatrixInputConfig, OrderingConfig, PipelineConfig
+import numpy as np
+import pytest
+import scipy.io
+import scipy.sparse as sp
+
+from src.config import (
+    EquilibrationConfig,
+    MatrixInputConfig,
+    OrderingConfig,
+    PipelineConfig,
+)
 from src.dataStruct import NODE_TASK_BYTE_SIZE
 from src.pipeline import run_pipeline
-from src.verify.manifest import validate_manifest
+from src.verify.manifest import ManifestValidationError, validate_manifest
 
 
 def test_pipeline_outputs_are_manifest_consistent(tmp_path: Path):
@@ -95,3 +105,64 @@ def test_pipeline_artifacts_are_reproducible(tmp_path: Path):
         assert (first.out_dir / filename).read_bytes() == (
             second.out_dir / filename
         ).read_bytes()
+
+
+def test_pipeline_supports_asymmetric_structure_without_losing_values(
+    tmp_path: Path,
+):
+    matrix = sp.csr_matrix(
+        np.array(
+            [
+                [10.0, 2.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 11.0, 3.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 12.0, 4.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 13.0, 5.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 14.0, 6.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 15.0],
+            ]
+        )
+    )
+    matrix_path = tmp_path / "asymmetric.mtx"
+    scipy.io.mmwrite(matrix_path, matrix)
+    config = PipelineConfig(
+        matrix=MatrixInputConfig(path=str(matrix_path), n=6),
+        ordering=OrderingConfig(method="rcm"),
+        equilibration=EquilibrationConfig(mode="none"),
+        out_dir=tmp_path / "artifact",
+    )
+
+    outputs = run_pipeline(config)
+    manifest = json.loads(outputs.manifest_path.read_text(encoding="utf-8"))
+    validate_manifest(outputs.manifest_path)
+
+    assert manifest["matrix"]["structurally_symmetric"] is False
+    assert (
+        manifest["symbolic"]["pattern_source"]
+        == "union_of_A_and_transpose_nonzero_patterns"
+    )
+    assert manifest["symbolic"]["pattern_structurally_symmetric"] is True
+    assert outputs.original_residual_norm <= 1e-12
+
+    permutation = np.asarray(manifest["symbolic"]["permutation"])
+    expected = matrix[permutation][:, permutation].toarray()
+    reconstructed = np.zeros_like(expected)
+    reference_data = outputs.reference_front_path.read_bytes()
+    for node_id in range(outputs.node_count):
+        node = manifest["nodes"][str(node_id)]
+        front = np.asarray(node["front_indices"])
+        dimension = len(front)
+        offset = node["reference_front_file_offset"]
+        local = np.frombuffer(
+            reference_data,
+            dtype="<f8",
+            count=dimension * dimension,
+            offset=offset,
+        ).reshape(dimension, dimension)
+        reconstructed[np.ix_(front, front)] += local
+
+    np.testing.assert_array_equal(reconstructed, expected)
+
+    manifest["symbolic"]["pattern_source"] = "original_matrix"
+    outputs.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ManifestValidationError, match="symbolic pattern"):
+        validate_manifest(outputs.manifest_path)

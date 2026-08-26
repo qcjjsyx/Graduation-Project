@@ -511,7 +511,7 @@ ordering 本身接近当前无 delayed pivot 设计的稳定边界，而不是 S
 
 当前已通过：
 
-- 软件 pytest：30/30；
+- 软件 pytest：32/32；
 - SystemC CTest：3/3；
 - ATU/HPU 边界、握手和最小负数测试；
 - 宽除法、guard-bit cancellation、救援触发单元测试；
@@ -576,7 +576,7 @@ NodeStatus 传播，不能表现为依赖永不满足。
 
 1. 不支持 delayed pivot；
 2. 不支持运行时扩大/合并 front；
-3. 不支持列主元和一般非结构对称稀疏结构；
+3. 符号包络支持非对称稀疏结构，但不支持独立行列置换、列主元或结构 matching；
 4. 不支持 tile/block 级 exponent，只支持 local、assembled、U、update 和 node-vector 层级；
 5. precision rescue 是 FP64 SystemC 后端，不是 RTL；
 6. 迭代求精的 residual 使用稠密黄金 `A`，属于 Host Checker/研究模型；

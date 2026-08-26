@@ -1,33 +1,74 @@
-# 软件侧符号分析与 SystemC 产物生成
+# 软件侧：稀疏求解编译器
 
-软件侧负责把结构对称的稀疏矩阵转换为 ABI v2 DDR 镜像。数值可以非对称；若稀疏结构
-不对称会明确拒绝。SystemC 只依赖 `manifest.json` 和 `memory_image.bin`，其余独立
-二进制文件用于调试、黄金验证和跨语言测试。
+状态：当前主线说明
 
-## 当前流程
+软件侧不执行硬件计算，而是将输入矩阵转换为设备能够执行的结构和数据产物。
+
+## 1. 软件职责
 
 ```text
-矩阵与 RHS
-  -> 2 的整数次幂行均衡 D_r A x = D_r b
-  -> ordering
-  -> 显式消元图 fill-in
-  -> elimination forest / supernode / front
-  -> 唯一 A_local 归属
-  -> child update map
-  -> S-format 量化
-  -> ABI v2 地址规划
-  -> memory_image.bin + manifest
+A、b
+  → 行均衡（可选）
+  → pattern(A) ∪ pattern(Aᵀ)
+  → ordering / fill / elimination forest
+  → supernode / front / update map
+  → artifact ABI v2
+  → command stream（目标接口）
 ```
 
-每个原始元素只在最早消去它的节点中出现。`A_local` 的 `F11/F12/F21` 来自原矩阵，
-`F22` 初始化为零，避免跨 front 重复装配。多根消去森林会原样保留。
+具体职责包括：
 
-默认使用稀疏结构不变的 2 的整数次幂行均衡。第 `i` 行的缩放为
-`2^row_scale_e[i]`，因此硬件只需要调整 exponent，不需要增加浮点乘法器。该变换只缩放
-方程、不缩放未知量，所以求得的 `x` 无需反变换。软件同时保留原始 `A` 和 `b`，最终
-正确性始终按原方程 `A*x=b` 计算，而不是只检查均衡后的方程。
+- 保留原始矩阵数值和方向性；
+- 使用非零模式对称包络进行符号分析；
+- 构建消除森林、supernode、front 和 child update map；
+- 确保每个原始数值元素唯一归属；
+- 规划 DDR 地址、区域所有权和 buffer 需求；
+- 生成 manifest、memory image 和当前 ABI v2 `NodeTask`；
+- 后续由 command compiler 生成 command ring 和 descriptor table。
 
-## 运行
+## 2. 当前产物接口
+
+当前 SystemC 运行路径读取：
+
+```text
+manifest.json
+memory_image.bin
+```
+
+其中 `memory_image.bin` 包含当前 ABI v2 所需的任务、front、map 和数据区域。独立的 FP64 front、原始矩阵、RHS 和参考解文件只用于调试或黄金检查，不得被设备计算路径当作旁路输入。
+
+当前 ABI v2 的固定任务记录为 128 字节 `NodeTask`。它仍然是迁移阶段的实际接口，不是目标长期接口。
+
+## 3. 目标 command compiler
+
+目标软件接口为：
+
+```text
+NodeTask / forest / front metadata
+              ↓
+       Command Compiler
+              ↓
+command ring + descriptor table + data image
+```
+
+command 只表达 `PANEL_LU`、`TRSM`、`GEMM_SCHUR`、`STORE`、`COMMIT` 等语义操作；front 地址、尺寸、stride、map、局部 GEMM scale 和异常策略进入 descriptor。
+
+迁移策略是先增加适配器，不立即删除 ABI v2：
+
+1. 现有 pipeline 继续生成 ABI v2；
+2. 从同一内部 front graph 生成 command stream；
+3. 用命令解释器和现有 SystemC 结果交叉检查；
+4. command executor 稳定后，停止扩张 `NodeTask` 字段。
+
+## 4. 数值数据原则
+
+- FP64 作为软件黄金参考；
+- FP32/FP64 front 作为 SystemC 主设备路径；
+- INT32 只在 GEMM tile 调用边界量化；
+- 不将 INT32/BFP scale 传播为整棵消除树的全局格式；
+- 量化导致 pivot 或 residual 失败时，返回明确状态，不使用黄金结果覆盖。
+
+## 5. 当前运行
 
 ```bash
 cd graduation-code/software
@@ -38,94 +79,32 @@ python -m src.main \
   --out /tmp/mf-256
 ```
 
-未提供 `--rhs` 时，程序使用固定 `--rhs-seed` 生成 `x_true`，再计算 `b=A*x_true`：
-
-```bash
-python -m src.main \
-  --n 32 --density 0.1 --seed 3 --rhs-seed 11 \
-  --out /tmp/mf-random
-```
-
-主要参数：
-
-| 参数 | 默认值 | 含义 |
-|---|---:|---|
-| `-mtx`, `--mtx` | 无 | `.mat` 或 MatrixMarket 输入 |
-| `--rhs` | 无 | 可选 `.mat`/`.npy` RHS |
-| `--rhs-seed` | 0 | 生成参考解/RHS 的 seed |
-| `--ordering` | `amd` | `amd`、`rcm` 或 `identity` |
-| `--max-supernode-size` | 256 | 最大 pivot supernode |
-| `--effective-bits` | 30 | 软件输入源量化有效位 |
-| `--clip-percentile` | 100 | 输入源裁剪分位数 |
-| `--equilibrate` | `pow2-row` | `pow2-row` 或 `none` |
-| `--max-scale-exponent` | 60 | 行缩放 exponent 的绝对值上限 |
-
-这里的 `amd` 是仓库内的确定性最小度启发式实现，不等同于 SuiteSparse AMD。
-
-## 输出
-
-硬件/SystemC 主入口：
-
-| 文件 | 内容 |
-|---|---|
-| `manifest.json` | ABI、符号结构、量化信息、地址和文件索引 |
-| `memory_image.bin` | 与地址规划完全一致的完整 DDR 镜像 |
-
-调试镜像：
-
-| 文件 | 内容 |
-|---|---|
-| `tasks.bin` | 128 字节 ABI v2 NodeTask 队列 |
-| `map_table.bin` | child update 到 parent front 的映射 |
-| `front_q.bin` / `front_e.bin` | 软件量化的唯一 A_local |
-| `rhs_q.bin` / `rhs_e.bin` | 定点 RHS |
-
-黄金验证旁路：
-
-| 文件 | 内容 |
-|---|---|
-| `reference_front_f64.bin` | 均衡后 FP64 A_local |
-| `rhs_f64.bin` | 均衡且排序后的 FP64 RHS |
-| `x_reference_f64.bin` | 排序后的参考解 |
-| `original_matrix_f64.bin` | 原始坐标、未均衡的稠密 FP64 矩阵 |
-| `original_rhs_f64.bin` | 原始坐标、未均衡的 FP64 RHS |
-| `row_scale_e.bin` | 原始行编号顺序的 int16 行缩放 exponent |
-
-黄金文件不属于硬件 DDR 输入。
-
-## ABI 与校验
-
-ABI v2 使用小端 128 字节 `NodeTask`，不兼容 v1。软件生成结束后会校验：
-
-- 实际矩阵维度、任务数和文件大小；
-- task order、parent/children/flags 和 tile metadata；
-- 所有 DDR 地址的对齐、边界和不重叠；
-- map table 的父子关系和 child update 完整覆盖；
-- `memory_image.bin` 与独立调试文件逐区域一致；
-- RHS、参考 front、参考解、原始矩阵/RHS 和行缩放 exponent 长度；
-- 行均衡方程、模式及“解不需要反缩放”语义。
-
-完整布局见 [../systemc/docs/ABI_v2.md](../systemc/docs/ABI_v2.md)。
-
-## 测试
+验证软件：
 
 ```bash
 cd graduation-code/software
 python -m pytest -q
 ```
 
-当前 30 个测试覆盖 ABI、map、地址规划、ordering、fill/supernode、量化、2 的整数次幂
-行均衡、原方程验证、产物可复现性和端到端产物。
-SystemC 的 CTest 会再次调用此工具链生成真实产物，并进行 C++ 侧独立校验。
+## 6. 软件输出检查
 
-## 当前规模
+必须检查：
 
-当前 ordering 与 supernode 规则下：
+- 矩阵是否方形；
+- 原始数值非对称性是否被保留；
+- 符号来源是否为 `pattern(A) ∪ pattern(Aᵀ)`；
+- front、forest、supernode 和 map 是否完整；
+- 地址范围、对齐和区域是否重叠；
+- descriptor 引用是否有效；
+- front/panel/tile 是否超过当前硬件支持上限。
 
-| 矩阵 | 节点数 | 最大 pivot | 最大 front |
-|---|---:|---:|---:|
-| 256JJ | 73 | 72 | 72 |
-| 576JJ | 157 | 156 | 156 |
-| 1024JJ | 274 | 256 | 272 |
+## 7. 不负责的内容
 
-这也是 SystemC HPU 保留 256 个候选、ATU 使用 9 bit 行索引的依据。
+软件不负责：
+
+- 在设备侧动态生成 fill；
+- 在硬件中维护消除树缓存；
+- 为每个消除树节点定义一套独立全局量化格式；
+- 直接把 Host 指针传递给 SystemC 或 RTL；
+- 把 FP64 黄金结果写入设备计算 buffer。
+
