@@ -1,0 +1,85 @@
+<mxfile host="Electron" agent="Codex">
+  <diagram id="图2 双缓冲流水线" name="图2 双缓冲流水线">
+    <mxGraphModel dx="1338" dy="1006" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1120" pageHeight="500" background="light-dark(#FFFFFF,#FFFFFF)" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="box2" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;strokeColor=#b7b7b7;fillColor=#ffffff;" value="" vertex="1">
+          <mxGeometry height="360" width="910" x="170" y="55" as="geometry" />
+        </mxCell>
+        <mxCell id="b3" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;fillColor=#4472c4;strokeColor=#4472c4;fontColor=#ffffff;fontSize=20;fontStyle=1;rotation=0;align=center;verticalAlign=middle;" value="双缓冲" vertex="1">
+          <mxGeometry height="200" width="70" x="80" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="b4" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;fillColor=#4472c4;strokeColor=#ffffff;fontColor=#ffffff;fontSize=17;fontStyle=1;rotation=0;align=center;verticalAlign=middle;" value="缓冲区一" vertex="1">
+          <mxGeometry height="80" width="70" x="150" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="b5" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;fillColor=#4472c4;strokeColor=#ffffff;fontColor=#ffffff;fontSize=17;fontStyle=1;rotation=0;align=center;verticalAlign=middle;" value="缓冲区二" vertex="1">
+          <mxGeometry height="80" width="70" x="150" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="c6" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 1" vertex="1">
+          <mxGeometry height="45" width="120" x="260" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="c7" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 2" vertex="1">
+          <mxGeometry height="45" width="120" x="380" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="c8" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 3" vertex="1">
+          <mxGeometry height="45" width="120" x="500" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="c9" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 4" vertex="1">
+          <mxGeometry height="45" width="120" x="620" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="c10" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 5" vertex="1">
+          <mxGeometry height="45" width="120" x="740" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="c11" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;align=center;verticalAlign=middle;fontSize=15;" value="周期 6" vertex="1">
+          <mxGeometry height="45" width="120" x="860" y="28" as="geometry" />
+        </mxCell>
+        <mxCell id="line12" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;fillColor=none;strokeColor=#b7b7b7;strokeWidth=1;" value="" vertex="1">
+          <mxGeometry height="1" width="910" x="170" y="235" as="geometry" />
+        </mxCell>
+        <mxCell id="s13" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="加载任务" vertex="1">
+          <mxGeometry height="58" width="105" x="258" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s14" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="加载数据" vertex="1">
+          <mxGeometry height="58" width="105" x="378" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s15" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="计算" vertex="1">
+          <mxGeometry height="58" width="105" x="498" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s16" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="空闲" vertex="1">
+          <mxGeometry height="58" width="105" x="618" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s17" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="结果写回" vertex="1">
+          <mxGeometry height="58" width="105" x="738" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s18" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="空闲" vertex="1">
+          <mxGeometry height="58" width="105" x="858" y="115" as="geometry" />
+        </mxCell>
+        <mxCell id="s19" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="空闲" vertex="1">
+          <mxGeometry height="58" width="105" x="258" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="s20" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="加载任务" vertex="1">
+          <mxGeometry height="58" width="105" x="378" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="s21" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="加载数据" vertex="1">
+          <mxGeometry height="58" width="105" x="498" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="s22" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="计算" vertex="1">
+          <mxGeometry height="58" width="105" x="618" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="s23" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="空闲" vertex="1">
+          <mxGeometry height="58" width="105" x="738" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="s24" parent="1" style="whiteSpace=wrap;html=1;fontFamily=Microsoft YaHei;fontColor=#000000;shape=chevron;perimeter=chevronPerimeter;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1.2;fontSize=15;align=center;verticalAlign=middle;" value="结果写回" vertex="1">
+          <mxGeometry height="58" width="105" x="858" y="285" as="geometry" />
+        </mxCell>
+        <mxCell id="e25" edge="1" parent="1" style="fontFamily=Microsoft YaHei;edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#000000;strokeWidth=1.4;dashed=1;dashPattern=2 7;endArrow=none;startArrow=none;" value="待处理子节点数＝0">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="558" y="183" as="sourcePoint" />
+            <mxPoint x="558" y="278" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

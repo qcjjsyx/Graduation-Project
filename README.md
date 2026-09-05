@@ -41,7 +41,7 @@ selected RTL prototypes
 
 软件负责全局结构分析和命令编译。设备侧不负责 ordering、fill 或 supernode 构造，只执行已经编译的命令。
 
-当前仍在使用的 artifact ABI 是固定 128 字节 `NodeTask` 的 ABI v2。它是迁移阶段接口；长期目标是由 `NodeTask` 经过 command compiler 转换为 command stream + descriptor。
+当前 artifact ABI 是 Command/Descriptor v1：32B command、64B descriptor、64B completion 和同一 `memory_image.bin` 中的显式数据区域。旧 `NodeTask` ABI v2 已归档，不参与当前构建。
 
 ## 当前代码目录
 
@@ -89,8 +89,10 @@ python graduation-code/sim/hardware.py --n 32 --mode stable --seed 42 --ir-iters
 - [项目范围与交付边界](docs/architecture/项目范围与交付边界.md)
 - [系统架构与模块职责](docs/architecture/系统架构与模块职责.md)
 - [Command Stream 与 Descriptor 接口](docs/interface/Command_Stream_and_Descriptor.md)
+- [Command / Descriptor 固定格式 v1](docs/interface/Command_Schema_v1.md)
 - [SystemC 模型规范](docs/systemc/SystemC_模型规范.md)
 - [验证计划与结果口径](docs/verification/验证计划与结果口径.md)
+- [T00 可复现基线](docs/verification/T00_baseline.md)
 - [项目实现任务说明书](docs/项目实现任务说明书.md)
 - [总体架构重新定型方案](项目总体架构重新定型方案.md)
 - [当前推进计划](todo.md)

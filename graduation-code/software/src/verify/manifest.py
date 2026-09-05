@@ -4,459 +4,342 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from src.dataStruct import ABI_VERSION, NODE_TASK_BYTE_SIZE, ROOT_PARENT_ID
-from src.io import read_map_tables, read_tasks
+
+from src.command_codec import (
+    COMMAND_RECORD_BYTES,
+    COMPLETION_RECORD_BYTES,
+    DESCRIPTOR_RECORD_BYTES,
+    DataFormat,
+    DescriptorType,
+    Opcode,
+    StatusCode,
+    decode_commands,
+    decode_completions,
+    decode_descriptors,
+    validate_command_batch,
+)
+from src.dataStruct import MemoryRegion
+from src.memory.planner import validate_region_layout
+from src.scheduler.task_queue import sibling_friendly_order
 
 
 class ManifestValidationError(ValueError):
     pass
 
 
-def _as_int(value: Any, label: str) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ManifestValidationError(f"{label}: expected integer, got {value!r}") from exc
-
-
 @dataclass(frozen=True)
 class ManifestValidationResult:
     node_count: int
-    task_count: int
-    map_table_count: int
+    command_count: int
+    descriptor_count: int
+    completion_count: int
 
 
 def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
-    manifest_path = Path(manifest_path)
-    out_dir = manifest_path.parent
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    path = Path(manifest_path)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        _validate_abi(manifest)
+        total_bytes = _as_int(manifest["total_bytes"], "total_bytes")
+        image_meta = manifest["memory_image"]
+        image_path = path.parent / image_meta["file"]
+        image = image_path.read_bytes()
+        if len(image) != total_bytes or _as_int(image_meta["size"], "image.size") != total_bytes:
+            raise ManifestValidationError("memory image size does not match manifest")
 
-    _validate_abi(manifest)
-    _validate_symbolic_metadata(manifest)
-    _validate_output_sizes(out_dir, manifest)
-    _validate_equilibration(out_dir, manifest)
+        alignment = _as_int(manifest["compiler"]["alignment"], "alignment")
+        regions = {
+            name: MemoryRegion(
+                offset=_as_int(value["offset"], f"{name}.offset"),
+                size=_as_int(value["size"], f"{name}.size"),
+            )
+            for name, value in image_meta["regions"].items()
+        }
+        validate_region_layout(regions, total_bytes, alignment)
+        for required in (
+            "command_buffer",
+            "descriptor_table",
+            "descriptor_payload",
+            "completion_status",
+            "permutation_data",
+            "rhs_data",
+            "solution_data",
+        ):
+            if required not in regions:
+                raise ManifestValidationError(f"missing memory region: {required}")
 
-    node_count = _as_int(manifest["symbolic"]["node_count"], "node_count")
-    nodes = manifest["nodes"]
-    if len(nodes) != node_count:
-        raise ManifestValidationError("nodes section length does not match node_count")
+        batch = manifest["command_batch"]
+        table = manifest["descriptor_table"]
+        completion_meta = manifest["completion_queue"]
+        command_count = _as_int(batch["command_count"], "command_count")
+        descriptor_count = _as_int(table["descriptor_count"], "descriptor_count")
+        completion_count = _as_int(completion_meta["slot_count"], "slot_count")
+        if command_count <= 0 or descriptor_count <= 0:
+            raise ManifestValidationError("command and descriptor counts must be positive")
+        if completion_count != command_count:
+            raise ManifestValidationError("completion slot count must equal command count")
+        _require_region_size(
+            regions, "command_buffer", command_count * COMMAND_RECORD_BYTES
+        )
+        _require_region_size(
+            regions, "descriptor_table", descriptor_count * DESCRIPTOR_RECORD_BYTES
+        )
+        _require_region_size(
+            regions, "completion_status", completion_count * COMPLETION_RECORD_BYTES
+        )
 
-    tasks = read_tasks(str(out_dir / "tasks.bin"))
-    if len(tasks) != node_count:
-        raise ManifestValidationError("tasks.bin record count does not match node_count")
-
-    task_ids = sorted(task.node_id for task in tasks)
-    if task_ids != list(range(node_count)):
-        raise ManifestValidationError("task node ids are not a dense 0..N-1 range")
-
-    task_order = manifest["task_order"]
-    if sorted(task_order) != list(range(node_count)):
-        raise ManifestValidationError("task_order is not a permutation of node ids")
-    if [task.node_id for task in tasks] != task_order:
-        raise ManifestValidationError("tasks.bin order does not match task_order")
-
-    parent = manifest["symbolic"]["parent"]
-    if len(parent) != node_count:
-        raise ManifestValidationError("parent array length does not match node_count")
-
-    _validate_task_fields(tasks, parent, nodes)
-    _validate_forest(parent)
-    _validate_quantization(nodes)
-    _validate_node_file_ranges(out_dir, manifest)
-    _validate_memory_regions(
-        manifest,
-        _as_int(manifest["config"]["memory"]["alignment"], "alignment"),
-    )
-    map_tables = _validate_map_tables(out_dir, manifest)
-    _validate_memory_image(out_dir, manifest, tasks)
-
-    return ManifestValidationResult(
-        node_count=node_count,
-        task_count=len(tasks),
-        map_table_count=len(map_tables),
-    )
+        commands = decode_commands(_slice(image, regions["command_buffer"]))
+        descriptors = decode_descriptors(
+            _slice(image, regions["descriptor_table"]),
+            memory_image_bytes=total_bytes,
+        )
+        completions = decode_completions(_slice(image, regions["completion_status"]))
+        if len(commands) != command_count or len(descriptors) != descriptor_count:
+            raise ManifestValidationError("decoded record count mismatch")
+        token_count = _as_int(batch["token_count"], "token_count")
+        validate_command_batch(
+            commands,
+            descriptors,
+            image,
+            token_count=token_count,
+            max_wait_tokens=_as_int(batch["max_wait_tokens"], "max_wait_tokens"),
+        )
+        _validate_command_semantics(commands, descriptors, image, token_count)
+        _validate_completion_templates(commands, completions)
+        node_count = _validate_symbolic_and_nodes(manifest, commands, regions)
+        _validate_descriptor_references(descriptors)
+        _validate_device_precision(manifest, descriptors)
+        _validate_reference_files(path.parent, manifest)
+        return ManifestValidationResult(
+            node_count=node_count,
+            command_count=command_count,
+            descriptor_count=descriptor_count,
+            completion_count=completion_count,
+        )
+    except ManifestValidationError:
+        raise
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise ManifestValidationError(str(exc)) from exc
 
 
 def _validate_abi(manifest: dict) -> None:
     abi = manifest.get("abi", {})
-    if _as_int(abi.get("version", -1), "abi.version") != ABI_VERSION:
-        raise ManifestValidationError("manifest ABI version does not match code")
-    if _as_int(abi.get("node_task_byte_size", -1), "node_task_byte_size") != NODE_TASK_BYTE_SIZE:
-        raise ManifestValidationError("manifest NodeTask byte size does not match code")
+    if abi.get("name") != "command_descriptor" or _as_int(
+        abi.get("version", -1), "abi.version"
+    ) != 1:
+        raise ManifestValidationError("manifest is not Command/Descriptor v1")
     if abi.get("endianness") != "little":
         raise ManifestValidationError("only little-endian artifacts are supported")
-
-
-def _validate_symbolic_metadata(manifest: dict) -> None:
-    matrix = manifest.get("matrix", {})
-    if not isinstance(matrix.get("structurally_symmetric"), bool):
-        raise ManifestValidationError(
-            "matrix.structurally_symmetric must describe the input pattern"
-        )
-
-    symbolic = manifest.get("symbolic", {})
-    if (
-        symbolic.get("pattern_source")
-        != "union_of_A_and_transpose_nonzero_patterns"
-    ):
-        raise ManifestValidationError(
-            "symbolic pattern must come from pattern(A) union pattern(A.T)"
-        )
-    if symbolic.get("pattern_structurally_symmetric") is not True:
-        raise ManifestValidationError(
-            "symbolic pattern must be marked structurally symmetric"
-        )
-
-
-def _validate_output_sizes(out_dir: Path, manifest: dict) -> None:
-    for name, expected_size in manifest.get("output_sizes", {}).items():
-        path = out_dir / name
-        if not path.exists():
-            raise ManifestValidationError(f"missing output file: {name}")
-        actual_size = path.stat().st_size
-        if actual_size != _as_int(expected_size, f"output_size[{name}]"):
-            raise ManifestValidationError(
-                f"{name} size mismatch: manifest={expected_size}, actual={actual_size}"
-            )
-
-
-def _validate_equilibration(out_dir: Path, manifest: dict) -> None:
-    matrix_dim = _as_int(manifest["matrix"]["n"], "matrix.n")
-    metadata = manifest.get("equilibration", {})
-    mode = metadata.get("mode")
-    if mode not in {"none", "pow2-row"}:
-        raise ManifestValidationError("unsupported equilibration mode")
-    if metadata.get("equation") != "D_r * A * x = D_r * b":
-        raise ManifestValidationError("equilibration equation metadata mismatch")
-    if metadata.get("solution_requires_unscale") is not False:
-        raise ManifestValidationError(
-            "row-only equilibration must not require solution unscale"
-        )
-    exponent_count = _as_int(
-        metadata.get("row_scale_exponent_count", -1),
-        "row_scale_exponent_count",
-    )
-    if exponent_count != matrix_dim:
-        raise ManifestValidationError("row scale exponent count mismatch")
-    exponent_path = out_dir / metadata.get("row_scale_exponent_file", "")
-    if not exponent_path.exists() or exponent_path.stat().st_size != matrix_dim * 2:
-        raise ManifestValidationError("row scale exponent file size mismatch")
-
-    verification = manifest.get("verification", {})
-    required_sizes = {
-        verification.get("original_matrix_reference_file", ""):
-            matrix_dim * matrix_dim * 8,
-        verification.get("original_rhs_reference_file", ""):
-            matrix_dim * 8,
+    expected = {
+        "command_record_bytes": COMMAND_RECORD_BYTES,
+        "descriptor_record_bytes": DESCRIPTOR_RECORD_BYTES,
+        "completion_record_bytes": COMPLETION_RECORD_BYTES,
     }
-    for name, expected_size in required_sizes.items():
-        path = out_dir / name
-        if not name or not path.exists() or path.stat().st_size != expected_size:
-            raise ManifestValidationError(
-                f"original-coordinate reference file {name!r} has wrong size"
-            )
+    for name, value in expected.items():
+        if _as_int(abi.get(name, -1), f"abi.{name}") != value:
+            raise ManifestValidationError(f"manifest {name} mismatch")
 
 
-def _validate_task_fields(tasks, parent: list[int], nodes: dict) -> None:
-    by_id = {task.node_id: task for task in tasks}
-    for node_id, parent_id in enumerate(parent):
-        task = by_id[node_id]
-        node = nodes[str(node_id)]
-        node_range = node["range"]
-        pivot_dim = _as_int(node_range["end"], "range.end") - _as_int(node_range["start"], "range.start")
-        total_dim = len(node.get("front_indices", [])) or pivot_dim
-        expected_children = sum(candidate == node_id for candidate in parent)
-        expected_flags = (1 if expected_children == 0 else 0) | (
-            2 if parent_id < 0 else 0
-        )
-
-        if task.total_dim != total_dim or task.pivot_dim != pivot_dim:
-            raise ManifestValidationError(f"task {node_id} dimensions do not match node range")
-        if task.children_count != expected_children or task.flags != expected_flags:
+def _validate_completion_templates(commands, completions) -> None:
+    for slot, (command, completion) in enumerate(zip(commands, completions)):
+        if completion.command_id != command.command_id or completion.node_id != command.node_id:
             raise ManifestValidationError(
-                f"task {node_id} dependency metadata mismatch"
+                f"completion template {slot} does not match its command"
             )
-        if task.reserved or task.reserved_addr0 or task.reserved_addr1:
-            raise ManifestValidationError(
-                f"task {node_id} reserved ABI fields must be zero"
+        if completion.status_code != StatusCode.OK:
+            raise ManifestValidationError("completion template status must be OK")
+        if any(
+            (
+                completion.pivot_count,
+                completion.start_cycle,
+                completion.finish_cycle,
+                completion.read_bytes,
+                completion.write_bytes,
+                completion.stall_cycles,
+                completion.overflow_count,
+                completion.retry_count,
             )
-        expected_tiles = (pivot_dim + 15) // 16
-        expected_tail = pivot_dim % 16 or min(pivot_dim, 16)
-        if task.tile_count != expected_tiles or task.tail_dim != expected_tail:
-            raise ManifestValidationError(f"task {node_id} tile metadata mismatch")
-        if task.map_table_bytes != _as_int(
-            node["map_table"]["size"], f"node_{node_id}_map_table_size"
         ):
-            raise ManifestValidationError(f"task {node_id} map table byte count mismatch")
-        address_fields = {
-            "front_q": task.front_q_addr,
-            "front_e": task.front_e_addr,
-            "update_q": task.update_q_addr,
-            "update_e": task.update_e_addr,
-            "map_table": task.map_table_addr,
-            "l_factor": task.l_factor_addr,
-            "u_factor": task.u_factor_addr,
-            "p_vector": task.p_vector_addr,
-            "node_meta": task.node_meta_addr,
-            "solve_workspace": task.solve_workspace_addr,
-        }
-        for region_name, address in address_fields.items():
-            expected = _as_int(
-                node[region_name]["offset"],
-                f"node_{node_id}_{region_name}_offset",
-            )
-            if address != expected:
+            raise ManifestValidationError("completion template counters must start at zero")
+
+
+def _validate_command_semantics(commands, descriptors, image: bytes, token_count: int) -> None:
+    expected_descriptor_types = {
+        Opcode.NODE_BEGIN: {DescriptorType.FRONT_DESC},
+        Opcode.LOAD_FRONT: {DescriptorType.FRONT_DESC},
+        Opcode.ASSEMBLE_EXTEND_ADD: {DescriptorType.CONTRIBUTION_DESC},
+        Opcode.PANEL_LU: {DescriptorType.KERNEL_DESC},
+        Opcode.TRSM_LEFT: {DescriptorType.KERNEL_DESC},
+        Opcode.TRSM_RIGHT: {DescriptorType.KERNEL_DESC},
+        Opcode.GEMM_SCHUR: {DescriptorType.KERNEL_DESC},
+        Opcode.STORE_FACTOR: {DescriptorType.FACTOR_DESC},
+        Opcode.STORE_UPDATE: {DescriptorType.REGION_DESC},
+        Opcode.SOLVE_FORWARD: {DescriptorType.SOLVE_DESC},
+        Opcode.SOLVE_BACKWARD: {DescriptorType.SOLVE_DESC},
+        Opcode.NODE_COMMIT: {DescriptorType.FRONT_DESC},
+    }
+    signals = {command.signal_token for command in commands}
+    if signals != set(range(token_count)):
+        raise ManifestValidationError("T03 requires one dense signal token per command")
+    for command in commands:
+        allowed = expected_descriptor_types.get(Opcode(command.opcode))
+        if allowed is not None:
+            if command.descriptor_id == 0xFFFFFFFF:
                 raise ManifestValidationError(
-                    f"task {node_id} {region_name} address mismatch"
+                    f"command {command.command_id} is missing its descriptor"
                 )
-        if parent_id < 0:
-            if task.parent_id != ROOT_PARENT_ID:
-                raise ManifestValidationError(f"root task {node_id} has wrong parent sentinel")
-        elif task.parent_id != parent_id:
-            raise ManifestValidationError(f"task {node_id} parent_id mismatch")
+            actual = DescriptorType(descriptors[command.descriptor_id].descriptor_type)
+            if actual not in allowed:
+                raise ManifestValidationError(
+                    f"command {command.command_id} uses the wrong descriptor type"
+                )
+        if command.wait_list_id != 0xFFFFFFFF:
+            waits = descriptors[command.wait_list_id].dependency_tokens(
+                image, token_count=token_count
+            )
+            if any(token >= command.command_id for token in waits):
+                raise ManifestValidationError(
+                    f"command {command.command_id} waits on a non-preceding token"
+                )
 
 
-def _validate_forest(parent: list[int]) -> None:
-    node_count = len(parent)
-    roots = 0
-    for node_id, parent_id in enumerate(parent):
-        if parent_id < 0:
-            roots += 1
-        elif parent_id >= node_count or parent_id == node_id:
-            raise ManifestValidationError("parent array contains an invalid node id")
-    if roots == 0:
-        raise ManifestValidationError("elimination forest has no root")
-    for origin in range(node_count):
-        visited: set[int] = set()
-        cursor = origin
-        while cursor >= 0:
-            if cursor in visited:
-                raise ManifestValidationError("elimination forest contains a cycle")
-            visited.add(cursor)
-            cursor = parent[cursor]
-
-
-def _validate_node_file_ranges(out_dir: Path, manifest: dict) -> None:
-    file_sizes = manifest["output_sizes"]
-    for node_id, node in manifest["nodes"].items():
-        _check_file_range(
-            f"node {node_id} front_q",
-            _as_int(node["front_q_file_offset"], f"node_{node_id}_front_q_offset"),
-            _as_int(node["front_q"]["size"], f"node_{node_id}_front_q_size"),
-            _as_int(file_sizes["front_q.bin"], "front_q.bin_size"),
-        )
-        _check_file_range(
-            f"node {node_id} front_e",
-            _as_int(node["front_e_file_offset"], f"node_{node_id}_front_e_offset"),
-            _as_int(node["front_e"]["size"], f"node_{node_id}_front_e_size"),
-            _as_int(file_sizes["front_e.bin"], "front_e.bin_size"),
-        )
-        _check_file_range(
-            f"node {node_id} map_table",
-            _as_int(node["map_table_file_offset"], f"node_{node_id}_map_offset"),
-            _as_int(node["map_table"]["size"], f"node_{node_id}_map_size"),
-            _as_int(file_sizes["map_table.bin"], "map_table.bin_size"),
-        )
-
-
-def _check_file_range(name: str, offset: int, size: int, file_size: int) -> None:
-    if offset < 0 or size < 0 or offset + size > file_size:
-        raise ManifestValidationError(f"{name} file range is out of bounds")
-
-
-def _validate_memory_regions(manifest: dict, alignment: int) -> None:
+def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
+    symbolic = manifest["symbolic"]
+    if symbolic.get("pattern_source") != "union_of_A_and_transpose_nonzero_patterns":
+        raise ManifestValidationError("unsupported symbolic pattern source")
+    node_count = _as_int(symbolic["node_count"], "node_count")
     nodes = manifest["nodes"]
-    ranges: list[tuple[int, int, str]] = []
-    global_regions = manifest["memory_image"]["global_regions"]
+    if node_count <= 0 or set(nodes) != {str(index) for index in range(node_count)}:
+        raise ManifestValidationError("node IDs must form a dense unique 0..N-1 range")
+    parent = [_as_int(value, "parent") for value in symbolic["parent"]]
+    if len(parent) != node_count:
+        raise ManifestValidationError("parent array length mismatch")
+    try:
+        expected_order = sibling_friendly_order(parent)
+    except ValueError as exc:
+        raise ManifestValidationError(f"invalid elimination forest: {exc}") from exc
+    if symbolic["factorization_order"] != expected_order:
+        raise ManifestValidationError("factorization order is inconsistent with forest")
+
+    seen_commands: set[int] = set()
+    max_front = _as_int(manifest["compiler"]["max_front_size"], "max_front_size")
+    for node_id in range(node_count):
+        node = nodes[str(node_id)]
+        if _as_int(node["parent_id"], "parent_id") != parent[node_id]:
+            raise ManifestValidationError(f"node {node_id} parent mismatch")
+        total = _as_int(node["total_dim"], "total_dim")
+        pivot = _as_int(node["pivot_dim"], "pivot_dim")
+        update = _as_int(node["update_dim"], "update_dim")
+        if pivot <= 0 or total != pivot + update or total > max_front:
+            raise ManifestValidationError(f"node {node_id} dimensions are invalid")
+        for region_name in node["regions"].values():
+            if region_name not in regions:
+                raise ManifestValidationError(
+                    f"node {node_id} references unknown region {region_name}"
+                )
+        command_ids = [_as_int(value, "command_id") for value in node["command_ids"]]
+        if seen_commands.intersection(command_ids):
+            raise ManifestValidationError("a command is owned by multiple nodes")
+        seen_commands.update(command_ids)
+        if any(command_id >= len(commands) for command_id in command_ids):
+            raise ManifestValidationError("node references an unknown command")
+        if any(commands[command_id].node_id != node_id for command_id in command_ids):
+            raise ManifestValidationError("command node ID disagrees with manifest")
+        opcodes = {commands[command_id].opcode for command_id in command_ids}
+        for required in (
+            Opcode.NODE_BEGIN,
+            Opcode.LOAD_FRONT,
+            Opcode.PANEL_LU,
+            Opcode.STORE_FACTOR,
+            Opcode.NODE_COMMIT,
+            Opcode.SOLVE_FORWARD,
+            Opcode.SOLVE_BACKWARD,
+        ):
+            if required not in opcodes:
+                raise ManifestValidationError(
+                    f"node {node_id} is missing command {required.name}"
+                )
+    if seen_commands != set(range(len(commands))):
+        raise ManifestValidationError("manifest does not assign every command to a node")
+    return node_count
+
+
+def _validate_descriptor_references(descriptors) -> None:
+    count = len(descriptors)
+
+    def require(index: int, allowed: set[DescriptorType], label: str) -> None:
+        if index == 0xFFFFFFFF:
+            return
+        if index >= count or DescriptorType(descriptors[index].descriptor_type) not in allowed:
+            raise ManifestValidationError(f"{label} has invalid descriptor reference")
+
+    for descriptor in descriptors:
+        kind = DescriptorType(descriptor.descriptor_type)
+        body = descriptor.body_words
+        if kind == DescriptorType.FRONT_DESC:
+            require(body[0], {DescriptorType.REGION_DESC}, "front region")
+            require(body[4], {DescriptorType.CONTRIBUTION_DESC}, "front contribution")
+            require(body[5], {DescriptorType.FACTOR_DESC}, "front factor")
+            require(body[6], {DescriptorType.REGION_DESC}, "front P-vector")
+            require(body[7], {DescriptorType.REGION_DESC}, "front workspace")
+        elif kind == DescriptorType.CONTRIBUTION_DESC:
+            require(body[0], {DescriptorType.REGION_DESC}, "contribution source")
+            require(body[1], {DescriptorType.REGION_DESC}, "contribution target")
+        elif kind == DescriptorType.FACTOR_DESC:
+            for index in (0, 1, 2, 6):
+                require(body[index], {DescriptorType.REGION_DESC}, "factor region")
+        elif kind == DescriptorType.KERNEL_DESC:
+            for index in (0, 1, 2):
+                require(body[index], {DescriptorType.FRONT_DESC}, "kernel operand")
+            require(body[8], {DescriptorType.SCALE_DESC}, "kernel scale")
+        elif kind == DescriptorType.SOLVE_DESC:
+            require(body[0], {DescriptorType.FACTOR_DESC}, "solve factor")
+            for index in (1, 2, 3, 4):
+                require(body[index], {DescriptorType.REGION_DESC}, "solve region")
+
+
+def _validate_device_precision(manifest, descriptors) -> None:
+    compiler = manifest["compiler"]
+    if compiler.get("device_format") != "FP32" or compiler.get("global_bfp") is not False:
+        raise ManifestValidationError("Command v1 main path must be FP32 without global BFP")
+    for descriptor in descriptors:
+        if descriptor.descriptor_type == DescriptorType.REGION_DESC:
+            data_format = DataFormat(descriptor.body_words[7])
+            if data_format not in {DataFormat.FP32, DataFormat.INT32}:
+                raise ManifestValidationError(
+                    "device image contains a non-current data format"
+                )
+
+
+def _validate_reference_files(out_dir: Path, manifest: dict) -> None:
+    verification = manifest.get("verification")
+    if verification is None:
+        return
+    if verification.get("device_memory_contains_fp64_reference") is not False:
+        raise ManifestValidationError("FP64 reference must not be device input")
     matrix_dim = _as_int(manifest["matrix"]["n"], "matrix.n")
-    node_count = _as_int(manifest["symbolic"]["node_count"], "node_count")
-    expected_global_sizes = {
-        "task_queue": node_count * NODE_TASK_BYTE_SIZE,
-        "permutation": matrix_dim * 4,
-        "rhs_q": matrix_dim * 4,
-        "rhs_e": 2,
-        "solution_q": matrix_dim * 8,
-        "solution_e": node_count * 2,
+    expected_sizes = {
+        verification["rhs_reference_file"]: matrix_dim * 8,
+        verification["original_matrix_reference_file"]: matrix_dim * matrix_dim * 8,
+        verification["original_rhs_reference_file"]: matrix_dim * 8,
+        verification["row_scale_exponent_file"]: matrix_dim * 2,
+        verification["solution_reference_file"]: matrix_dim * 8,
     }
-    if set(global_regions) != set(expected_global_sizes):
-        raise ManifestValidationError("global DDR region set is incomplete")
-    for region_name, region in global_regions.items():
-        offset = _as_int(region["offset"], f"global_{region_name}_offset")
-        size = _as_int(region["size"], f"global_{region_name}_size")
-        if offset < 0 or size < 0:
-            raise ManifestValidationError("global memory region has a negative range")
-        if size != expected_global_sizes[region_name]:
-            raise ManifestValidationError(
-                f"global region {region_name} has the wrong size"
-            )
-        if offset % alignment != 0:
-            raise ManifestValidationError(
-                f"global region {region_name} offset is not aligned"
-            )
-        if size:
-            ranges.append((offset, offset + size, f"global {region_name}"))
-
-    for node_id, node in nodes.items():
-        for region_name in (
-            "front_q",
-            "front_e",
-            "update_q",
-            "update_e",
-            "l_factor",
-            "u_factor",
-            "map_table",
-            "p_vector",
-            "node_meta",
-            "solve_workspace",
-        ):
-            region = node[region_name]
-            offset = _as_int(region["offset"], f"node_{node_id}_{region_name}_offset")
-            size = _as_int(region["size"], f"node_{node_id}_{region_name}_size")
-            if offset < 0 or size < 0:
-                raise ManifestValidationError("node memory region has a negative range")
-            if offset % alignment != 0:
-                raise ManifestValidationError(
-                    f"node {node_id} {region_name} offset is not aligned"
-                )
-            if size:
-                ranges.append((offset, offset + size, f"node {node_id} {region_name}"))
-
-    ranges.sort()
-    for prev, curr in zip(ranges, ranges[1:]):
-        if prev[1] > curr[0]:
-            raise ManifestValidationError(f"memory regions overlap: {prev[2]} and {curr[2]}")
-    total_bytes = _as_int(manifest["total_bytes"], "total_bytes")
-    if any(start < 0 or end > total_bytes for start, end, _ in ranges):
-        raise ManifestValidationError("memory region extends beyond total_bytes")
+    for name, expected in expected_sizes.items():
+        if (out_dir / name).stat().st_size != expected:
+            raise ManifestValidationError(f"reference file {name} has wrong size")
 
 
-def _validate_memory_image(out_dir: Path, manifest: dict, tasks) -> None:
-    image_path = out_dir / manifest["memory_image"]["file"]
-    image = image_path.read_bytes()
-    total_bytes = _as_int(manifest["total_bytes"], "total_bytes")
-    if len(image) != total_bytes:
-        raise ManifestValidationError("memory image size does not match total_bytes")
-
-    task_region = manifest["memory_image"]["global_regions"]["task_queue"]
-    task_offset = _as_int(task_region["offset"], "task_queue.offset")
-    task_size = _as_int(task_region["size"], "task_queue.size")
-    encoded_tasks = b"".join(task.to_bytes() for task in tasks)
-    if task_size != len(encoded_tasks):
-        raise ManifestValidationError("task queue region size mismatch")
-    if image[task_offset : task_offset + task_size] != encoded_tasks:
-        raise ManifestValidationError("memory image task queue differs from tasks.bin")
-
-    for node_id, node in manifest["nodes"].items():
-        for region_name, file_name, file_offset_name in (
-            ("front_q", "front_q.bin", "front_q_file_offset"),
-            ("front_e", "front_e.bin", "front_e_file_offset"),
-            ("map_table", "map_table.bin", "map_table_file_offset"),
-        ):
-            region = node[region_name]
-            image_offset = _as_int(region["offset"], f"node_{node_id}_{region_name}.offset")
-            size = _as_int(region["size"], f"node_{node_id}_{region_name}.size")
-            file_offset = _as_int(
-                node[file_offset_name], f"node_{node_id}_{file_offset_name}"
-            )
-            file_data = (out_dir / file_name).read_bytes()
-            if image[image_offset : image_offset + size] != file_data[
-                file_offset : file_offset + size
-            ]:
-                raise ManifestValidationError(
-                    f"memory image node {node_id} {region_name} differs from {file_name}"
-                )
+def _require_region_size(regions, name: str, expected: int) -> None:
+    if regions[name].size != expected:
+        raise ManifestValidationError(f"{name} has wrong size")
 
 
-def _validate_map_tables(out_dir: Path, manifest: dict):
-    offsets = [
-        _as_int(manifest["nodes"][str(node_id)]["map_table_file_offset"], f"node_{node_id}_map_table_offset")
-        for node_id in range(_as_int(manifest["symbolic"]["node_count"], "node_count"))
-    ]
-    map_tables = read_map_tables(str(out_dir / "map_table.bin"), offsets)
-    node_count = _as_int(manifest["symbolic"]["node_count"], "node_count")
-    parent = manifest["symbolic"]["parent"]
-    for parent_id, entries in enumerate(map_tables):
-        parent_front = set(manifest["nodes"][str(parent_id)].get("front_indices", []))
-        for entry in entries:
-            if not (0 <= entry.child_id < node_count):
-                raise ManifestValidationError("map_table child_id out of range")
-            if len(entry.row_map) != len(entry.col_map):
-                raise ManifestValidationError("map_table row/col map lengths differ")
-            if parent[entry.child_id] != parent_id:
-                raise ManifestValidationError(
-                    "map_table child does not belong to the parent node"
-                )
-            child = manifest["nodes"][str(entry.child_id)]
-            child_pivot = (
-                _as_int(child["range"]["end"], "child.range.end")
-                - _as_int(child["range"]["start"], "child.range.start")
-            )
-            child_update = len(child["front_indices"]) - child_pivot
-            if sorted(entry.row_map) != list(range(child_update)):
-                raise ManifestValidationError(
-                    "map_table does not cover the complete child update"
-                )
-            if parent_front:
-                parent_size = len(parent_front)
-                if any(col < 0 or col >= parent_size for col in entry.col_map):
-                    raise ManifestValidationError("map_table parent column index out of range")
-                if len(set(entry.col_map)) != child_update:
-                    raise ManifestValidationError(
-                        "map_table parent column indices are not unique"
-                    )
-        expected_children = sorted(
-            child for child, owner in enumerate(parent) if owner == parent_id
-        )
-        if sorted(entry.child_id for entry in entries) != expected_children:
-            raise ManifestValidationError(
-                "map_table entries do not match the parent child list"
-            )
-    return map_tables
+def _slice(image: bytes, region: MemoryRegion) -> bytes:
+    return image[region.offset : region.offset + region.size]
 
 
-def _validate_quantization(nodes: dict) -> None:
-    for node_id, node in nodes.items():
-        front_dim = len(node.get("front_indices", []))
-        local_source = node.get("local_source")
-        if not local_source:
-            raise ManifestValidationError(f"node {node_id} missing local_source metadata")
-        if local_source.get("format") != "S_format":
-            raise ManifestValidationError(f"node {node_id} local_source has wrong format")
-
-        shape = local_source.get("shape")
-        if shape != [front_dim, front_dim]:
-            raise ManifestValidationError(f"node {node_id} local_source shape mismatch")
-
-        front_q_size = _as_int(node["front_q"]["size"], f"node_{node_id}_front_q_size")
-        if front_q_size != front_dim * front_dim * 4:
-            raise ManifestValidationError(f"node {node_id} front_q size mismatch")
-        if _as_int(node["front_e"]["size"], f"node_{node_id}_front_e_size") != 2:
-            raise ManifestValidationError(f"node {node_id} front_e must store one int16 exponent")
-
-        node_range = node["range"]
-        pivot_dim = _as_int(
-            node_range["end"], f"node_{node_id}_range_end"
-        ) - _as_int(node_range["start"], f"node_{node_id}_range_start")
-        if pivot_dim <= 0 or pivot_dim > front_dim:
-            raise ManifestValidationError(
-                f"node {node_id} has invalid pivot/front dimensions"
-            )
-        update_dim = front_dim - pivot_dim
-        expected_sizes = {
-            "update_q": update_dim * update_dim * 4,
-            "update_e": 2 if update_dim else 0,
-            "l_factor": front_dim * pivot_dim * 4,
-            "u_factor": pivot_dim * front_dim * 4,
-            "p_vector": pivot_dim * 2,
-            "node_meta": 64,
-            "solve_workspace": pivot_dim * 16,
-        }
-        for region_name, expected_size in expected_sizes.items():
-            actual_size = _as_int(
-                node[region_name]["size"],
-                f"node_{node_id}_{region_name}_size",
-            )
-            if actual_size != expected_size:
-                raise ManifestValidationError(
-                    f"node {node_id} {region_name} size mismatch"
-                )
+def _as_int(value: Any, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ManifestValidationError(f"{label}: expected integer")
+    return value

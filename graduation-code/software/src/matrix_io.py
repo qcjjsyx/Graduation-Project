@@ -18,7 +18,12 @@ def load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_m
 
     if matrix.shape[0] != matrix.shape[1]: # type: ignore
         raise ValueError("matrix must be square")
-    return matrix.tocsr()
+    matrix = matrix.tocsr().astype(np.float64)
+    if matrix.shape[0] == 0:
+        raise ValueError("matrix must not be empty")
+    if not np.all(np.isfinite(matrix.data)):
+        raise ValueError("matrix contains non-finite values")
+    return matrix
 
 
 def load_vector(path: str, expected_size: int) -> np.ndarray:
@@ -36,6 +41,8 @@ def load_vector(path: str, expected_size: int) -> np.ndarray:
         value = np.load(path)
 
     vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    if vector.size == 0:
+        raise ValueError("RHS must not be empty")
     if vector.size != expected_size:
         raise ValueError(
             f"RHS length {vector.size} does not match matrix dimension {expected_size}"

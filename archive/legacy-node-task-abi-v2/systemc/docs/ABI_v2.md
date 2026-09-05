@@ -10,6 +10,10 @@ ABI v2 是当前软件工具链和 SystemC `system_sim` 实际使用的 artifact
 
 [`docs/interface/Command_Stream_and_Descriptor.md`](../../../docs/interface/Command_Stream_and_Descriptor.md)
 
+T01 冻结的固定二进制布局见：
+
+[`docs/interface/Command_Schema_v1.md`](../../../docs/interface/Command_Schema_v1.md)
+
 迁移原则：
 
 ```text
@@ -168,4 +172,3 @@ SystemC/硬件写回：
 - [ ] v2 regression 继续通过；
 - [ ] command path 通过单节点、多节点、多根和 numeric failure 测试；
 - [ ] 通过后停止增加 v2 `NodeTask` 字段。
-

@@ -1,136 +1,169 @@
-# 毕业设计当前推进计划
+# 毕业设计当前任务状态
 
-最后更新：2026-08-26
+状态：**T00–T03 已完成，下一阶段从 T04 开始。**
 
-## 1. 当前目标
+> 本文档只记录当前主线已经完成的工作、验证证据和后续边界，不再按月份或周数安排进度。
 
-具体代码任务以[项目实现任务说明书](docs/项目实现任务说明书.md)为准；本文件保留阶段性推进概览。
+## 1. 当前主线
 
-六个月内完成一个边界明确、可验证的多前沿稀疏 LU 硬件架构原型：
+- 软件与 SystemC 的主接口已切换到 **Command / Descriptor v1**。
+- 旧 NodeTask / ABI v2 软件、SystemC 执行器及历史优化代码已整体归档到：
+  - archive/legacy-node-task-abi-v2/
+- 主线软件当前负责：
+  - 从 Matrix Market 输入构建统一符号分析结果；
+  - 生成 Command、Descriptor、Completion、内存镜像和 manifest；
+  - 生成供验证使用的 FP64 reference，reference 不进入 device memory image。
+- 主线 SystemC 当前保留：
+  - Command / Descriptor / Completion C++ codec；
+  - 独立 FP64 reference；
+  - 独立 ATU / HPU 模块与测试。
+- **SystemC Command 执行器尚未实现**，属于后续 T04/T05。
 
-- 软件完成符号分析、front/任务产物和 command compiler；
-- SystemC 完成所有核心模块的显式数据通路、周期模型和分解—求解闭环；
-- SystemC 提供 FP32/FP64 浮点主设备路径；
-- INT32 只用于 GEMM 调用边界，使用局部 quantize/dequantize；
-- 没有 INT32 GEMM RTL 时，使用可替换的 `Int32GemmBehavioral`；
-- RTL 优先完成 GCU、HPU、ATU、片上存储接口和关键控制路径；
-- 不把全局 INT32/BFP、真实 DDR/PCIe 或完整浮点 LU RTL 作为首版前提。
+## 2. 已完成任务
 
-## 2. 当前事实
+### T00：旧基线归档与主线边界整理 [x]
 
-### 已有基础
+- [x] 保留旧 ABI v2 的历史实现、文档语义和构建入口，作为可追溯基线。
+- [x] 将旧软件流水线、旧 SystemC NodeTask 执行器和历史 optimization 整体迁出主目录。
+- [x] 为归档代码提供独立 README 和 SystemC 构建入口。
+- [x] 确认主线代码不再依赖归档目录。
+- [x] 明确当前主线只使用 Command / Descriptor v1，不再为 ABI v2 增加兼容适配层。
 
-- [x] 软件可以生成稀疏多前沿相关产物；
-- [x] 支持数值非对称矩阵和 `pattern(A) ∪ pattern(Aᵀ)` 符号包络；
-- [x] 已有消除森林、supernode、front、map 和 ABI v2 产物；
-- [x] SystemC 已有任务获取、依赖管理、buffer、DDR 事务、HPU/ATU、写回和树形求解框架；
-- [x] 已有 FP64、定点和实验性精度策略代码；
-- [x] 已有 GCU、HPU、ATU 等 RTL 原型和测试入口；
-- [x] 软件和 SystemC 已有可运行测试与历史实验结果。
+归档位置：
 
-### 尚未完成且不能误写为已完成
+- archive/legacy-node-task-abi-v2/software/
+- archive/legacy-node-task-abi-v2/systemc/
+- archive/legacy-node-task-abi-v2/optimization/
 
-- [ ] 当前主线尚未完成 command stream executor；
-- [ ] 当前 SystemC 数值后端仍有 C++ 行为函数直接参与，尚未全部转换为显式 buffer-driven 算子；
-- [ ] 当前没有可用于联调的 INT32 GEMM RTL；
-- [ ] 当前 RTL 尚未形成完整 GCU 顶层设备；
-- [ ] Panel-LU、TRSM、GEMM 的 SystemC 周期级数据通路仍需按新规范重构；
-- [ ] 最终结果尚不能表述为完整浮点求解器 RTL。
+### T01：Command / Descriptor v1 codec [x]
 
-## 3. M0：架构冻结（第 1—2 周）
+- [x] 实现 32B little-endian Command record 的 Python/C++ 编解码。
+- [x] 实现 64B little-endian Descriptor record 的 Python/C++ 编解码。
+- [x] 实现 64B little-endian Completion record 的 Python/C++ 编解码。
+- [x] 固定并校验 opcode、status code、NONE、flags 和 reserved 字段。
+- [x] 实现 typed DataFormat、Layout、Backend、Direction 字段及区域范围校验。
+- [x] 提供 READY / FAILED / UNSIGNALED token fixture。
+- [x] 提供 Python/C++ 共用 golden binary fixture 和正反向单元测试。
 
-- [ ] 确认正式问题为 `Ax=b`，显式逆矩阵只作为多 RHS 扩展；
-- [ ] 确认数值范围为方形、数值可非对称、符号使用对称包络；
-- [ ] 确认 `FP64_GOLDEN`、`FP32_SYSTEMC`、`FP32_SYSTEMC_INT32_GEMM` 三种后端；
-- [ ] 确认 INT32 量化只发生在 GEMM 调用边界；
-- [ ] 确认 front、panel、tile、RHS 数量和 HPU/ATU 最大容量；
-- [ ] 确认 ABI v2 是迁移阶段接口，command stream 是目标接口；
-- [ ] 确认 SystemC 是完整主模型，浮点 Panel-LU/TRSM 不要求首版 RTL；
-- [ ] 确认 GCU/HPU/ATU/存储接口是 RTL 优先模块；
-- [ ] 确认论文暂不进入本阶段实现任务。
+主要产物：
 
-## 4. M1：命令流和软件适配（第 3—5 周）
+- graduation-code/software/src/abi/command_schema_v1.py
+- graduation-code/systemc/include/command_schema_v1.hpp
+- graduation-code/systemc/src/command_schema_v1.cpp
+- graduation-code/fixtures/command_schema_v1/
 
-- [ ] 定义 command header、schema version、command ID 和 token；
-- [ ] 定义 `FrontDesc`、`ContributionDesc`、`KernelDesc`、`ScaleDesc`；
-- [ ] 定义 command ring、descriptor table、data image 和 completion queue；
-- [ ] 实现 `NodeTask → command stream` 的适配器；
-- [ ] 保留 ABI v2 生成路径用于回归，不继续扩张 `NodeTask` 字段；
-- [ ] 实现命令长度、版本、地址、依赖和 descriptor 合法性检查；
-- [ ] 实现命令级黄金解释器。
+### T02：SystemC FP64 reference [x]
 
-## 5. M2：SystemC 硬件模型重构（第 6—10 周）
+- [x] 实现独立、确定性的 C++ FP64 数值 reference。
+- [x] 实现 panel LU。
+- [x] 实现左下三角和右上三角 TRSM。
+- [x] 实现 GEMM Schur update。
+- [x] 实现基于 LU 的线性求解。
+- [x] 实现 front-tree factor/solve reference。
+- [x] 实现相对残差、分量后向误差和相对解误差统计。
+- [x] 提供 JSON fixture、单元测试和 sanitizer 测试。
+- [x] 保证 reference 不调用 sc_start()，也不生成设备侧 FP64 镜像。
 
-- [ ] Command Fetch 从 command buffer 读取命令；
-- [ ] GCU 通过 token 管理依赖和资源；
-- [ ] Buffer/DMA/Assembly 只从 DDR/descriptor/buffer 读取数据；
-- [ ] Panel-LU 使用显式 load、pivot、swap、divide、update、writeback 状态；
-- [ ] TRSM 使用显式三角依赖、mask、对角处理和完成状态；
-- [ ] GEMM 使用显式 tile buffer、K 维累加和写回；
-- [ ] Solve Controller 从已提交的因子和 RHS 完成 SystemC 前代/回代；
-- [ ] 原有 C++ numeric kernel 降为独立 checker，不再作为设备旁路；
-- [ ] 输出 command、node、operation、timeline、memory 和 status trace。
+主要产物：
 
-## 6. M3：INT32 GEMM 行为后端（第 11—13 周）
+- graduation-code/systemc/include/fp64_reference.hpp
+- graduation-code/systemc/src/fp64_reference.cpp
+- graduation-code/systemc/tests/test_fp64_reference.cpp
+- graduation-code/systemc/tests/test_fp64_reference_fixture.cpp
+- graduation-code/fixtures/fp64_reference/
 
-- [ ] 实现 `GemmFp32Reference`；
-- [ ] 实现 `PrecisionAdapter`；
-- [ ] 实现 `Int32GemmBehavioral`；
-- [ ] 支持 tile 内二的幂 scale、舍入、饱和和反量化；
-- [ ] 确认 INT32 GEMM 的累加宽度；必要时实现 K 维分块；
-- [ ] 统计量化误差、overflow、saturation、cycles 和 bytes；
-- [ ] 验证 `FP32_SYSTEMC_INT32_GEMM` 的单节点和小树路径；
-- [ ] 保留未来 `Int32GemmRtlWrapper` 的接口。
+### T03：Command Compiler [x]
 
-## 7. M4：控制和地址路径 RTL（第 14—17 周）
+#### 统一前处理
 
-- [ ] 将 command schema 接入 GCU parser；
-- [ ] 完成 GCU token scoreboard 和完成队列；
-- [ ] 完成 buffer/SRAM 风格接口；
-- [ ] 补齐 HPU reset、候选边界、tie-break 和 backpressure 测试；
-- [ ] 补齐 ATU 初始化、query、swap 和非法访问测试；
-- [ ] 统一 RTL/SystemC 的 row width、pivot capacity 和状态语义；
-- [ ] 使用同一条短 command stream 做 SystemC/RTL trace 对照。
+- [x] 读取 Matrix Market 稀疏矩阵并完成输入合法性检查。
+- [x] 对非对称输入按 A union A-transpose 构建统一结构图。
+- [x] 完成 AMD 风格排序、精确填充图、消去树、supernode、front 和 front forest 构建。
+- [x] 删除主线全局 BFP/指数选择/量化前处理。
+- [x] 使用 NodeCompileRecord 作为编译 IR，不再生成 NodeTask。
 
-## 8. M5：端到端验证和实验（第 18—23 周）
+#### Command / Descriptor 生成
 
-- [ ] 单节点闭环：`LOAD → ASSEMBLE → PANEL → TRSM → SCHUR → STORE → COMMIT`；
-- [ ] 多节点和多根消除森林闭环；
-- [ ] `FP64_GOLDEN` 与 `FP32_SYSTEMC` 数值对照；
-- [ ] `FP32_SYSTEMC_INT32_GEMM` 的局部量化误差实验；
-- [ ] 量化导致 pivot 变化时记录实际 pivot，不使用黄金 pivot 覆盖；
-- [ ] 验证非法 command、损坏 descriptor、buffer 满/空、timeout 和 numeric failure；
-- [ ] 扫描 tile、lane、DDR 带宽、延迟、buffer 和调度策略；
-- [ ] 分离报告 Host、SystemC、行为模型和 RTL 结果。
+- [x] 为每个节点生成显式 assemble、panel factor、TRSM、Schur update、store-update 命令。
+- [x] 为根节点生成 solve 命令序列。
+- [x] 通过 token 表达子节点 store-update 到父节点 assemble 的依赖。
+- [x] 生成 operand/output/completion descriptor，并对描述符类型和 payload 进行校验。
+- [x] 生成 Completion 初始化模板；实际运行时状态写回留给后续 SystemC 执行器。
 
-## 9. M6：收口材料（第 24—26 周）
+#### 内存规划和产物
 
-- [ ] 固定最终矩阵集合和实验 seed；
-- [ ] 复现所有主结果；
-- [ ] 生成 residual、backward error、pivot、overflow、量化开销、周期和 bytes 报告；
-- [ ] 整理 SystemC/行为模型/RTL 的边界说明；
-- [ ] 检查 README、接口文档、验证文档和代码路径一致；
-- [ ] 论文在架构和实验冻结后再开始编写。
+- [x] 实现两遍内存规划，先确定节点局部尺寸，再分配全局地址。
+- [x] 实现 u64 地址溢出、alignment、区间越界和 region overlap 检查。
+- [x] 生成唯一的 FP32 device memory image。
+- [x] 将 P 向量固定为 INT32；reference/metrics 保留在 host-side JSON。
+- [x] 生成 Command binary、Descriptor binary、Completion binary、memory image 和 manifest。
+- [x] manifest 包含 schema/version、区域表、命令统计、token producer/consumer 和节点摘要。
+- [x] 对 opcode、flags、descriptor index、token、reserved、region、data format、layout、backend、direction 实施编译期验证。
+- [x] 确保相同输入和配置生成字节级一致的 manifest 与 memory image。
 
-## 10. 明确不做
+主要产物：
 
-- [ ] 不实现任意规模的通用非对称 multifrontal LU；
-- [ ] 不将 INT32/BFP scale 传播到整棵消除树；
-- [ ] 不把 FP8 作为主路径；
-- [ ] 不实现真实 DDR PHY、PCIe 和完整 FPGA 驱动；
-- [ ] 不为了证明完整性强行实现单 RHS 树形求解 RTL；
-- [ ] 不用黄金数据、预选 pivot 或静默饱和掩盖设备路径失败；
-- [ ] 不在论文开始前继续堆叠没有验证的架构功能。
+- graduation-code/software/src/scheduler/command_compiler.py
+- graduation-code/software/src/pipeline/pipeline.py
+- graduation-code/software/src/scheduler/planner.py
+- graduation-code/software/src/io/manifest.py
+- graduation-code/software/src/main.py
+- graduation-code/software/tests/
 
-## 11. 当前验收口径
+## 3. 当前验证结果
 
-`status=OK` 只表示控制流完成。数值是否可接受，必须同时查看：
+| 验证项 | 结果 |
+| --- | --- |
+| 软件单元测试 | 49 passed |
+| T03 关键模块 mypy | Success: no issues found in 5 source files |
+| 主线 SystemC CTest | 3/3 passed |
+| 主线 SystemC sanitizer CTest | 3/3 passed |
+| 归档 SystemC 独立构建 | 通过 |
+| 256 阶真实矩阵编译 | 73 nodes、866 commands、1747 descriptors |
+| 256 阶 reference 原始残差 | 5.256e-11 |
+| 256 阶 device memory image | 1,400,576 bytes |
+| 重复编译确定性 | manifest 和 memory image 字节级一致 |
 
-```text
-relative_residual
-componentwise_backward_error
-relative_solution_error
-pivot_growth / minimum_pivot_ratio
-overflow / saturation / retry
-cycles / bytes / stall
-```
+## 4. 当前未完成内容
+
+以下内容不属于 T00–T03 的已完成范围，不能作为当前能力对外宣称：
+
+- [ ] SystemC 对 Command artifact 和 manifest 的加载。
+- [ ] SystemC byte-addressable device memory。
+- [ ] Descriptor Reader、Buffer Handle、DMA Engine。
+- [ ] 基于 token scoreboard 的 GCU 调度与运行时 Completion 写回。
+- [ ] SystemC Panel-LU、TRSM、GEMM、assemble、update 和 solve 执行 kernel。
+- [ ] FP32 Command 全链路数值闭环。
+- [ ] 局部 INT32 / BFP GEMM。
+- [ ] RTL Command Processor、GCU、DMA、HPU/PE 和完整 RTL 仿真闭环。
+- [ ] 性能、带宽和面积证据。
+
+## 5. 下一阶段
+
+### T04：SystemC Command 数据面 [ ]
+
+- [ ] 加载 manifest、Command、Descriptor、Completion 和 memory image。
+- [ ] 实现统一 byte-addressable memory 与严格 region/bounds 检查。
+- [ ] 实现 Descriptor Reader 和轻量 Buffer Handle。
+- [ ] 实现带请求/响应、延迟和背压语义的 DMA Engine。
+- [ ] 覆盖非法 descriptor、越界访问、错误 data format/layout 和背压场景。
+
+### T05：SystemC Command 控制面 [ ]
+
+- [ ] 实现固定宽度 Command Fetch。
+- [ ] 实现 GCU token scoreboard 与 token 状态机。
+- [ ] 按 descriptor 解释命令并派发到执行 kernel。
+- [ ] 实现 Completion 成功/失败写回、错误传播和完成顺序验证。
+- [ ] 建立 Command 级 golden interpreter/reference，对照 SystemC 执行结果。
+- [ ] 不重新引入 NodeTask 或 ABI v2 adapter。
+
+后续 T06 及 RTL 阶段只有在 T04/T05 完成并形成可验证闭环后再展开。
+
+## 6. 固定边界
+
+- 主线不恢复全局量化前处理。
+- 主线不生成多份不同精度的全局矩阵副本。
+- FP64 仅作为 host/SystemC reference，不进入 device memory image。
+- 归档目录只用于历史追溯和独立复现，不参与主线构建。
+- 新 SystemC 执行器必须直接消费 Command / Descriptor v1，不以旧 ABI v2 为中间层。
+- 任何“已完成”项必须同时具备代码、测试和可复现验证证据。

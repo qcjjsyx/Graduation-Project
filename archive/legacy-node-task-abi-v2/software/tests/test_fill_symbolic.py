@@ -1,0 +1,84 @@
+import numpy as np
+import scipy.sparse as sp
+
+from src.dataStruct import NodeRange
+from src.pipeline import extract_local_contribution
+from src.symbolic.fill import symbolic_fill_pattern
+from src.symbolic.pattern import (
+    is_structurally_symmetric,
+    symmetric_sparsity_pattern,
+)
+
+
+def test_symbolic_fill_adds_elimination_clique_edge():
+    matrix = sp.csr_matrix(
+        np.array(
+            [
+                [4.0, 1.0, 1.0],
+                [2.0, 5.0, 0.0],
+                [3.0, 0.0, 6.0],
+            ]
+        )
+    )
+    filled = symbolic_fill_pattern(matrix)
+    assert filled.columns == [[0, 1, 2], [1, 2], [2]]
+    assert filled.parent.tolist() == [1, 2, -1]
+    assert filled.fill_edge_count == 1
+
+
+def test_structurally_asymmetric_matrix_uses_symmetric_envelope():
+    matrix = sp.csr_matrix(
+        np.array(
+            [
+                [1.0, 2.0, 0.0],
+                [0.0, 3.0, -4.0],
+                [5.0, 0.0, 6.0],
+            ]
+        )
+    )
+
+    assert not is_structurally_symmetric(matrix)
+    envelope = symmetric_sparsity_pattern(matrix)
+    np.testing.assert_array_equal(
+        envelope.toarray(),
+        np.ones((3, 3), dtype=bool),
+    )
+
+    filled = symbolic_fill_pattern(matrix)
+    assert filled.columns == [[0, 1, 2], [1, 2], [2]]
+
+
+def test_symbolic_union_cannot_cancel_opposite_numeric_values():
+    matrix = sp.csr_matrix(np.array([[1.0, 2.0], [-2.0, 3.0]]))
+    envelope = symmetric_sparsity_pattern(matrix)
+    np.testing.assert_array_equal(
+        envelope.toarray(),
+        np.ones((2, 2), dtype=bool),
+    )
+
+
+def test_local_contribution_owns_no_initial_update_update_block():
+    matrix = sp.csr_matrix(
+        np.array(
+            [
+                [4.0, 1.0, 2.0],
+                [3.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+            ]
+        )
+    )
+    local = extract_local_contribution(
+        matrix,
+        front_indices=[0, 1, 2],
+        node_range=NodeRange(start=0, end=1),
+    )
+    np.testing.assert_array_equal(
+        local,
+        np.array(
+            [
+                [4.0, 1.0, 2.0],
+                [3.0, 0.0, 0.0],
+                [7.0, 0.0, 0.0],
+            ]
+        ),
+    )

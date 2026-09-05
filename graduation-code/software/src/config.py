@@ -31,20 +31,8 @@ class OrderingConfig:
             raise ValueError(
                 f"method must be one of {sorted(self._VALID_METHODS)}, got {self.method!r}"
             )
-
-
-@dataclass(frozen=True)
-class QuantConfig:
-    effective_bits: int = 30
-    clip_percentile: float = 100.0
-
-    def __post_init__(self) -> None:
-        if not 1 <= self.effective_bits <= 30:
-            raise ValueError(
-                f"effective_bits must be in [1, 30], got {self.effective_bits}"
-            )
-        if not 0 < self.clip_percentile <= 100:
-            raise ValueError(f"clip_percentile must be in (0, 100], got {self.clip_percentile}")
+        if self.max_supernode_size <= 0:
+            raise ValueError("max_supernode_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -68,14 +56,21 @@ class EquilibrationConfig:
 
 
 @dataclass(frozen=True)
-class MemoryConfig:
+class CommandCompilerConfig:
     alignment: int = 64
+    tile_size: int = 16
+    max_front_size: int = 256
+    max_wait_tokens: int = 256
 
     def __post_init__(self) -> None:
-        if self.alignment <= 0:
-            raise ValueError(f"alignment must be positive, got {self.alignment}")
-        if self.alignment & (self.alignment - 1) != 0:
-            raise ValueError(f"alignment must be a power of 2, got {self.alignment}")
+        if self.alignment <= 0 or self.alignment & (self.alignment - 1):
+            raise ValueError("alignment must be a positive power of two")
+        if self.tile_size <= 0:
+            raise ValueError("tile_size must be positive")
+        if self.max_front_size <= 0:
+            raise ValueError("max_front_size must be positive")
+        if self.max_wait_tokens <= 0:
+            raise ValueError("max_wait_tokens must be positive")
 
 
 @dataclass(frozen=True)
@@ -88,8 +83,7 @@ class SolveInputConfig:
 class PipelineConfig:
     matrix: MatrixInputConfig = MatrixInputConfig()
     ordering: OrderingConfig = OrderingConfig()
-    quant: QuantConfig = QuantConfig()
     equilibration: EquilibrationConfig = EquilibrationConfig()
-    memory: MemoryConfig = MemoryConfig()
+    command: CommandCompilerConfig = CommandCompilerConfig()
     solve: SolveInputConfig = SolveInputConfig()
     out_dir: Path = Path("out")

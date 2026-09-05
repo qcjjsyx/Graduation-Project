@@ -17,7 +17,7 @@ def build_supernodes(
     indistinguishable variables in AMD-style quotient graph descriptions:
     two columns can be merged when Adj(i) U {i} == Adj(j) U {j}. The pipeline
     keeps the additional engineering restriction that merged columns must be
-    consecutive in the current ordering, so NodeTask ranges remain compact.
+    consecutive in the current ordering, so compiler node ranges remain compact.
     """
     n = len(parent)
     if n == 0:

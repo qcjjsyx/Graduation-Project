@@ -1,0 +1,203 @@
+{
+  "schema": "fp64_reference_fixture_v1",
+  "panel_cases": [
+    {
+      "name": "one_by_one",
+      "matrix": {"rows": 1, "cols": 1, "values": [4.0]},
+      "pivot_columns": 1,
+      "rhs": [8.0],
+      "reference_solution": [2.0],
+      "expected": {
+        "pivot_rows": [0],
+        "permutation": [0],
+        "l": {"rows": 1, "cols": 1, "values": [1.0]},
+        "u": {"rows": 1, "cols": 1, "values": [4.0]},
+        "schur_update": {"rows": 0, "cols": 0, "values": []},
+        "solution": [2.0],
+        "minimum_pivot_ratio": 1.0,
+        "pivot_growth": 1.0
+      }
+    },
+    {
+      "name": "two_by_two_row_swap",
+      "matrix": {"rows": 2, "cols": 2, "values": [0.0, 2.0, 3.0, 4.0]},
+      "pivot_columns": 2,
+      "rhs": [4.0, 11.0],
+      "reference_solution": [1.0, 2.0],
+      "expected": {
+        "pivot_rows": [1, 1],
+        "permutation": [1, 0],
+        "l": {"rows": 2, "cols": 2, "values": [1.0, 0.0, 0.0, 1.0]},
+        "u": {"rows": 2, "cols": 2, "values": [3.0, 4.0, 0.0, 2.0]},
+        "schur_update": {"rows": 0, "cols": 0, "values": []},
+        "solution": [1.0, 2.0],
+        "minimum_pivot_ratio": 0.5,
+        "pivot_growth": 1.0
+      }
+    },
+    {
+      "name": "two_by_two_tie_break",
+      "matrix": {"rows": 2, "cols": 2, "values": [2.0, 1.0, -2.0, 3.0]},
+      "pivot_columns": 2,
+      "rhs": [4.0, 4.0],
+      "reference_solution": [1.0, 2.0],
+      "expected": {
+        "pivot_rows": [0, 1],
+        "permutation": [0, 1],
+        "l": {"rows": 2, "cols": 2, "values": [1.0, 0.0, -1.0, 1.0]},
+        "u": {"rows": 2, "cols": 2, "values": [2.0, 1.0, 0.0, 4.0]},
+        "schur_update": {"rows": 0, "cols": 0, "values": []},
+        "solution": [1.0, 2.0],
+        "minimum_pivot_ratio": 0.6666666666666666,
+        "pivot_growth": 1.3333333333333333
+      }
+    },
+    {
+      "name": "four_by_four_partial_panel",
+      "matrix": {
+        "rows": 4,
+        "cols": 4,
+        "values": [
+          0.0, 2.0, 1.0, 3.0,
+          4.0, 1.0, 0.0, 2.0,
+          2.0, 3.0, 5.0, 1.0,
+          1.0, 0.0, 2.0, 4.0
+        ]
+      },
+      "pivot_columns": 2,
+      "expected": {
+        "pivot_rows": [1, 2],
+        "permutation": [1, 2, 0, 3],
+        "l": {
+          "rows": 4,
+          "cols": 2,
+          "values": [1.0, 0.0, 0.5, 1.0, 0.0, 0.8, 0.25, -0.1]
+        },
+        "u": {
+          "rows": 2,
+          "cols": 4,
+          "values": [4.0, 1.0, 0.0, 2.0, 0.0, 2.5, 5.0, 0.0]
+        },
+        "schur_update": {"rows": 2, "cols": 2, "values": [-3.0, 3.0, 2.5, 3.5]},
+        "minimum_pivot_ratio": 0.5,
+        "pivot_growth": 1.0
+      }
+    },
+    {
+      "name": "near_singular",
+      "matrix": {"rows": 2, "cols": 2, "values": [1.0, 1.0, 1.0, 1.000000000001]},
+      "pivot_columns": 2,
+      "rhs": [2.0, 2.000000000001],
+      "reference_solution": [1.0, 1.0],
+      "expected": {
+        "pivot_rows": [0, 1],
+        "permutation": [0, 1],
+        "l": {"rows": 2, "cols": 2, "values": [1.0, 0.0, 1.0, 1.0]},
+        "u": {"rows": 2, "cols": 2, "values": [1.0, 1.0, 0.0, 1.000088900582341e-12]},
+        "schur_update": {"rows": 0, "cols": 0, "values": []},
+        "solution": [1.0, 1.0],
+        "minimum_pivot_ratio": 1.0000889005813408e-12,
+        "pivot_growth": 1.0
+      }
+    },
+    {
+      "name": "structurally_asymmetric_four_by_four",
+      "matrix": {
+        "rows": 4,
+        "cols": 4,
+        "values": [
+          10.0, 2.0, 0.0, 1.0,
+          3.0, 9.0, 4.0, 0.0,
+          0.0, 0.0, 8.0, 5.0,
+          0.0, 0.0, 3.0, 7.0
+        ]
+      },
+      "pivot_columns": 4,
+      "rhs": [9.0, -13.0, 19.0, 22.5],
+      "reference_solution": [1.0, -2.0, 0.5, 3.0],
+      "expected": {
+        "pivot_rows": [0, 1, 2, 3],
+        "permutation": [0, 1, 2, 3],
+        "l": {
+          "rows": 4,
+          "cols": 4,
+          "values": [
+            1.0, 0.0, 0.0, 0.0,
+            0.3, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.375, 1.0
+          ]
+        },
+        "u": {
+          "rows": 4,
+          "cols": 4,
+          "values": [
+            10.0, 2.0, 0.0, 1.0,
+            0.0, 8.4, 4.0, -0.3,
+            0.0, 0.0, 8.0, 5.0,
+            0.0, 0.0, 0.0, 5.125
+          ]
+        },
+        "schur_update": {"rows": 0, "cols": 0, "values": []},
+        "solution": [1.0, -2.0, 0.5, 3.0],
+        "minimum_pivot_ratio": 0.5125,
+        "pivot_growth": 1.0
+      }
+    }
+  ],
+  "operators": {
+    "trsm_left_lower": {
+      "lower": {"rows": 3, "cols": 3, "values": [1.0, 0.0, 0.0, 2.0, 1.0, 0.0, -1.0, 3.0, 1.0]},
+      "rhs": {"rows": 3, "cols": 2, "values": [1.0, 2.0, 5.0, 8.0, 13.0, 16.0]},
+      "expected": {"rows": 3, "cols": 2, "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
+    },
+    "trsm_right_upper": {
+      "rhs": {"rows": 2, "cols": 3, "values": [2.0, 9.0, 16.0, -2.0, 15.0, -4.5]},
+      "upper": {"rows": 3, "cols": 3, "values": [2.0, 1.0, 3.0, 0.0, 4.0, -1.0, 0.0, 0.0, 5.0]},
+      "expected": {"rows": 2, "cols": 3, "values": [1.0, 2.0, 3.0, -1.0, 4.0, 0.5]}
+    },
+    "gemm_schur": {
+      "a": {"rows": 2, "cols": 3, "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]},
+      "b": {"rows": 3, "cols": 2, "values": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]},
+      "c": {"rows": 2, "cols": 2, "values": [100.0, 80.0, 200.0, 150.0]},
+      "expected": {"rows": 2, "cols": 2, "values": [42.0, 16.0, 61.0, -4.0]}
+    }
+  },
+  "metric_case": {
+    "matrix": {"rows": 2, "cols": 2, "values": [2.0, 0.0, 0.0, 4.0]},
+    "rhs": [2.0, 8.0],
+    "solution": [1.1, 1.9],
+    "reference_solution": [1.0, 2.0],
+    "expected": {
+      "relative_residual": 0.02475640482756602,
+      "componentwise_backward_error": 0.047619047619047616,
+      "relative_solution_error": 0.06324555320336758
+    }
+  },
+  "tree_case": {
+    "name": "two_front_chain",
+    "global_matrix": {"rows": 3, "cols": 3, "values": [4.0, 1.0, 0.0, 2.0, 5.0, 1.0, 0.0, 3.0, 6.0]},
+    "rhs": [2.0, -5.0, 12.0],
+    "reference_solution": [1.0, -2.0, 3.0],
+    "child": {
+      "variables": [0, 1],
+      "local_matrix": {"rows": 2, "cols": 2, "values": [4.0, 1.0, 2.0, 0.0]},
+      "pivot_columns": 1,
+      "expected_pivot_rows": [0],
+      "expected_permutation": [0, 1],
+      "expected_update": {"rows": 1, "cols": 1, "values": [-0.5]},
+      "expected_l": {"rows": 2, "cols": 1, "values": [1.0, 0.5]},
+      "expected_u": {"rows": 1, "cols": 2, "values": [4.0, 1.0]}
+    },
+    "parent": {
+      "variables": [1, 2],
+      "local_matrix_before_extend_add": {"rows": 2, "cols": 2, "values": [5.0, 1.0, 3.0, 6.0]},
+      "expected_assembled_matrix": {"rows": 2, "cols": 2, "values": [4.5, 1.0, 3.0, 6.0]},
+      "pivot_columns": 2,
+      "expected_pivot_rows": [0, 1],
+      "expected_permutation": [0, 1],
+      "expected_l": {"rows": 2, "cols": 2, "values": [1.0, 0.0, 0.6666666666666666, 1.0]},
+      "expected_u": {"rows": 2, "cols": 2, "values": [4.5, 1.0, 0.0, 5.333333333333333]}
+    }
+  }
+}
