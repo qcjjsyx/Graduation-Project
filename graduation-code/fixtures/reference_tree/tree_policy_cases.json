@@ -1,0 +1,642 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "p_local": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "status": "ok",
+        "x_hat": [
+          0.11180124223602486,
+          0.32298136645962733,
+          0.45962732919254656
+        ]
+      },
+      "maps": [
+        []
+      ],
+      "name": "static_identity_front",
+      "nodes": [
+        {
+          "front": [
+            4.0,
+            1.0,
+            0.5,
+            1.0,
+            3.0,
+            2.0,
+            0.5,
+            2.0,
+            5.0
+          ],
+          "pivot_dim": 3,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "STATIC",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "column": 1,
+        "kind": "zero_pivot",
+        "node_id": 0,
+        "status": "pivot_failure"
+      },
+      "maps": [
+        []
+      ],
+      "name": "static_trap_fails",
+      "nodes": [
+        {
+          "front": [
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          "pivot_dim": 3,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "STATIC",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "p_local": [
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "status": "ok",
+        "x_hat": [
+          -1.0,
+          2.0,
+          1.0
+        ]
+      },
+      "maps": [
+        []
+      ],
+      "name": "dynamic_trap_succeeds",
+      "nodes": [
+        {
+          "front": [
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          "pivot_dim": 3,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "DYNAMIC_PANEL",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "column": 1,
+        "kind": "no_candidate",
+        "node_id": 0,
+        "status": "pivot_failure"
+      },
+      "maps": [
+        []
+      ],
+      "name": "dynamic_cross_block_rejected",
+      "nodes": [
+        {
+          "front": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "pivot_dim": 2,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "DYNAMIC_PANEL",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "column": 1,
+        "kind": "below_threshold",
+        "node_id": 0,
+        "status": "pivot_failure"
+      },
+      "maps": [
+        []
+      ],
+      "name": "static_threshold_below",
+      "nodes": [
+        {
+          "front": [
+            100.0,
+            1.0,
+            1.0,
+            0.0001
+          ],
+          "pivot_dim": 2,
+          "variables": [
+            0,
+            1
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "STATIC",
+      "rhs": [
+        1.0,
+        2.0
+      ],
+      "threshold_ratio": 0.0010000000474974513
+    },
+    {
+      "expected": {
+        "column": 1,
+        "kind": "no_candidate",
+        "node_id": 0,
+        "status": "pivot_failure"
+      },
+      "maps": [
+        []
+      ],
+      "name": "dynamic_threshold_no_candidate",
+      "nodes": [
+        {
+          "front": [
+            100.0,
+            1.0,
+            1.0,
+            0.0001
+          ],
+          "pivot_dim": 2,
+          "variables": [
+            0,
+            1
+          ]
+        }
+      ],
+      "parent": [
+        -1
+      ],
+      "policy": "DYNAMIC_PANEL",
+      "rhs": [
+        1.0,
+        2.0
+      ],
+      "threshold_ratio": 0.0010000000474974513
+    },
+    {
+      "expected": {
+        "p_local": [
+          [
+            1,
+            0
+          ],
+          [
+            0
+          ]
+        ],
+        "status": "ok",
+        "x_hat": [
+          0.0,
+          0.0,
+          0.33333333333333337
+        ]
+      },
+      "maps": [
+        [],
+        [
+          {
+            "child": 0,
+            "col_map": [
+              0
+            ],
+            "row_map": [
+              0
+            ]
+          }
+        ]
+      ],
+      "name": "dynamic_swap_within_block",
+      "nodes": [
+        {
+          "front": [
+            0.0,
+            2.0,
+            3.0,
+            5.0,
+            1.0,
+            6.0,
+            7.0,
+            8.0,
+            0.0
+          ],
+          "pivot_dim": 2,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "front": [
+            9.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            2
+          ]
+        }
+      ],
+      "parent": [
+        1,
+        -1
+      ],
+      "policy": "DYNAMIC_PANEL",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "p_local": [
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ]
+        ],
+        "status": "ok",
+        "x_hat": [
+          0.11180124223602486,
+          0.32298136645962733,
+          0.45962732919254656,
+          1.2727272727272727,
+          2.909090909090909
+        ]
+      },
+      "maps": [
+        [],
+        [
+          {
+            "child": 0,
+            "col_map": [
+              0,
+              1
+            ],
+            "row_map": [
+              0,
+              1
+            ]
+          }
+        ],
+        [
+          {
+            "child": 1,
+            "col_map": [
+              0
+            ],
+            "row_map": [
+              0
+            ]
+          }
+        ],
+        [],
+        [
+          {
+            "child": 3,
+            "col_map": [
+              0
+            ],
+            "row_map": [
+              0
+            ]
+          }
+        ]
+      ],
+      "name": "multi_root_forest_static",
+      "nodes": [
+        {
+          "front": [
+            4.0,
+            1.0,
+            0.5,
+            1.0,
+            0.0,
+            0.0,
+            0.5,
+            0.0,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "front": [
+            3.0,
+            2.0,
+            2.0,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            1,
+            2
+          ]
+        },
+        {
+          "front": [
+            5.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            2
+          ]
+        },
+        {
+          "front": [
+            2.0,
+            0.5,
+            0.5,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            3,
+            4
+          ]
+        },
+        {
+          "front": [
+            1.5
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            4
+          ]
+        }
+      ],
+      "parent": [
+        1,
+        2,
+        -1,
+        4,
+        -1
+      ],
+      "policy": "STATIC",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0
+      ],
+      "threshold_ratio": 0.0
+    },
+    {
+      "expected": {
+        "p_local": [
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ],
+          [
+            0
+          ]
+        ],
+        "status": "ok",
+        "x_hat": [
+          0.11180124223602486,
+          0.32298136645962733,
+          0.45962732919254656,
+          1.2727272727272727,
+          2.909090909090909
+        ]
+      },
+      "maps": [
+        [],
+        [
+          {
+            "child": 0,
+            "col_map": [
+              0,
+              1
+            ],
+            "row_map": [
+              0,
+              1
+            ]
+          }
+        ],
+        [
+          {
+            "child": 1,
+            "col_map": [
+              0
+            ],
+            "row_map": [
+              0
+            ]
+          }
+        ],
+        [],
+        [
+          {
+            "child": 3,
+            "col_map": [
+              0
+            ],
+            "row_map": [
+              0
+            ]
+          }
+        ]
+      ],
+      "name": "multi_root_forest_dynamic",
+      "nodes": [
+        {
+          "front": [
+            4.0,
+            1.0,
+            0.5,
+            1.0,
+            0.0,
+            0.0,
+            0.5,
+            0.0,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "front": [
+            3.0,
+            2.0,
+            2.0,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            1,
+            2
+          ]
+        },
+        {
+          "front": [
+            5.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            2
+          ]
+        },
+        {
+          "front": [
+            2.0,
+            0.5,
+            0.5,
+            0.0
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            3,
+            4
+          ]
+        },
+        {
+          "front": [
+            1.5
+          ],
+          "pivot_dim": 1,
+          "variables": [
+            4
+          ]
+        }
+      ],
+      "parent": [
+        1,
+        2,
+        -1,
+        4,
+        -1
+      ],
+      "policy": "DYNAMIC_PANEL",
+      "rhs": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0
+      ],
+      "threshold_ratio": 0.0
+    }
+  ],
+  "schema": "fp64_reference_tree_v1"
+}

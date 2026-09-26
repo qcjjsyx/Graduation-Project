@@ -12,6 +12,9 @@ SystemC 的目标是同时回答三类问题：
 2. GCU、buffer、HPU、ATU 和计算引擎之间的时序/依赖是否正确；
 3. 在不同精度、带宽、buffer 和资源配置下，周期和数值误差如何变化。
 
+当前状态：T04/T05 的 SystemC Command executor（数据面/控制面、DMA、descriptor reader、
+token scoreboard 运行时、FP32 数值闭环）尚未实现；本文描述目标模型规范。
+
 ## 2. 三种后端
 
 ### 2.1 `FP64_GOLDEN`
@@ -19,8 +22,15 @@ SystemC 的目标是同时回答三类问题：
 普通 C++/FP64 参考计算，不作为设备仿真。用于：
 
 - 生成或检查 pivot、L/U/P 和 solution；
-- 计算 residual、backward error 和解误差；
+- 计算 residual、backward error 和解误差（对原始 `A x = b`）；
 - 对比 SystemC 输出。
+
+独立 FP64 参考（`graduation-code/systemc/reference/`）具有显式 `PivotPolicy`
+（`Static` / `DynamicPanel`）与 `PivotFailure` 语义：`panel_lu_policy()` 表达设备契约
+语义（置换范围限于 pivot block）；经典通用稠密部分主元 `panel_lu()` 保留完整数学能力
+（update 行可提升为 pivot），它**不是**设备契约。front-tree solve 强制同样的
+pivot-block 置换范围。host 侧 Python front-tree 参考只用于显式开启的预检（`PipelineConfig.reference_check`，默认关闭）与检查，
+不向设备数据供数。
 
 ### 2.2 `FP32_SYSTEMC`
 
@@ -28,7 +38,7 @@ SystemC 的目标是同时回答三类问题：
 
 必须具备：
 
-- command fetch；
+- command fetch（消费 Command/Descriptor schema v2，manifest `abi.version = 2`）；
 - descriptor 读取；
 - explicit front/scratchpad buffer；
 - 算子启动、运行、完成和异常状态；
@@ -57,8 +67,8 @@ SystemC top
  │   └─ ResourceScheduler
  ├─ DDR/MemoryModel
  ├─ AssemblyEngine
- ├─ HPU
- ├─ ATU
+ ├─ HPU（DYNAMIC_PANEL 单元）
+ ├─ ATU（DYNAMIC_PANEL 单元）
  ├─ PanelLuEngine
  ├─ TrsmEngine
  ├─ GemmFpEngine / Int32GemmBehavioral
@@ -67,6 +77,10 @@ SystemC top
  ├─ SolveController
  └─ GoldenChecker
 ```
+
+STATIC 路径不需要 HPU/ATU，运行时旁路其动态映射事务（旁路与综合时裁剪是两种不同
+能力）；DYNAMIC_PANEL 路径在当前 pivot block 内使用 HPU 搜索主元、ATU 维护逻辑→物理
+行映射。
 
 ## 4. 计算模块的真实性标准
 
@@ -102,7 +116,9 @@ DONE
 ERROR
 ```
 
-TRSM 至少体现对角处理、三角 mask、行/列依赖和完成条件。GEMM 至少体现 tile load、K 维累加和 writeback。
+其中 `PIVOT_CANDIDATE`、`PIVOT_SELECT`、`ROW_SWAP` 只在 DYNAMIC_PANEL 下使用；STATIC
+路径不搜索候选、不换行，但仍检查消元后的实际主元。TRSM 至少体现对角处理、三角 mask、
+行/列依赖和完成条件。GEMM 至少体现 tile load、K 维累加和 writeback。
 
 ### 4.4 必须显式建模延迟和反压
 
@@ -153,7 +169,25 @@ C  = qC × 2^(eA+eB)
 
 `C` 反量化回 FP32/FP64 后再参与 Schur update。不得把 scale 传播为整棵消除树的统一 front 格式。
 
-## 7. 设备执行闭环
+## 7. 主元策略契约（Command/Descriptor schema v2）
+
+- 设备执行链消费 Command/Descriptor schema v2（manifest `abi.version = 2`，见
+  [../interface/Command_Schema_v2.md](../interface/Command_Schema_v2.md)）；主元策略由
+  `FRONT_DESC` 显式声明（STATIC 默认 / DYNAMIC_PANEL 可选），executor 不得根据
+  P-vector 内容猜测策略。
+- 未来 executor 对未实现的策略必须返回 `POLICY_NOT_SUPPORTED` 并拒绝执行，且不得发布
+  READY token；依赖它的命令完成为 `DEPENDENCY_FAILED`。契约违规（非法策略编码、
+  P-vector 引用 `NONE`、v1/v2 混合记录）返回 `BAD_COMMAND`/`BAD_DESCRIPTOR`。
+- STATIC：固定顺序消元，不搜索候选、不换行，运行时旁路 HPU/ATU；仍检查消元后的实际
+  主元（`STATIC_PIVOT_FAILURE` / `PIVOT_UNSTABLE` / `NON_FINITE_VALUE`）。失败命令不
+  发布 READY token。
+- DYNAMIC_PANEL：主元搜索与行映射限于当前 pivot block 内 `k .. pivot_dim-1` 行（HPU
+  搜索、ATU 行映射），tie-break 取最小逻辑行号；跨 pivot block 才能继续时显式失败
+  （`PIVOT_NOT_FOUND`）。
+- 当前状态：DYNAMIC_PANEL 仅契约表达 + 参考行为，设备执行未实现；T04/T05 executor
+  尚未实现。
+
+## 8. 设备执行闭环
 
 单节点必须能够通过：
 
@@ -171,7 +205,7 @@ LOAD
 
 solve 阶段在 SystemC 中通过 `SOLVE_FORWARD` 和 `SOLVE_BACKWARD` 完成，并读取已经提交的因子和 RHS。
 
-## 8. 输出和 trace
+## 9. 输出和 trace
 
 每次运行应输出：
 
@@ -181,18 +215,19 @@ solve 阶段在 SystemC 中通过 `SOLVE_FORWARD` 和 `SOLVE_BACKWARD` 完成，
 - buffer occupancy 和 stall；
 - pivot、overflow、saturation、retry；
 - L/U/P、update 和 solution 的数据快照；
-- residual、backward error 和解误差。
+- residual、backward error 和解误差（对原始 `A x = b`）。
 
-## 9. 不能作出的表述
+## 10. 不能作出的表述
 
 即使 SystemC 运行成功，也不能直接表述为：
 
 - 完整 Verilog 硬件已经实现；
 - SystemC 周期数等于真实芯片周期；
 - INT32 GEMM 已经完成 RTL 验证；
-- FP32/INT32 对所有矩阵都达到 FP64 精度。
+- FP32/INT32 对所有矩阵都达到 FP64 精度；
+- FP32 静态设备路径的数值稳定性已完全验证（当前仅存在 FP64 验证）；
+- 已实现任何硬件加速（不得作硬件加速结论）。
 
 正确表述是：
 
 > 建立了命令驱动、buffer 驱动、周期级近似的 SystemC 硬件架构模型，并对 INT32 GEMM 局部混合精度路径进行了行为建模。
-

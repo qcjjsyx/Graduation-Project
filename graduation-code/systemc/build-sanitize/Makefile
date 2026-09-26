@@ -179,6 +179,19 @@ fp64_reference_tests/fast:
 .PHONY : fp64_reference_tests/fast
 
 #=============================================================================
+# Target rules for targets named fp64_reference_smoke
+
+# Build rule for target.
+fp64_reference_smoke: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 fp64_reference_smoke
+.PHONY : fp64_reference_smoke
+
+# fast build rule for target.
+fp64_reference_smoke/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fp64_reference_smoke.dir/build.make CMakeFiles/fp64_reference_smoke.dir/build
+.PHONY : fp64_reference_smoke/fast
+
+#=============================================================================
 # Target rules for targets named Experimental
 
 # Build rule for target.
@@ -590,6 +603,30 @@ reference/tests/fp64_reference_tests.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fp64_reference_tests.dir/build.make CMakeFiles/fp64_reference_tests.dir/reference/tests/fp64_reference_tests.cpp.s
 .PHONY : reference/tests/fp64_reference_tests.cpp.s
 
+reference/tools/fp64_reference_smoke.o: reference/tools/fp64_reference_smoke.cpp.o
+.PHONY : reference/tools/fp64_reference_smoke.o
+
+# target to build an object file
+reference/tools/fp64_reference_smoke.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fp64_reference_smoke.dir/build.make CMakeFiles/fp64_reference_smoke.dir/reference/tools/fp64_reference_smoke.cpp.o
+.PHONY : reference/tools/fp64_reference_smoke.cpp.o
+
+reference/tools/fp64_reference_smoke.i: reference/tools/fp64_reference_smoke.cpp.i
+.PHONY : reference/tools/fp64_reference_smoke.i
+
+# target to preprocess a source file
+reference/tools/fp64_reference_smoke.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fp64_reference_smoke.dir/build.make CMakeFiles/fp64_reference_smoke.dir/reference/tools/fp64_reference_smoke.cpp.i
+.PHONY : reference/tools/fp64_reference_smoke.cpp.i
+
+reference/tools/fp64_reference_smoke.s: reference/tools/fp64_reference_smoke.cpp.s
+.PHONY : reference/tools/fp64_reference_smoke.s
+
+# target to generate assembly for a file
+reference/tools/fp64_reference_smoke.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fp64_reference_smoke.dir/build.make CMakeFiles/fp64_reference_smoke.dir/reference/tools/fp64_reference_smoke.cpp.s
+.PHONY : reference/tools/fp64_reference_smoke.cpp.s
+
 src/atu_hpu_demo.o: src/atu_hpu_demo.cpp.o
 .PHONY : src/atu_hpu_demo.o
 
@@ -614,29 +651,29 @@ src/atu_hpu_demo.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/atu_hpu_demo.dir/build.make CMakeFiles/atu_hpu_demo.dir/src/atu_hpu_demo.cpp.s
 .PHONY : src/atu_hpu_demo.cpp.s
 
-src/command_codec_tests.o: src/command_codec_tests.cpp.o
-.PHONY : src/command_codec_tests.o
+tests/command_codec_tests.o: tests/command_codec_tests.cpp.o
+.PHONY : tests/command_codec_tests.o
 
 # target to build an object file
-src/command_codec_tests.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/src/command_codec_tests.cpp.o
-.PHONY : src/command_codec_tests.cpp.o
+tests/command_codec_tests.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/tests/command_codec_tests.cpp.o
+.PHONY : tests/command_codec_tests.cpp.o
 
-src/command_codec_tests.i: src/command_codec_tests.cpp.i
-.PHONY : src/command_codec_tests.i
+tests/command_codec_tests.i: tests/command_codec_tests.cpp.i
+.PHONY : tests/command_codec_tests.i
 
 # target to preprocess a source file
-src/command_codec_tests.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/src/command_codec_tests.cpp.i
-.PHONY : src/command_codec_tests.cpp.i
+tests/command_codec_tests.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/tests/command_codec_tests.cpp.i
+.PHONY : tests/command_codec_tests.cpp.i
 
-src/command_codec_tests.s: src/command_codec_tests.cpp.s
-.PHONY : src/command_codec_tests.s
+tests/command_codec_tests.s: tests/command_codec_tests.cpp.s
+.PHONY : tests/command_codec_tests.s
 
 # target to generate assembly for a file
-src/command_codec_tests.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/src/command_codec_tests.cpp.s
-.PHONY : src/command_codec_tests.cpp.s
+tests/command_codec_tests.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/command_codec_tests.dir/build.make CMakeFiles/command_codec_tests.dir/tests/command_codec_tests.cpp.s
+.PHONY : tests/command_codec_tests.cpp.s
 
 # Help Target
 help:
@@ -678,6 +715,7 @@ help:
 	@echo "... atu_hpu_demo"
 	@echo "... command_codec_tests"
 	@echo "... fp64_reference"
+	@echo "... fp64_reference_smoke"
 	@echo "... fp64_reference_tests"
 	@echo "... reference/src/fp64_reference.o"
 	@echo "... reference/src/fp64_reference.i"
@@ -685,12 +723,15 @@ help:
 	@echo "... reference/tests/fp64_reference_tests.o"
 	@echo "... reference/tests/fp64_reference_tests.i"
 	@echo "... reference/tests/fp64_reference_tests.s"
+	@echo "... reference/tools/fp64_reference_smoke.o"
+	@echo "... reference/tools/fp64_reference_smoke.i"
+	@echo "... reference/tools/fp64_reference_smoke.s"
 	@echo "... src/atu_hpu_demo.o"
 	@echo "... src/atu_hpu_demo.i"
 	@echo "... src/atu_hpu_demo.s"
-	@echo "... src/command_codec_tests.o"
-	@echo "... src/command_codec_tests.i"
-	@echo "... src/command_codec_tests.s"
+	@echo "... tests/command_codec_tests.o"
+	@echo "... tests/command_codec_tests.i"
+	@echo "... tests/command_codec_tests.s"
 .PHONY : help
 
 

@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from src.command_codec import (
     COMMAND_RECORD_BYTES,
+    COMMAND_SCHEMA_VERSION,
     COMPLETION_RECORD_BYTES,
     DESCRIPTOR_RECORD_BYTES,
+    NONE,
+    PVECTOR_ELEMENT_BYTES,
+    PVECTOR_INIT_VALUE,
     DataFormat,
     DescriptorType,
     Opcode,
+    PivotPolicy,
     StatusCode,
     decode_commands,
     decode_completions,
     decode_descriptors,
+    decode_pivot_threshold,
     validate_command_batch,
 )
 from src.dataStruct import MemoryRegion
@@ -108,6 +115,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
         _validate_completion_templates(commands, completions)
         node_count = _validate_symbolic_and_nodes(manifest, commands, regions)
         _validate_descriptor_references(descriptors)
+        _validate_pivot_contract(manifest, descriptors, image)
         _validate_device_precision(manifest, descriptors)
         _validate_reference_files(path.parent, manifest)
         return ManifestValidationResult(
@@ -124,10 +132,14 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
 
 def _validate_abi(manifest: dict) -> None:
     abi = manifest.get("abi", {})
-    if abi.get("name") != "command_descriptor" or _as_int(
-        abi.get("version", -1), "abi.version"
-    ) != 1:
-        raise ManifestValidationError("manifest is not Command/Descriptor v1")
+    version = _as_int(abi.get("version", -1), "abi.version")
+    if abi.get("name") != "command_descriptor":
+        raise ManifestValidationError("manifest is not a Command/Descriptor artifact")
+    if version != COMMAND_SCHEMA_VERSION:
+        raise ManifestValidationError(
+            f"manifest schema version {version} is not Command/Descriptor "
+            f"v{COMMAND_SCHEMA_VERSION} (v1 artifacts must not be reinterpreted)"
+        )
     if abi.get("endianness") != "little":
         raise ManifestValidationError("only little-endian artifacts are supported")
     expected = {
@@ -138,6 +150,8 @@ def _validate_abi(manifest: dict) -> None:
     for name, value in expected.items():
         if _as_int(abi.get(name, -1), f"abi.{name}") != value:
             raise ManifestValidationError(f"manifest {name} mismatch")
+    if abi.get("pivot_policy_field") != "FRONT_DESC.body_words[8..9]":
+        raise ManifestValidationError("manifest pivot_policy_field is inconsistent")
 
 
 def _validate_completion_templates(commands, completions) -> None:
@@ -168,7 +182,7 @@ def _validate_command_semantics(commands, descriptors, image: bytes, token_count
         Opcode.NODE_BEGIN: {DescriptorType.FRONT_DESC},
         Opcode.LOAD_FRONT: {DescriptorType.FRONT_DESC},
         Opcode.ASSEMBLE_EXTEND_ADD: {DescriptorType.CONTRIBUTION_DESC},
-        Opcode.PANEL_LU: {DescriptorType.KERNEL_DESC},
+        Opcode.PANEL_LU: {DescriptorType.FRONT_DESC},
         Opcode.TRSM_LEFT: {DescriptorType.KERNEL_DESC},
         Opcode.TRSM_RIGHT: {DescriptorType.KERNEL_DESC},
         Opcode.GEMM_SCHUR: {DescriptorType.KERNEL_DESC},
@@ -205,7 +219,7 @@ def _validate_command_semantics(commands, descriptors, image: bytes, token_count
 
 def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
     symbolic = manifest["symbolic"]
-    if symbolic.get("pattern_source") != "union_of_A_and_transpose_nonzero_patterns":
+    if symbolic.get("pattern_source") != "union_of_pattern_B_and_pattern_B_transpose":
         raise ManifestValidationError("unsupported symbolic pattern source")
     node_count = _as_int(symbolic["node_count"], "node_count")
     nodes = manifest["nodes"]
@@ -268,10 +282,15 @@ def _validate_descriptor_references(descriptors) -> None:
     count = len(descriptors)
 
     def require(index: int, allowed: set[DescriptorType], label: str) -> None:
-        if index == 0xFFFFFFFF:
+        if index == NONE:
             return
         if index >= count or DescriptorType(descriptors[index].descriptor_type) not in allowed:
             raise ManifestValidationError(f"{label} has invalid descriptor reference")
+
+    def require_mandatory(index: int, allowed: set[DescriptorType], label: str) -> None:
+        if index == NONE:
+            raise ManifestValidationError(f"{label} must not be NONE")
+        require(index, allowed, label)
 
     for descriptor in descriptors:
         kind = DescriptorType(descriptor.descriptor_type)
@@ -279,29 +298,188 @@ def _validate_descriptor_references(descriptors) -> None:
         if kind == DescriptorType.FRONT_DESC:
             require(body[0], {DescriptorType.REGION_DESC}, "front region")
             require(body[4], {DescriptorType.CONTRIBUTION_DESC}, "front contribution")
-            require(body[5], {DescriptorType.FACTOR_DESC}, "front factor")
-            require(body[6], {DescriptorType.REGION_DESC}, "front P-vector")
-            require(body[7], {DescriptorType.REGION_DESC}, "front workspace")
+            require_mandatory(body[5], {DescriptorType.FACTOR_DESC}, "front factor")
+            require_mandatory(body[6], {DescriptorType.REGION_DESC}, "front P-vector")
+            require_mandatory(body[7], {DescriptorType.REGION_DESC}, "front workspace")
         elif kind == DescriptorType.CONTRIBUTION_DESC:
             require(body[0], {DescriptorType.REGION_DESC}, "contribution source")
             require(body[1], {DescriptorType.REGION_DESC}, "contribution target")
         elif kind == DescriptorType.FACTOR_DESC:
-            for index in (0, 1, 2, 6):
-                require(body[index], {DescriptorType.REGION_DESC}, "factor region")
+            require(body[0], {DescriptorType.REGION_DESC}, "factor L region")
+            require(body[1], {DescriptorType.REGION_DESC}, "factor U region")
+            require_mandatory(body[2], {DescriptorType.REGION_DESC}, "factor P-vector")
+            require(body[6], {DescriptorType.REGION_DESC}, "factor workspace")
         elif kind == DescriptorType.KERNEL_DESC:
             for index in (0, 1, 2):
                 require(body[index], {DescriptorType.FRONT_DESC}, "kernel operand")
             require(body[8], {DescriptorType.SCALE_DESC}, "kernel scale")
         elif kind == DescriptorType.SOLVE_DESC:
-            require(body[0], {DescriptorType.FACTOR_DESC}, "solve factor")
-            for index in (1, 2, 3, 4):
-                require(body[index], {DescriptorType.REGION_DESC}, "solve region")
+            require_mandatory(body[0], {DescriptorType.FACTOR_DESC}, "solve factor")
+            require(body[1], {DescriptorType.REGION_DESC}, "solve RHS region")
+            require(body[2], {DescriptorType.REGION_DESC}, "solve solution region")
+            require_mandatory(body[3], {DescriptorType.REGION_DESC}, "solve P-vector")
+            require(body[4], {DescriptorType.REGION_DESC}, "solve workspace")
+
+
+def _check_p_vector_reference(
+    descriptors, image: bytes, index: int, pivot_dim: int, label: str
+) -> int:
+    """Follow a P-vector descriptor reference down to the actual data region."""
+
+    if index == NONE:
+        raise ManifestValidationError(f"{label} P-vector reference must not be NONE")
+    if index >= len(descriptors):
+        raise ManifestValidationError(f"{label} P-vector reference is unknown")
+    region = descriptors[index]
+    if DescriptorType(region.descriptor_type) != DescriptorType.REGION_DESC:
+        raise ManifestValidationError(f"{label} P-vector reference is not a REGION_DESC")
+    body = region.body_words
+    base_addr = body[0] | (body[1] << 32)
+    byte_size = body[2] | (body[3] << 32)
+    rows, cols = body[5], body[6]
+    if body[7] != int(DataFormat.INT32):
+        raise ManifestValidationError(f"{label} P-vector region must use INT32")
+    if pivot_dim <= 0:
+        raise ManifestValidationError(f"{label} pivot_dim must be positive")
+    if rows * cols != pivot_dim or byte_size != pivot_dim * PVECTOR_ELEMENT_BYTES:
+        raise ManifestValidationError(
+            f"{label} P-vector region capacity must equal pivot_dim {pivot_dim}"
+        )
+    end = base_addr + byte_size
+    if end > len(image):
+        raise ManifestValidationError(
+            f"{label} P-vector region exceeds the memory image"
+        )
+    words = struct.unpack(f"<{pivot_dim}i", image[base_addr:end])
+    if any(word != PVECTOR_INIT_VALUE for word in words):
+        raise ManifestValidationError(
+            f"{label} P-vector must be initialized to the INT32 sentinel "
+            f"{PVECTOR_INIT_VALUE}; a zero array is never identity"
+        )
+    return index
+
+
+def _validate_pivot_contract(manifest, descriptors, image: bytes) -> None:
+    pivot = manifest.get("pivot")
+    if not isinstance(pivot, dict):
+        raise ManifestValidationError("manifest is missing the pivot policy block")
+    policy_name = pivot.get("policy")
+    if not isinstance(policy_name, str):
+        raise ManifestValidationError("manifest pivot policy must be a name")
+    try:
+        policy = PivotPolicy[policy_name]
+    except KeyError as exc:
+        raise ManifestValidationError(f"unknown pivot policy {policy_name!r}") from exc
+    threshold_bits = _as_int(pivot.get("threshold_bits_fp32", -1), "threshold_bits_fp32")
+    if pivot.get("scope") != "batch_level_uniform":
+        raise ManifestValidationError("pivot policy scope must be batch_level_uniform")
+    if pivot.get("threshold_scale") != "front_pre_elimination_max_abs":
+        raise ManifestValidationError("pivot threshold scale must be explicit")
+    if not pivot.get("static_pivot_failure_policy"):
+        raise ManifestValidationError("manifest must declare the static failure policy")
+    effective_threshold = decode_pivot_threshold(threshold_bits)
+    if float(pivot.get("threshold_ratio", -1.0)) != effective_threshold:
+        raise ManifestValidationError(
+            "manifest threshold_ratio does not equal the binary32 threshold bits"
+        )
+    p_vector_meta = pivot.get("p_vector", {})
+    if p_vector_meta.get("omitted") is not False:
+        raise ManifestValidationError("v2 artifacts must keep explicit P-vector regions")
+    if p_vector_meta.get("none_reference_allowed") is not False:
+        raise ManifestValidationError("NONE P-vector references are not allowed in v2")
+
+    front_count = 0
+    for descriptor in descriptors:
+        kind = DescriptorType(descriptor.descriptor_type)
+        body = descriptor.body_words
+        if kind == DescriptorType.FRONT_DESC:
+            front_count += 1
+            if body[8] != int(policy):
+                raise ManifestValidationError(
+                    "FRONT_DESC pivot policy disagrees with the manifest policy"
+                )
+            if body[9] != threshold_bits:
+                raise ManifestValidationError(
+                    "FRONT_DESC pivot threshold disagrees with the manifest threshold"
+                )
+            front_p = _check_p_vector_reference(
+                descriptors, image, body[6], body[2], "front"
+            )
+            factor = descriptors[body[5]]
+            if factor.body_words[2] != front_p:
+                raise ManifestValidationError(
+                    "FRONT_DESC and FACTOR_DESC must reference one P-vector region"
+                )
+        elif kind == DescriptorType.FACTOR_DESC:
+            _check_p_vector_reference(
+                descriptors, image, body[2], body[4], "factor"
+            )
+        elif kind == DescriptorType.SOLVE_DESC:
+            factor = descriptors[body[0]]
+            solve_p = _check_p_vector_reference(
+                descriptors, image, body[3], factor.body_words[4], "solve"
+            )
+            if factor.body_words[2] != solve_p:
+                raise ManifestValidationError(
+                    "SOLVE_DESC and FACTOR_DESC must reference one P-vector region"
+                )
+    if front_count == 0:
+        raise ManifestValidationError("artifact contains no FRONT_DESC")
+
+    capabilities = manifest.get("required_device_capabilities", {})
+    if not isinstance(capabilities, dict) or not capabilities.get("always"):
+        raise ManifestValidationError("manifest must declare required device capabilities")
+    policy_caps = capabilities.get(policy.name)
+    if not isinstance(policy_caps, dict):
+        raise ManifestValidationError("manifest must declare policy device capabilities")
+    if policy == PivotPolicy.STATIC and policy_caps.get("hpu_atu_dynamic_mapping") != "bypassed":
+        raise ManifestValidationError("STATIC must bypass the HPU/ATU dynamic mapping")
+    if (
+        policy == PivotPolicy.DYNAMIC_PANEL
+        and policy_caps.get("hpu_atu_dynamic_mapping") != "required"
+    ):
+        raise ManifestValidationError("DYNAMIC_PANEL requires the HPU/ATU dynamic mapping")
+
+    preprocess = manifest.get("preprocess")
+    if not isinstance(preprocess, dict):
+        raise ManifestValidationError("manifest is missing the preprocess block")
+    matching = preprocess.get("matching", {})
+    if matching.get("method") not in {"none", "weighted_matching"}:
+        raise ManifestValidationError("unknown matching method in preprocess block")
+    transform = preprocess.get("transform", {})
+    row_match = [
+        _as_int(value, "row_perm_match") for value in transform.get("row_perm_match", [])
+    ]
+    ordering = [
+        _as_int(value, "ordering_perm") for value in transform.get("ordering_perm", [])
+    ]
+    rhs_map = [_as_int(value, "rhs_row_map") for value in transform.get("rhs_row_map", [])]
+    dimension = len(ordering)
+    if dimension == 0 or len(row_match) != dimension or len(rhs_map) != dimension:
+        raise ManifestValidationError("preprocess permutation arrays have wrong length")
+    for name, values in (
+        ("row_perm_match", row_match),
+        ("ordering_perm", ordering),
+        ("rhs_row_map", rhs_map),
+    ):
+        if sorted(values) != list(range(dimension)):
+            raise ManifestValidationError(f"{name} is not a 0..N-1 permutation")
+    if rhs_map != [row_match[ordering[index]] for index in range(dimension)]:
+        raise ManifestValidationError("rhs_row_map is inconsistent with the two permutations")
+    if matching.get("method") == "weighted_matching":
+        if matching.get("full_matching") is not True:
+            raise ManifestValidationError("weighted_matching requires a full matching")
+        matched_columns = matching.get("matched_column_of_row", [])
+        if sorted(_as_int(value, "match") for value in matched_columns) != list(
+            range(dimension)
+        ):
+            raise ManifestValidationError("matching columns are not a bijection")
 
 
 def _validate_device_precision(manifest, descriptors) -> None:
     compiler = manifest["compiler"]
     if compiler.get("device_format") != "FP32" or compiler.get("global_bfp") is not False:
-        raise ManifestValidationError("Command v1 main path must be FP32 without global BFP")
+        raise ManifestValidationError("Command v2 main path must be FP32 without global BFP")
     for descriptor in descriptors:
         if descriptor.descriptor_type == DescriptorType.REGION_DESC:
             data_format = DataFormat(descriptor.body_words[7])
@@ -317,14 +495,74 @@ def _validate_reference_files(out_dir: Path, manifest: dict) -> None:
         return
     if verification.get("device_memory_contains_fp64_reference") is not False:
         raise ManifestValidationError("FP64 reference must not be device input")
+    if verification.get("residual_target") != "original_A_x_equals_b":
+        raise ManifestValidationError("residuals must target the original system")
     matrix_dim = _as_int(manifest["matrix"]["n"], "matrix.n")
+    nodes = manifest["nodes"]
+    front_bytes = 8 * sum(
+        _as_int(nodes[name]["total_dim"], "total_dim") ** 2 for name in nodes
+    )
     expected_sizes = {
         verification["rhs_reference_file"]: matrix_dim * 8,
         verification["original_matrix_reference_file"]: matrix_dim * matrix_dim * 8,
         verification["original_rhs_reference_file"]: matrix_dim * 8,
         verification["row_scale_exponent_file"]: matrix_dim * 2,
-        verification["solution_reference_file"]: matrix_dim * 8,
+        verification["reference_front_file"]: front_bytes,
     }
+    solution_file = verification.get("solution_reference_file")
+    if solution_file is None:
+        if verification.get("solution_reference_space") is not None:
+            raise ManifestValidationError(
+                "missing golden solution must not declare a solution space"
+            )
+    else:
+        if verification.get("solution_reference_space") != "original_variable_order":
+            raise ManifestValidationError(
+                "golden solution must be in original variable order"
+            )
+        expected_sizes[solution_file] = matrix_dim * 8
+
+    host_reference = verification.get("host_reference")
+    if not isinstance(host_reference, dict):
+        raise ManifestValidationError("verification must declare the host reference block")
+    performed = host_reference.get("performed")
+    if performed is True:
+        if host_reference.get("policy") != manifest["pivot"]["policy"]:
+            raise ManifestValidationError(
+                "host reference policy must match the artifact policy"
+            )
+        x_hat_file = host_reference.get("x_hat_reference_file")
+        if not isinstance(x_hat_file, str):
+            raise ManifestValidationError(
+                "performed host reference must declare its x_hat file"
+            )
+        if host_reference.get("x_hat_reference_space") != "ordering_perm_variable_order":
+            raise ManifestValidationError("x_hat must be in the ordering_perm space")
+        expected_sizes[x_hat_file] = matrix_dim * 8
+        for field in (
+            "original_reference_residual_norm",
+            "original_reference_backward_error",
+        ):
+            if not isinstance(host_reference.get(field), (int, float)):
+                raise ManifestValidationError(
+                    f"performed host reference must report {field}"
+                )
+    elif performed is False:
+        if host_reference.get("x_hat_reference_file") is not None:
+            raise ManifestValidationError(
+                "host reference not performed must not declare an x_hat file"
+            )
+        for field in (
+            "original_reference_residual_norm",
+            "original_reference_backward_error",
+        ):
+            if host_reference.get(field) is not None:
+                raise ManifestValidationError(
+                    f"host reference not performed must not report {field}"
+                )
+    else:
+        raise ManifestValidationError("host_reference.performed must be a boolean")
+
     for name, expected in expected_sizes.items():
         if (out_dir / name).stat().st_size != expected:
             raise ManifestValidationError(f"reference file {name} has wrong size")

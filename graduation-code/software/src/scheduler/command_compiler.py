@@ -8,9 +8,12 @@ import numpy as np
 
 from src.command_codec import (
     COMMAND_RECORD_BYTES,
+    COMMAND_SCHEMA_VERSION,
     COMPLETION_RECORD_BYTES,
     DESCRIPTOR_RECORD_BYTES,
     NONE,
+    PVECTOR_ELEMENT_BYTES,
+    PVECTOR_INIT_VALUE,
     Command,
     Completion,
     DataFormat,
@@ -19,14 +22,16 @@ from src.command_codec import (
     DescriptorType,
     KernelBackend,
     Opcode,
+    PivotPolicy,
     SolveDirection,
     StatusCode,
     encode_commands,
     encode_completions,
     encode_descriptors,
+    encode_pivot_threshold,
     validate_command_batch,
 )
-from src.config import CommandCompilerConfig
+from src.config import CommandCompilerConfig, PivotPolicyConfig
 from src.dataStruct import MapTableEntry, MemoryRegion, NodeCompileRecord
 from src.memory.planner import plan_regions
 from src.scheduler.task_queue import sibling_friendly_order
@@ -92,8 +97,9 @@ def compile_command_artifact(
     permutation: Sequence[int],
     rhs: np.ndarray,
     config: CommandCompilerConfig,
+    pivot: PivotPolicyConfig,
 ) -> CompiledCommandArtifact:
-    """Compile symbolic/front IR into a self-contained Command v1 image."""
+    """Compile symbolic/front IR into a self-contained Command schema v2 image."""
 
     ordered_nodes, parent, matrix_dim = _validate_inputs(
         nodes, map_tables, local_fronts, permutation, rhs, config
@@ -102,7 +108,7 @@ def compile_command_artifact(
         ordered_nodes, local_fronts, permutation, rhs, matrix_dim
     )
     descriptor_specs = _build_static_descriptors(
-        ordered_nodes, map_tables, config.tile_size
+        ordered_nodes, map_tables, config.tile_size, pivot
     )
     command_specs, node_command_ids, node_tokens = _build_commands(
         ordered_nodes, map_tables, parent
@@ -209,6 +215,7 @@ def compile_command_artifact(
 
     manifest = _build_manifest(
         config=config,
+        pivot=pivot,
         total_bytes=total_bytes,
         regions=regions,
         descriptor_ids=descriptor_ids,
@@ -400,7 +407,10 @@ def _build_data_regions(
                     1,
                     node.pivot_dim,
                     DataFormat.INT32,
-                    bytes(node.pivot_dim * 4),
+                    struct.pack(
+                        f"<{node.pivot_dim}i",
+                        *([PVECTOR_INIT_VALUE] * node.pivot_dim),
+                    ),
                 ),
                 _RegionSpec(
                     f"{prefix}.solve_workspace",
@@ -421,8 +431,11 @@ def _build_static_descriptors(
     nodes: Sequence[NodeCompileRecord],
     map_tables: Sequence[Sequence[MapTableEntry]],
     tile_size: int,
+    pivot: PivotPolicyConfig,
 ) -> list[_DescriptorSpec]:
     descriptors: list[_DescriptorSpec] = []
+    policy_word = int(PivotPolicy[pivot.policy])
+    threshold_word = encode_pivot_threshold(pivot.threshold_ratio)
 
     def region(name: str) -> str:
         descriptor_name = f"region:{name}"
@@ -486,11 +499,12 @@ def _build_static_descriptors(
                     "factor": f"{prefix}.factor",
                     "p": f"region:{prefix}.p_vector",
                     "workspace": f"region:{prefix}.solve_workspace",
+                    "pivot_policy": policy_word,
+                    "pivot_threshold": threshold_word,
                 },
             )
         )
         kernel_shapes = {
-            "panel": (node.pivot_dim, node.pivot_dim, node.pivot_dim),
             "trsm_left": (node.pivot_dim, node.update_dim, node.pivot_dim),
             "trsm_right": (node.update_dim, node.pivot_dim, node.pivot_dim),
             "gemm": (node.update_dim, node.update_dim, node.pivot_dim),
@@ -613,7 +627,7 @@ def _build_commands(
         panel = emit(
             Opcode.PANEL_LU,
             node_id,
-            f"{prefix}.kernel.panel",
+            f"{prefix}.front",
             (current,),
             "panel",
         )
@@ -736,8 +750,8 @@ def _resolve_descriptor(
             descriptor_id(fields["factor"]),
             descriptor_id(fields["p"]),
             descriptor_id(fields["workspace"]),
-            0,
-            0,
+            fields["pivot_policy"],
+            fields["pivot_threshold"],
         )
     elif spec.descriptor_type == DescriptorType.CONTRIBUTION_DESC:
         body = (
@@ -806,6 +820,7 @@ def _resolve_descriptor(
 def _build_manifest(
     *,
     config: CommandCompilerConfig,
+    pivot: PivotPolicyConfig,
     total_bytes: int,
     regions: dict[str, MemoryRegion],
     descriptor_ids: dict[str, int],
@@ -821,18 +836,87 @@ def _build_manifest(
     return {
         "abi": {
             "name": "command_descriptor",
-            "version": 1,
+            "version": COMMAND_SCHEMA_VERSION,
             "endianness": "little",
             "address_unit": "byte_offset_from_memory_image_base",
             "command_record_bytes": COMMAND_RECORD_BYTES,
             "descriptor_record_bytes": DESCRIPTOR_RECORD_BYTES,
             "completion_record_bytes": COMPLETION_RECORD_BYTES,
+            "pivot_policy_field": "FRONT_DESC.body_words[8..9]",
         },
         "compiler": {
             "device_format": "FP32",
             "kernel_backend": "SYSTEMC_FP32_DEVICE_MODEL",
             "global_bfp": False,
             **asdict(config),
+        },
+        "pivot": {
+            "policy": pivot.policy,
+            "scope": "batch_level_uniform",
+            "threshold_ratio": pivot.threshold_ratio,
+            "threshold_bits_fp32": encode_pivot_threshold(pivot.threshold_ratio),
+            "threshold_scale": "front_pre_elimination_max_abs",
+            "threshold_scale_definition": (
+                "max |A_front| over the assembled front before elimination "
+                "of that front; computed once per front, never as a per-column "
+                "candidate search"
+            ),
+            "static_pivot_failure_policy": (
+                "report a numeric failure of the fixed elimination order "
+                "(STATIC_PIVOT_FAILURE / PIVOT_UNSTABLE / NON_FINITE_VALUE); "
+                "never publish a READY token; never claim the matrix is "
+                "singular; no runtime switch to another policy; host retry "
+                "restarts from the original inputs or fully rebuilt state"
+            ),
+            "p_vector": {
+                "region_suffix": "p_vector",
+                "format": "INT32",
+                "length": "pivot_dim",
+                "initial_value": PVECTOR_INIT_VALUE,
+                "direction": "gather_within_pivot_block",
+                "semantics": (
+                    "p[i] = source pivot-block row for pivot position i; "
+                    "STATIC writes the explicit identity; DYNAMIC_PANEL writes "
+                    "the selected interchange within the pivot block"
+                ),
+                "omitted": False,
+                "none_reference_allowed": False,
+            },
+        },
+        "required_device_capabilities": {
+            "always": [
+                "command_fetch_fixed_width",
+                "descriptor_reader",
+                "byte_addressable_memory",
+                "token_scoreboard",
+                "completion_writeback",
+                "panel_lu",
+                "trsm",
+                "gemm_schur",
+                "assemble_extend_add",
+                "tree_solve",
+            ],
+            "STATIC": {
+                "panel_lu_fixed_order": True,
+                "pivot_search": False,
+                "row_interchange": False,
+                "hpu_atu_dynamic_mapping": "bypassed",
+            },
+            "DYNAMIC_PANEL": {
+                "panel_lu_fixed_order": False,
+                "pivot_search": "pivot_block_only",
+                "row_interchange": "within_pivot_block",
+                "hpu_atu_dynamic_mapping": "required",
+                "cross_front_pivot": False,
+                "update_row_promotion": False,
+                "delayed_pivot": False,
+                "dynamic_front_growth": False,
+            },
+            "executor_policy_refusal": (
+                "an executor that does not implement the declared policy must "
+                "refuse the PANEL_LU command with POLICY_NOT_SUPPORTED and "
+                "must not publish its READY token"
+            ),
         },
         "total_bytes": total_bytes,
         "memory_image": {
@@ -861,7 +945,7 @@ def _build_manifest(
             "initialization": "expected_OK_templates; executor overwrites each slot",
         },
         "symbolic": {
-            "pattern_source": "union_of_A_and_transpose_nonzero_patterns",
+            "pattern_source": "union_of_pattern_B_and_pattern_B_transpose",
             "node_count": len(ordered_nodes),
             "parent": list(parent),
             "permutation": [int(value) for value in permutation],

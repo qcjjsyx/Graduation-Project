@@ -38,6 +38,25 @@ void validate_tolerance(double tolerance, const std::string& name) {
     }
 }
 
+// The device stores the pivot threshold as IEEE-754 binary32
+// (FRONT_DESC.body_words[9]).  The device-contract reference must use the same
+// effective value as the host configuration and the descriptor, so the ratio
+// is normalized to its binary32 value exactly once here.  Positive ratios that
+// underflow to zero and ratios that round to 1.0 are rejected.
+double normalize_pivot_threshold(double ratio) {
+    if (!std::isfinite(ratio) || ratio < 0.0 || ratio >= 1.0) {
+        throw ReferenceError("pivot threshold ratio must be in [0, 1)");
+    }
+    const auto normalized = static_cast<double>(static_cast<float>(ratio));
+    if (ratio != 0.0 && normalized == 0.0) {
+        throw ReferenceError("pivot threshold ratio underflows to zero in binary32");
+    }
+    if (normalized < 0.0 || normalized >= 1.0) {
+        throw ReferenceError("pivot threshold ratio rounds outside [0, 1) in binary32");
+    }
+    return normalized;
+}
+
 long double vector_l2_norm(const std::vector<double>& values) {
     long double sum = 0.0L;
     for (const auto value : values) {
@@ -245,6 +264,246 @@ PanelLuResult panel_lu(
     result.pivot_growth = initial_max_abs == 0.0 ?
         1.0 : maximum_workspace_abs / initial_max_abs;
     return result;
+}
+
+PanelLuResult panel_lu_policy(
+    const DenseMatrix& input,
+    std::size_t pivot_columns,
+    PivotPolicy policy,
+    double relative_pivot_tolerance) {
+    validate_shape(input, "panel input");
+    const auto threshold_ratio = normalize_pivot_threshold(relative_pivot_tolerance);
+    if (input.rows == 0 || input.cols == 0 || pivot_columns == 0 ||
+        pivot_columns > std::min(input.rows, input.cols)) {
+        throw ReferenceError("invalid panel dimensions");
+    }
+
+    DenseMatrix work = input;
+    PanelLuResult result{};
+    result.pivot_columns = pivot_columns;
+    result.permutation.resize(input.rows);
+    std::iota(result.permutation.begin(), result.permutation.end(), 0);
+    result.minimum_pivot_ratio = std::numeric_limits<double>::infinity();
+
+    double initial_max_abs = 0.0;
+    for (const auto value : input.values) {
+        initial_max_abs = std::max(initial_max_abs, std::abs(value));
+    }
+    double maximum_workspace_abs = initial_max_abs;
+    const auto threshold = threshold_ratio * initial_max_abs;
+
+    for (std::size_t column = 0; column < pivot_columns; ++column) {
+        std::size_t best_row = column;
+        double best_abs = -1.0;
+        if (policy == PivotPolicy::Static) {
+            const auto pivot = work.at(column, column);
+            if (!std::isfinite(pivot)) {
+                throw PivotFailure(
+                    PivotFailure::Kind::NonFinite, column,
+                    "fixed elimination order met a non-finite pivot");
+            }
+            best_abs = std::abs(pivot);
+            if (best_abs == 0.0) {
+                throw PivotFailure(
+                    PivotFailure::Kind::ZeroPivot, column,
+                    "fixed elimination order produced a zero pivot "
+                    "(not a singularity claim)");
+            }
+            if (best_abs <= threshold) {
+                throw PivotFailure(
+                    PivotFailure::Kind::BelowThreshold, column,
+                    "pivot below relative threshold "
+                        + std::to_string(threshold_ratio) +
+                        " * front_pre_elimination_max_abs");
+            }
+        } else {
+            bool found = false;
+            for (std::size_t row = column; row < pivot_columns; ++row) {
+                const auto candidate = work.at(row, column);
+                if (!std::isfinite(candidate)) {
+                    continue;
+                }
+                const auto magnitude = std::abs(candidate);
+                if (!found || magnitude > best_abs) {
+                    best_abs = magnitude;
+                    best_row = row;
+                    found = true;
+                }
+            }
+            if (!found) {
+                throw PivotFailure(
+                    PivotFailure::Kind::NonFinite, column,
+                    "pivot block column has no finite candidate");
+            }
+            if (best_abs <= threshold) {
+                throw PivotFailure(
+                    PivotFailure::Kind::NoCandidate, column,
+                    "no admissible pivot inside the pivot block "
+                    "(search never crosses the pivot-block boundary)");
+            }
+        }
+        result.pivot_rows.push_back(best_row);
+        const auto pivot_ratio =
+            initial_max_abs == 0.0 ? 0.0 : best_abs / initial_max_abs;
+        result.minimum_pivot_ratio =
+            std::min(result.minimum_pivot_ratio, pivot_ratio);
+
+        if (best_row != column) {
+            for (std::size_t col = 0; col < input.cols; ++col) {
+                std::swap(work.at(column, col), work.at(best_row, col));
+            }
+            std::swap(result.permutation[column], result.permutation[best_row]);
+        }
+
+        const auto pivot = work.at(column, column);
+        for (std::size_t row = column + 1; row < input.rows; ++row) {
+            const auto multiplier = work.at(row, column) / pivot;
+            if (!std::isfinite(multiplier)) {
+                throw PivotFailure(
+                    PivotFailure::Kind::NonFinite, column,
+                    "non-finite panel multiplier");
+            }
+            work.at(row, column) = multiplier;
+            maximum_workspace_abs =
+                std::max(maximum_workspace_abs, std::abs(multiplier));
+            for (std::size_t col = column + 1; col < input.cols; ++col) {
+                const auto updated =
+                    work.at(row, col) - multiplier * work.at(column, col);
+                if (!std::isfinite(updated)) {
+                    throw PivotFailure(
+                        PivotFailure::Kind::NonFinite, column,
+                        "non-finite panel update");
+                }
+                work.at(row, col) = updated;
+                maximum_workspace_abs =
+                    std::max(maximum_workspace_abs, std::abs(updated));
+            }
+        }
+    }
+
+    result.l = DenseMatrix(input.rows, pivot_columns);
+    result.u = DenseMatrix(pivot_columns, input.cols);
+    for (std::size_t row = 0; row < input.rows; ++row) {
+        for (std::size_t col = 0; col < pivot_columns; ++col) {
+            if (row == col) {
+                result.l.at(row, col) = 1.0;
+            } else if (row > col) {
+                result.l.at(row, col) = work.at(row, col);
+            }
+        }
+    }
+    for (std::size_t row = 0; row < pivot_columns; ++row) {
+        for (std::size_t col = row; col < input.cols; ++col) {
+            result.u.at(row, col) = work.at(row, col);
+        }
+    }
+
+    result.schur_update = DenseMatrix(
+        input.rows - pivot_columns, input.cols - pivot_columns);
+    for (std::size_t row = pivot_columns; row < input.rows; ++row) {
+        for (std::size_t col = pivot_columns; col < input.cols; ++col) {
+            result.schur_update.at(row - pivot_columns, col - pivot_columns) =
+                work.at(row, col);
+        }
+    }
+    result.pivot_growth = initial_max_abs == 0.0 ?
+        1.0 : maximum_workspace_abs / initial_max_abs;
+    return result;
+}
+
+FrontFactor factor_front(
+    const std::vector<std::size_t>& variables,
+    const DenseMatrix& assembled_front,
+    std::size_t pivot_columns,
+    PivotPolicy policy,
+    double relative_pivot_tolerance) {
+    FrontFactor front{};
+    front.variables = variables;
+    front.factorization = panel_lu_policy(
+        assembled_front, pivot_columns, policy, relative_pivot_tolerance);
+    return front;
+}
+
+std::vector<FrontFactor> factor_front_tree(
+    const std::vector<FrontInput>& fronts,
+    const std::vector<int>& parent,
+    PivotPolicy policy,
+    double relative_pivot_tolerance) {
+    const auto count = fronts.size();
+    if (count == 0 || parent.size() != count) {
+        throw ReferenceError("front tree requires one parent entry per front");
+    }
+    std::vector<std::size_t> pending(count, 0);
+    for (std::size_t node = 0; node < count; ++node) {
+        const auto ancestor = parent[node];
+        if (ancestor < -1 || ancestor >= static_cast<int>(count) ||
+            ancestor == static_cast<int>(node)) {
+            throw ReferenceError("front tree parent array is invalid");
+        }
+        if (ancestor >= 0) {
+            ++pending[static_cast<std::size_t>(ancestor)];
+        }
+        if (fronts[node].variables.size() != fronts[node].local_front.rows) {
+            throw ReferenceError("tree front variable count does not match its matrix");
+        }
+        validate_shape(fronts[node].local_front, "tree front");
+    }
+
+    std::vector<DenseMatrix> assembled;
+    assembled.reserve(count);
+    for (const auto& input : fronts) {
+        assembled.push_back(input.local_front);
+    }
+    std::vector<FrontFactor> factors(count);
+    std::vector<bool> done(count, false);
+    std::size_t completed = 0;
+    while (completed < count) {
+        bool progressed = false;
+        for (std::size_t node = 0; node < count; ++node) {
+            if (done[node] || pending[node] != 0) {
+                continue;
+            }
+            for (const auto& contribution : fronts[node].contributions) {
+                const auto child = contribution.child;
+                if (child >= count || !done[child]) {
+                    throw ReferenceError(
+                        "contribution child is unknown or not yet factored");
+                }
+                const auto& schur = factors[child].factorization.schur_update;
+                if (contribution.row_map.size() != contribution.col_map.size()) {
+                    throw ReferenceError("contribution map lengths differ");
+                }
+                auto& target = assembled[node];
+                for (std::size_t i = 0; i < contribution.row_map.size(); ++i) {
+                    for (std::size_t j = 0; j < contribution.row_map.size(); ++j) {
+                        const auto source_row = contribution.row_map[i];
+                        const auto source_col = contribution.row_map[j];
+                        const auto target_row = contribution.col_map[i];
+                        const auto target_col = contribution.col_map[j];
+                        if (source_row >= schur.rows || source_col >= schur.cols ||
+                            target_row >= target.rows || target_col >= target.cols) {
+                            throw ReferenceError("contribution map index out of range");
+                        }
+                        target.at(target_row, target_col) +=
+                            schur.at(source_row, source_col);
+                    }
+                }
+            }
+            factors[node] = factor_front(
+                fronts[node].variables, assembled[node], fronts[node].pivot_columns,
+                policy, relative_pivot_tolerance);
+            done[node] = true;
+            ++completed;
+            progressed = true;
+            if (parent[node] >= 0) {
+                --pending[static_cast<std::size_t>(parent[node])];
+            }
+        }
+        if (!progressed) {
+            throw ReferenceError("front tree contains a cycle");
+        }
+    }
+    return factors;
 }
 
 DenseMatrix trsm_left_lower(

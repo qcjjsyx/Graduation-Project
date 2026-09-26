@@ -340,12 +340,383 @@ void test_rejections() {
         "tree solve must reject a cross-front pivot");
 }
 
+void expect_pivot_failure(
+    const std::function<void()>& action,
+    ref::PivotFailure::Kind kind,
+    std::size_t column,
+    const std::string& message) {
+    try {
+        action();
+    } catch (const ref::PivotFailure& failure) {
+        expect(failure.kind() == kind, message + " wrong failure kind");
+        expect(failure.column() == column, message + " wrong failure column");
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+void expect_lu_reconstruction(
+    const ref::PanelLuResult& result,
+    const ref::DenseMatrix& permuted,
+    const std::string& message) {
+    expect(result.l.rows == permuted.rows, message + " L rows");
+    expect(result.u.cols == permuted.cols, message + " U cols");
+    for (std::size_t row = 0; row < permuted.rows; ++row) {
+        for (std::size_t col = 0; col < permuted.cols; ++col) {
+            double value = 0.0;
+            for (std::size_t inner = 0; inner < result.l.cols; ++inner) {
+                value += result.l.at(row, inner) * result.u.at(inner, col);
+            }
+            expect(
+                close(value, permuted.at(row, col), 1e-12),
+                message + " L*U mismatch");
+        }
+    }
+}
+
+void test_policy_no_swap_success() {
+    const ref::DenseMatrix front(2, 2, {2.0, 1.0, 0.0, 3.0});
+    const auto result = ref::panel_lu_policy(
+        front, 2, ref::PivotPolicy::Static);
+    expect(result.permutation == std::vector<std::size_t>({0, 1}),
+           "static P must be identity without swaps");
+    expect(result.pivot_rows == std::vector<std::size_t>({0, 1}),
+           "static pivot rows must follow the fixed order");
+    expect_lu_reconstruction(result, front, "static triangular");
+}
+
+void test_policy_requires_preprocessing_row_swap() {
+    const ref::DenseMatrix swap_only(2, 2, {0.0, 1.0, 1.0, 0.0});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(swap_only, 2, ref::PivotPolicy::Static);
+        },
+        ref::PivotFailure::Kind::ZeroPivot, 0,
+        "static on the un-preprocessed matrix must fail");
+
+    const ref::DenseMatrix preprocessed(2, 2, {1.0, 0.0, 0.0, 1.0});
+    const auto result = ref::panel_lu_policy(
+        preprocessed, 2, ref::PivotPolicy::Static);
+    expect(result.permutation == std::vector<std::size_t>({0, 1}),
+           "preprocessed static solve must not swap");
+    expect_lu_reconstruction(result, preprocessed, "preprocessed static");
+}
+
+void test_policy_nonzero_diagonal_can_still_need_interchange() {
+    const ref::DenseMatrix dense(3, 3, {1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(dense, 3, ref::PivotPolicy::Static);
+        },
+        ref::PivotFailure::Kind::ZeroPivot, 1,
+        "static must fail at the second pivot of the trap matrix");
+
+    const auto dynamic = ref::panel_lu_policy(dense, 3, ref::PivotPolicy::DynamicPanel);
+    expect(dynamic.permutation == std::vector<std::size_t>({0, 2, 1}),
+           "dynamic panel P must swap within the pivot block");
+    ref::DenseMatrix permuted(3, 3, dense.values);
+    for (std::size_t row = 0; row < 3; ++row) {
+        for (std::size_t col = 0; col < 3; ++col) {
+            permuted.at(row, col) = dense.at(dynamic.permutation[row], col);
+        }
+    }
+    expect_lu_reconstruction(dynamic, permuted, "dynamic trap matrix");
+
+    const std::vector<double> rhs{1.0, 2.0, 3.0};
+    const std::vector<ref::FrontFactor> fronts{
+        {{0, 1, 2}, dynamic},
+    };
+    const auto solution = ref::solve_front_tree(fronts, rhs);
+    const std::vector<double> expected{-1.0, 2.0, 1.0};
+    expect_vector_close(solution, expected, "dynamic trap solution");
+
+    const auto dynamic_again = ref::panel_lu_policy(
+        dense, 3, ref::PivotPolicy::DynamicPanel);
+    expect(
+        dynamic_again.permutation == dynamic.permutation &&
+            dynamic_again.l.values == dynamic.l.values &&
+            dynamic_again.u.values == dynamic.u.values,
+        "same policy must be deterministic");
+}
+
+void test_policy_cross_pivot_block_is_rejected() {
+    const ref::DenseMatrix front(
+        3, 3, {1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(front, 2, ref::PivotPolicy::DynamicPanel);
+        },
+        ref::PivotFailure::Kind::NoCandidate, 1,
+        "dynamic panel must refuse a pivot that lives past the pivot block");
+
+    const auto full_block = ref::panel_lu_policy(
+        front, 3, ref::PivotPolicy::DynamicPanel);
+    expect(
+        full_block.permutation == std::vector<std::size_t>({0, 2, 1}),
+        "full pivot block may interchange inside the block");
+}
+
+void test_policy_threshold_nonfinite_and_tie_break() {
+    const ref::DenseMatrix near_zero(2, 2, {100.0, 1.0, 1.0, 1e-4});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(
+                near_zero, 2, ref::PivotPolicy::Static, 1e-3);
+        },
+        ref::PivotFailure::Kind::BelowThreshold, 1,
+        "static must reject a pivot below the relative threshold");
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(
+                near_zero, 2, ref::PivotPolicy::DynamicPanel, 1e-3);
+        },
+        ref::PivotFailure::Kind::NoCandidate, 1,
+        "dynamic must report no admissible pivot inside the block");
+    (void)ref::panel_lu_policy(near_zero, 2, ref::PivotPolicy::Static, 1e-6);
+
+    const ref::DenseMatrix overflow_multiplier(
+        2, 2, {1e-30, 1e308, 1e308, 1.0});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(
+                overflow_multiplier, 2, ref::PivotPolicy::Static);
+        },
+        ref::PivotFailure::Kind::NonFinite, 0,
+        "non-finite multiplier must be reported");
+
+    const ref::DenseMatrix overflow_update(
+        2, 2, {-1e308, 1e308, 1e308, 1e308});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(
+                overflow_update, 2, ref::PivotPolicy::DynamicPanel);
+        },
+        ref::PivotFailure::Kind::NonFinite, 0,
+        "non-finite trailing update must be reported");
+
+    const ref::DenseMatrix tie_low(
+        3, 3, {1.0, 5.0, 5.0, 5.0, 1.0, 2.0, 5.0, 3.0, 4.0});
+    const auto tied = ref::panel_lu_policy(
+        tie_low, 3, ref::PivotPolicy::DynamicPanel);
+    expect(tied.pivot_rows[0] == 1, "tie must pick the lowest logical row");
+    const ref::DenseMatrix tie_high(
+        3, 3, {5.0, 1.0, 2.0, 5.0, 3.0, 4.0, 1.0, 5.0, 5.0});
+    const auto tied_high = ref::panel_lu_policy(
+        tie_high, 3, ref::PivotPolicy::DynamicPanel);
+    expect(tied_high.pivot_rows[0] == 0, "tie must pick the lowest logical row");
+}
+
+void test_policy_static_and_dynamic_may_differ_but_solve_equally() {
+    const ref::DenseMatrix dense(2, 2, {1.0, 2.0, 3.0, 4.0});
+    const auto static_factor = ref::panel_lu_policy(
+        dense, 2, ref::PivotPolicy::Static);
+    const auto dynamic_factor = ref::panel_lu_policy(
+        dense, 2, ref::PivotPolicy::DynamicPanel);
+    expect(
+        static_factor.permutation != dynamic_factor.permutation,
+        "policies may produce different P");
+    expect(
+        static_factor.l.values != dynamic_factor.l.values ||
+            static_factor.u.values != dynamic_factor.u.values,
+        "policies may produce different L/U");
+
+    const std::vector<double> rhs{5.0, 11.0};
+    const std::vector<double> expected{1.0, 2.0};
+    for (const auto& factor : {static_factor, dynamic_factor}) {
+        const auto x = ref::solve_from_lu(factor, rhs);
+        expect_vector_close(x, expected, "policy solution");
+    }
+}
+
+void test_policy_multi_root_forest_static_solve() {
+    const std::vector<std::size_t> left_vars{0, 1, 2};
+    const std::vector<std::size_t> mid_vars{1, 2};
+    const std::vector<std::size_t> leaf_vars{2};
+    const std::vector<std::size_t> right_vars{3, 4};
+    const std::vector<std::size_t> right_leaf_vars{4};
+
+    const ref::DenseMatrix left(
+        3, 3, {4.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.5, 0.0, 0.0});
+    const ref::DenseMatrix mid(2, 2, {3.0, 2.0, 2.0, 0.0});
+    const ref::DenseMatrix leaf(1, 1, {5.0});
+    const ref::DenseMatrix right(2, 2, {2.0, 0.5, 0.5, 0.0});
+    const ref::DenseMatrix right_leaf(1, 1, {1.5});
+
+    auto child = ref::factor_front(
+        left_vars, left, 1, ref::PivotPolicy::Static);
+    ref::DenseMatrix mid_assembled = mid;
+    for (std::size_t row = 0; row < 2; ++row) {
+        for (std::size_t col = 0; col < 2; ++col) {
+            mid_assembled.at(row, col) +=
+                child.factorization.schur_update.at(row, col);
+        }
+    }
+    auto mid_factor = ref::factor_front(
+        mid_vars, mid_assembled, 1, ref::PivotPolicy::Static);
+    ref::DenseMatrix leaf_assembled = leaf;
+    leaf_assembled.at(0, 0) += mid_factor.factorization.schur_update.at(0, 0);
+    auto root = ref::factor_front(
+        leaf_vars, leaf_assembled, 1, ref::PivotPolicy::Static);
+
+    auto right_child = ref::factor_front(
+        right_vars, right, 1, ref::PivotPolicy::Static);
+    ref::DenseMatrix right_assembled = right_leaf;
+    right_assembled.at(0, 0) +=
+        right_child.factorization.schur_update.at(0, 0);
+    auto right_root = ref::factor_front(
+        right_leaf_vars, right_assembled, 1, ref::PivotPolicy::Static);
+
+    const std::vector<ref::FrontFactor> fronts{
+        child, mid_factor, root, right_child, right_root,
+    };
+    const std::vector<double> rhs{1.0, 2.0, 3.0, 4.0, 5.0};
+    const auto x = ref::solve_front_tree(fronts, rhs);
+
+    ref::DenseMatrix dense(5, 5, std::vector<double>(25, 0.0));
+    const double left_values[9]{4.0, 1.0, 0.5, 1.0, 3.0, 2.0, 0.5, 2.0, 5.0};
+    for (std::size_t row = 0; row < 3; ++row) {
+        for (std::size_t col = 0; col < 3; ++col) {
+            dense.at(row, col) = left_values[row * 3 + col];
+        }
+    }
+    dense.at(3, 3) = 2.0;
+    dense.at(3, 4) = 0.5;
+    dense.at(4, 3) = 0.5;
+    dense.at(4, 4) = 1.5;
+
+    const auto residual = ref::relative_residual(dense, x, rhs);
+    expect(residual < 1e-12, "multi-root forest residual too large");
+    const auto metrics = ref::compute_accuracy_metrics(dense, x, rhs, x);
+    expect(metrics.componentwise_backward_error < 1e-12,
+           "multi-root forest backward error too large");
+}
+
+void test_policy_threshold_normalizes_to_binary32() {
+    const ref::DenseMatrix front(2, 2, {1.0, 0.5, 0.0, 0.1000000005});
+    expect_pivot_failure(
+        [&] {
+            (void)ref::panel_lu_policy(front, 2, ref::PivotPolicy::Static, 0.1);
+        },
+        ref::PivotFailure::Kind::BelowThreshold, 1,
+        "host threshold must equal the binary32 device threshold");
+    expect_throws(
+        [&] {
+            (void)ref::panel_lu_policy(front, 2, ref::PivotPolicy::Static, 1e-50);
+        },
+        "underflowing threshold must fail");
+    expect_throws(
+        [&] {
+            (void)ref::panel_lu_policy(
+                front, 2, ref::PivotPolicy::Static, 0.99999999);
+        },
+        "threshold rounding to 1.0 must fail");
+}
+
+void test_policy_static_and_dynamic_factor_scopes() {
+    const ref::DenseMatrix front(
+        3, 3, {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0});
+    const auto factor = ref::panel_lu_policy(
+        front, 2, ref::PivotPolicy::DynamicPanel);
+    for (std::size_t row = 0; row < 2; ++row) {
+        expect(factor.permutation[row] < 2, "pivot rows stay inside the block");
+    }
+    expect(factor.permutation[2] == 2, "update rows must not move");
+    const auto front_factor = ref::factor_front(
+        {0, 1, 2}, front, 2, ref::PivotPolicy::Static);
+    expect(
+        front_factor.factorization.permutation ==
+            std::vector<std::size_t>({0, 1, 2}),
+        "static front permutation must be identity");
+}
+
+std::string failure_kind_name(ref::PivotFailure::Kind kind) {
+    switch (kind) {
+    case ref::PivotFailure::Kind::ZeroPivot: return "zero_pivot";
+    case ref::PivotFailure::Kind::BelowThreshold: return "below_threshold";
+    case ref::PivotFailure::Kind::NonFinite: return "non_finite";
+    case ref::PivotFailure::Kind::NoCandidate: return "no_candidate";
+    }
+    throw std::runtime_error("unknown pivot failure kind");
+}
+
+void test_tree_policy_fixture(const json& fixture) {
+    expect(
+        fixture.at("schema").get<std::string>() == "fp64_reference_tree_v1",
+        "unexpected tree fixture schema");
+    for (const auto& test_case : fixture.at("cases")) {
+        const auto name = test_case.at("name").get<std::string>();
+        const auto parent = test_case.at("parent").get<std::vector<int>>();
+        std::vector<ref::FrontInput> fronts;
+        for (const auto& node : test_case.at("nodes")) {
+            ref::FrontInput input{};
+            input.variables = node.at("variables").get<std::vector<std::size_t>>();
+            input.pivot_columns = node.at("pivot_dim").get<std::size_t>();
+            const auto dimension = input.variables.size();
+            input.local_front = ref::DenseMatrix(
+                dimension, dimension, node.at("front").get<std::vector<double>>());
+            fronts.push_back(std::move(input));
+        }
+        const auto& maps = test_case.at("maps");
+        expect(maps.size() == fronts.size(), name + " map table count mismatch");
+        for (std::size_t node = 0; node < maps.size(); ++node) {
+            for (const auto& entry : maps[node]) {
+                ref::ContributionMap map{};
+                map.child = entry.at("child").get<std::size_t>();
+                map.row_map = entry.at("row_map").get<std::vector<std::size_t>>();
+                map.col_map = entry.at("col_map").get<std::vector<std::size_t>>();
+                fronts[node].contributions.push_back(std::move(map));
+            }
+        }
+        const auto policy =
+            test_case.at("policy").get<std::string>() == "STATIC"
+                ? ref::PivotPolicy::Static
+                : ref::PivotPolicy::DynamicPanel;
+        const auto threshold = test_case.at("threshold_ratio").get<double>();
+        const auto rhs = test_case.at("rhs").get<std::vector<double>>();
+        const auto& expected = test_case.at("expected");
+        try {
+            const auto factors =
+                ref::factor_front_tree(fronts, parent, policy, threshold);
+            expect(
+                expected.at("status").get<std::string>() == "ok",
+                name + ": expected a pivot failure");
+            const auto x = ref::solve_front_tree(factors, rhs);
+            expect_vector_close(
+                x,
+                expected.at("x_hat").get<std::vector<double>>(),
+                name + " x_hat");
+            const auto& expected_p = expected.at("p_local");
+            expect(expected_p.size() == factors.size(), name + " p_local count");
+            for (std::size_t node = 0; node < factors.size(); ++node) {
+                for (std::size_t row = 0; row < fronts[node].pivot_columns; ++row) {
+                    expect(
+                        factors[node].factorization.permutation[row] ==
+                            expected_p[node][row].get<std::size_t>(),
+                        name + " p_local mismatch");
+                }
+            }
+        } catch (const ref::PivotFailure& failure) {
+            expect(
+                expected.at("status").get<std::string>() == "pivot_failure",
+                name + ": unexpected pivot failure");
+            expect(
+                failure_kind_name(failure.kind()) ==
+                    expected.at("kind").get<std::string>(),
+                name + " failure kind mismatch");
+            expect(
+                failure.column() == expected.at("column").get<std::size_t>(),
+                name + " failure column mismatch");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) {
-            throw std::runtime_error("usage: fp64_reference_tests FIXTURE_JSON");
+        if (argc != 3) {
+            throw std::runtime_error(
+                "usage: fp64_reference_tests FIXTURE_JSON TREE_FIXTURE_JSON");
         }
         std::ifstream input(argv[1]);
         if (!input) {
@@ -363,6 +734,24 @@ int main(int argc, char** argv) {
         test_accuracy_metrics(fixture);
         test_two_front_tree(fixture);
         test_rejections();
+        test_policy_no_swap_success();
+        test_policy_requires_preprocessing_row_swap();
+        test_policy_nonzero_diagonal_can_still_need_interchange();
+        test_policy_cross_pivot_block_is_rejected();
+        test_policy_threshold_nonfinite_and_tie_break();
+        test_policy_static_and_dynamic_may_differ_but_solve_equally();
+        test_policy_multi_root_forest_static_solve();
+        test_policy_threshold_normalizes_to_binary32();
+        test_policy_static_and_dynamic_factor_scopes();
+        {
+            std::ifstream tree_input(argv[2]);
+            if (!tree_input) {
+                throw std::runtime_error("cannot open tree fixture JSON");
+            }
+            json tree_fixture;
+            tree_input >> tree_fixture;
+            test_tree_policy_fixture(tree_fixture);
+        }
         std::cout << "[FP64_REFERENCE_TESTS] ALL PASSED\n";
         return 0;
     } catch (const std::exception& exception) {

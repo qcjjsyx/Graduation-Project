@@ -1,7 +1,13 @@
 # Command / Descriptor 固定格式 v1
 
-状态：T01 已冻结  
-适用范围：当前主线软件 Command Compiler、SystemC Command Executor 和未来 RTL GCU  
+状态：**历史规范（superseded）**。当前主线规范是
+[Command_Schema_v2.md](Command_Schema_v2.md)；主线编译器只生成 schema v2
+产物。本文保留 v1 的冻结语义用于追溯，v1 fixture 仍在
+`graduation-code/fixtures/command_schema_v1/` 中保留。注意：本文与已归档
+的 NodeTask ABI v2（`archive/legacy-node-task-abi-v2/`）无关。
+
+T01 已冻结（历史状态）  
+适用范围（历史）：当时主线软件 Command Compiler、SystemC Command Executor 和未来 RTL GCU  
 字节序：little-endian  
 地址单位：相对于 `memory_image.bin` 首地址的 64 位字节偏移
 

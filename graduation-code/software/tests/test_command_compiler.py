@@ -3,8 +3,15 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from src.command_codec import DataFormat, DescriptorType, Opcode
-from src.config import CommandCompilerConfig
+from src.command_codec import (
+    NONE,
+    DataFormat,
+    DescriptorType,
+    Opcode,
+    PivotPolicy,
+    encode_pivot_threshold,
+)
+from src.config import CommandCompilerConfig, PivotPolicyConfig
 from src.dataStruct import MapTableEntry, NodeCompileRecord, NodeRange
 from src.scheduler.command_compiler import CommandCompileError, compile_command_artifact
 
@@ -26,6 +33,7 @@ def _tree_fixture(config: CommandCompilerConfig | None = None):
         permutation=[0, 1],
         rhs=np.array([1.0, 2.0]),
         config=config or CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(),
     )
 
 
@@ -77,6 +85,7 @@ def test_single_node_skips_zero_dimension_update_kernels():
         permutation=[0],
         rhs=np.array([3.0]),
         config=CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(),
     )
     opcodes = [command.opcode for command in artifact.commands]
     assert Opcode.TRSM_LEFT not in opcodes
@@ -97,6 +106,7 @@ def test_compiler_rejects_duplicate_ids_cycle_and_front_limit():
         permutation=[0, 1],
         rhs=np.ones(2),
         config=CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(),
     )
     with pytest.raises(CommandCompileError, match="duplicate node ID"):
         compile_command_artifact(nodes=[base[0], replace(base[1], node_id=0)], **kwargs)
@@ -118,4 +128,70 @@ def test_compiler_rejects_empty_rhs():
             permutation=[0],
             rhs=np.array([]),
             config=CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(),
         )
+
+
+def test_panel_lu_uses_front_descriptor_with_explicit_policy():
+    artifact = _tree_fixture()
+    panel_commands = [
+        command for command in artifact.commands if command.opcode == Opcode.PANEL_LU
+    ]
+    assert panel_commands
+    for command in panel_commands:
+        descriptor = artifact.descriptors[command.descriptor_id]
+        assert descriptor.descriptor_type == DescriptorType.FRONT_DESC
+        assert descriptor.body_words[8] == PivotPolicy.STATIC
+        assert descriptor.body_words[9] == encode_pivot_threshold(0.0)
+
+
+def test_dynamic_panel_policy_reaches_every_front_descriptor():
+    artifact = compile_command_artifact(
+        nodes=[
+            NodeCompileRecord(0, 1, NodeRange(0, 1), (0, 1)),
+            NodeCompileRecord(1, -1, NodeRange(1, 2), (1,)),
+        ],
+        map_tables=[[], [MapTableEntry(0, [0], [0])]],
+        local_fronts=[
+            np.array([[4.0, 1.0], [2.0, 0.0]], dtype=np.float64),
+            np.array([[5.0]], dtype=np.float64),
+        ],
+        permutation=[0, 1],
+        rhs=np.array([1.0, 2.0]),
+        config=CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(policy="DYNAMIC_PANEL", threshold_ratio=0.25),
+    )
+    fronts = [
+        descriptor
+        for descriptor in artifact.descriptors
+        if descriptor.descriptor_type == DescriptorType.FRONT_DESC
+    ]
+    assert fronts
+    for descriptor in fronts:
+        assert descriptor.body_words[8] == PivotPolicy.DYNAMIC_PANEL
+        assert descriptor.body_words[9] == encode_pivot_threshold(0.25)
+    assert artifact.manifest["pivot"]["policy"] == "DYNAMIC_PANEL"
+    assert artifact.manifest["required_device_capabilities"]["DYNAMIC_PANEL"][
+        "hpu_atu_dynamic_mapping"
+    ] == "required"
+
+
+def test_p_vector_regions_hold_the_unset_sentinel():
+    import struct
+
+    artifact = _tree_fixture()
+    for name, region in artifact.regions.items():
+        if not name.endswith(".p_vector"):
+            continue
+        data = artifact.image[region.offset : region.offset + region.size]
+        words = struct.unpack(f"<{region.size // 4}i", data)
+        assert set(words) == {-1}
+        assert 0 not in words
+    assert artifact.manifest["pivot"]["p_vector"]["initial_value"] == -1
+    assert artifact.manifest["pivot"]["p_vector"]["omitted"] is False
+    assert artifact.manifest["pivot"]["p_vector"]["none_reference_allowed"] is False
+    assert NONE not in {
+        descriptor.body_words[6]
+        for descriptor in artifact.descriptors
+        if descriptor.descriptor_type == DescriptorType.FRONT_DESC
+    }

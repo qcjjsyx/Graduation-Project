@@ -12,12 +12,12 @@ graduation-code/
 ├── systemc/                          SystemC 系统级硬件模型
 ├── hardware/                         GCU/ATU/HPU 等 RTL 原型
 ├── sim/                              Python 数值行为和历史实验
-├── optimization-v1/                  历史行列均衡实验
-├── optimization-v2-tile-bfp/         历史 Tile BFP 实验
-└── optimization-v3-adaptive-precision/历史全局 BFP 精度实验
+└── fixtures/                         Python/C++ 共用 golden fixture
 ```
 
-`optimization-v1/v2/v3` 是独立实验副本，不是当前主线执行路径。它们的代码和结果用于复现实验，不用于继续定义当前 ABI 或硬件架构。
+历史 optimization 实验（行列均衡、Tile BFP、全局 BFP）已移出主线，位于
+仓库根目录 `unused/` 与 `archive/`，只用于复现实验，不用于继续定义当前
+ABI 或硬件架构。
 
 ## 当前三层边界
 
@@ -28,7 +28,8 @@ graduation-code/
 - 读取稀疏方阵和 RHS；
 - 行均衡、符号包络、ordering、fill、消除森林；
 - supernode、front、local map 和数据布局；
-- 当前 ABI v2 artifact 生成；
+- 数值预处理：pow2 行均衡 + 全局加权最大乘积匹配行置换；
+- Command/Descriptor schema v2 artifact 生成（含显式主元策略）；
 - 目标 command stream/descriptor 生成；
 - 软件侧合法性检查。
 

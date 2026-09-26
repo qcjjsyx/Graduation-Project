@@ -34,7 +34,7 @@ if(SYSTEMC_HOME AND APPLE)
         atu_hpu_demo PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
 endif()
 
-add_executable(command_codec_tests src/command_codec_tests.cpp)
+add_executable(command_codec_tests tests/command_codec_tests.cpp)
 target_include_directories(command_codec_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_options(command_codec_tests PRIVATE
     $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>)
@@ -55,15 +55,22 @@ target_compile_options(fp64_reference_tests PRIVATE
     $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>)
 enable_project_sanitizers(fp64_reference_tests)
 
+add_executable(fp64_reference_smoke reference/tools/fp64_reference_smoke.cpp)
+target_link_libraries(fp64_reference_smoke PRIVATE fp64_reference)
+target_compile_options(fp64_reference_smoke PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wall;-Wextra;-Wpedantic>)
+enable_project_sanitizers(fp64_reference_smoke)
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME atu_hpu_demo COMMAND atu_hpu_demo)
     add_test(
         NAME command_codec_tests
         COMMAND command_codec_tests
-            "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/command_schema_v1")
+            "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/command_schema_v2")
     add_test(
         NAME fp64_reference_tests
         COMMAND fp64_reference_tests
-            "${CMAKE_CURRENT_SOURCE_DIR}/reference/fixtures/fp64_reference_v1.json")
+            "${CMAKE_CURRENT_SOURCE_DIR}/reference/fixtures/fp64_reference_v1.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/reference_tree/tree_policy_cases.json")
 endif()

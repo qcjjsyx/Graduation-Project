@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <set>
@@ -10,9 +11,19 @@
 #include <string>
 #include <vector>
 
-namespace hw::command_v1 {
+namespace hw::command {
+
+// Command/Descriptor schema v2, the current mainline artifact format.  It is
+// unrelated to the archived NodeTask ABI v2 (archive/legacy-node-task-abi-v2).
+// Record sizes are unchanged from schema v1; v1 FRONT_DESC records (zero
+// policy words) are rejected instead of reinterpreted.
+inline constexpr std::uint32_t SCHEMA_VERSION = 2;
 
 inline constexpr std::uint32_t NONE = 0xFFFFFFFFu;
+// P-vector regions start filled with this INT32 sentinel ("not written yet").
+// PANEL_LU overwrites every entry (Static writes the explicit identity); a
+// zero-filled P-vector is never interpreted as identity.
+inline constexpr std::int32_t PVECTOR_INIT_VALUE = -1;
 inline constexpr std::size_t COMMAND_RECORD_BYTES = 32;
 inline constexpr std::size_t DESCRIPTOR_RECORD_BYTES = 64;
 inline constexpr std::size_t COMPLETION_RECORD_BYTES = 64;
@@ -49,6 +60,13 @@ enum class DescriptorType : std::uint16_t {
     Dependency = 0x08,
 };
 
+// Pivot policy of FRONT_DESC body_words[8].  Value 0 is invalid and marks a
+// schema v1 record; the policy is never guessed from P-vector contents.
+enum class PivotPolicy : std::uint32_t {
+    Static = 0x01,
+    DynamicPanel = 0x02,
+};
+
 enum class DataFormat : std::uint32_t {
     Fp64 = 0x01,
     Fp32 = 0x02,
@@ -77,11 +95,14 @@ enum class StatusCode : std::uint16_t {
     AddressFault = 0x0003,
     BufferFull = 0x0004,
     DependencyFailed = 0x0005,
+    PolicyNotSupported = 0x0006,
     PivotNotFound = 0x0100,
     PivotUnstable = 0x0101,
     NumericOverflow = 0x0102,
     QuantizationSaturation = 0x0103,
     PrecisionRetry = 0x0104,
+    StaticPivotFailure = 0x0105,
+    NonFiniteValue = 0x0106,
     Timeout = 0x0200,
     Aborted = 0x0201,
 };
@@ -178,6 +199,10 @@ inline bool known_opcode(Opcode opcode) {
            value <= static_cast<std::uint32_t>(Opcode::AbortNode);
 }
 
+inline bool known_pivot_policy(PivotPolicy policy) {
+    return policy == PivotPolicy::Static || policy == PivotPolicy::DynamicPanel;
+}
+
 inline bool known_descriptor_type(DescriptorType type) {
     const auto value = static_cast<std::uint16_t>(type);
     return value >= static_cast<std::uint16_t>(DescriptorType::Region) &&
@@ -192,11 +217,14 @@ inline bool known_status(StatusCode status) {
     case StatusCode::AddressFault:
     case StatusCode::BufferFull:
     case StatusCode::DependencyFailed:
+    case StatusCode::PolicyNotSupported:
     case StatusCode::PivotNotFound:
     case StatusCode::PivotUnstable:
     case StatusCode::NumericOverflow:
     case StatusCode::QuantizationSaturation:
     case StatusCode::PrecisionRetry:
+    case StatusCode::StaticPivotFailure:
+    case StatusCode::NonFiniteValue:
     case StatusCode::Timeout:
     case StatusCode::Aborted:
         return true;
@@ -302,7 +330,7 @@ public:
         std::size_t first_reserved_word = 10;
         switch (descriptor.descriptor_type) {
         case DescriptorType::Region: first_reserved_word = 9; break;
-        case DescriptorType::Front: first_reserved_word = 8; break;
+        case DescriptorType::Front: first_reserved_word = 10; break;
         case DescriptorType::Contribution: first_reserved_word = 9; break;
         case DescriptorType::Factor: first_reserved_word = 7; break;
         case DescriptorType::Kernel: first_reserved_word = 10; break;
@@ -316,7 +344,26 @@ public:
             }
         }
 
-        if (descriptor.descriptor_type == DescriptorType::Region) {
+        if (descriptor.descriptor_type == DescriptorType::Front) {
+            if (descriptor.payload_bytes != 0) {
+                throw std::runtime_error(
+                    "FRONT_DESC does not define a variable payload");
+            }
+            const auto policy =
+                static_cast<PivotPolicy>(descriptor.body_words[8]);
+            if (!detail::known_pivot_policy(policy)) {
+                throw std::runtime_error(
+                    "unknown pivot policy (v1 FRONT_DESC records are not "
+                    "valid schema v2)");
+            }
+            float threshold = 0.0f;
+            const auto bits = descriptor.body_words[9];
+            std::memcpy(&threshold, &bits, sizeof(threshold));
+            if (!(threshold >= 0.0f) || !(threshold < 1.0f)) {
+                throw std::runtime_error(
+                    "FRONT_DESC pivot threshold must be in [0, 1)");
+            }
+        } else if (descriptor.descriptor_type == DescriptorType::Region) {
             const auto base_addr =
                 static_cast<std::uint64_t>(descriptor.body_words[0]) |
                 (static_cast<std::uint64_t>(descriptor.body_words[1]) << 32);
@@ -394,7 +441,7 @@ public:
                     "DEPENDENCY_DESC payload_bytes must equal token_count * 4");
             }
         } else if (descriptor.payload_bytes != 0) {
-            throw std::runtime_error("descriptor type does not define a v1 variable payload");
+            throw std::runtime_error("descriptor type does not define a v2 variable payload");
         }
     }
 
@@ -605,4 +652,4 @@ inline void validate_command_batch(
     }
 }
 
-}  // namespace hw::command_v1
+}  // namespace hw::command

@@ -31,7 +31,7 @@ selected RTL prototypes
 
 ```text
 稀疏矩阵 A、RHS b
-  → 均衡、ordering、fill、消除森林
+  → 均衡、加权匹配行置换、ordering、fill、消除森林
   → supernode、front、map
   → command ring、descriptor table、data image
   → SystemC 或 RTL device executor
@@ -41,7 +41,7 @@ selected RTL prototypes
 
 软件负责全局结构分析和命令编译。设备侧不负责 ordering、fill 或 supernode 构造，只执行已经编译的命令。
 
-当前 artifact ABI 是 Command/Descriptor v1：32B command、64B descriptor、64B completion 和同一 `memory_image.bin` 中的显式数据区域。旧 `NodeTask` ABI v2 已归档，不参与当前构建。
+当前 artifact 是 Command/Descriptor schema v2：32B command、64B descriptor、64B completion 和同一 `memory_image.bin` 中的显式数据区域。`FRONT_DESC` 显式携带主元策略：默认 `STATIC`（软件数值预处理 + 硬件固定主元顺序，旁路 HPU/ATU 动态映射），`DYNAMIC_PANEL` 为显式可选能力（仅限 pivot block 内选主元）。旧 `NodeTask` ABI v2 已归档，与 schema v2 无关，不参与当前构建。
 
 ## 当前代码目录
 
@@ -55,9 +55,10 @@ Graduation-Project/
 │   ├── systemc/                  多前沿 SystemC 系统模型
 │   ├── hardware/                 GCU、ATU、HPU 等 RTL 原型
 │   ├── sim/                      Python 行为模型和实验脚本
-│   └── optimization-v1/v2/v3/   历史精度实验副本，暂不作为主线
+│   └── fixtures/                 Python/C++ 共用 golden fixture（schema v1/v2）
 ├── graduation-project/           论文、开题、汇报和参考资料
-└── unused/                      后续归档的废弃设计和旧提示词
+├── archive/                      归档：NodeTask ABI v2、历史优化与精度实验
+└── unused/                       早期设计与历史 optimization-v1/v2/v3 副本
 ```
 
 ## 快速验证
@@ -88,8 +89,10 @@ python graduation-code/sim/hardware.py --n 32 --mode stable --seed 42 --ir-iters
 
 - [项目范围与交付边界](docs/architecture/项目范围与交付边界.md)
 - [系统架构与模块职责](docs/architecture/系统架构与模块职责.md)
+- [软件侧算法说明](docs/algorithm/README.md)
 - [Command Stream 与 Descriptor 接口](docs/interface/Command_Stream_and_Descriptor.md)
-- [Command / Descriptor 固定格式 v1](docs/interface/Command_Schema_v1.md)
+- [Command / Descriptor Schema v2](docs/interface/Command_Schema_v2.md)
+- [Command / Descriptor 固定格式 v1（历史）](docs/interface/Command_Schema_v1.md)
 - [SystemC 模型规范](docs/systemc/SystemC_模型规范.md)
 - [验证计划与结果口径](docs/verification/验证计划与结果口径.md)
 - [T00 可复现基线](docs/verification/T00_baseline.md)
@@ -99,6 +102,6 @@ python graduation-code/sim/hardware.py --n 32 --mode stable --seed 42 --ir-iters
 
 ## 文档使用规则
 
-上述主线文档定义当前项目范围。`graduation-code/optimization-v1/v2/v3`、旧开题方案、旧量化方案和早期 prompt 只用于追溯历史实验，不能继续修改为当前架构依据。
+上述主线文档定义当前项目范围。`unused/optimization-v1/v2/v3`、`archive/`、旧开题方案、旧量化方案和早期 prompt 只用于追溯历史实验，不能继续修改为当前架构依据。
 
 FP64 参考结果、FP32 SystemC 结果、INT32 GEMM 行为模型结果和未来 RTL 结果必须在实验中分开标记。SystemC 运行成功不等于 Verilog 已经实现，也不等于真实芯片周期已经得到验证。

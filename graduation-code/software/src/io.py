@@ -53,7 +53,7 @@ def write_map_table(path: str, map_tables: List[List[MapTableEntry]]) -> List[in
 
 def write_manifest(path: str, manifest: dict) -> None:
     with open(path, "w", encoding="utf-8") as output:
-        json.dump(manifest, output, indent=2, sort_keys=True)
+        json.dump(manifest, output, indent=2, sort_keys=True, allow_nan=False)
         output.write("\n")
 
 

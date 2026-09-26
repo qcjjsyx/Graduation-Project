@@ -1,7 +1,17 @@
-"""Command / Descriptor fixed-record codec for schema v1.
+"""Command / Descriptor fixed-record codec for schema v2.
+
+Schema v2 is the current mainline Command/Descriptor artifact format.  It is
+unrelated to the archived NodeTask ABI v2 (see
+``archive/legacy-node-task-abi-v2``), which is not consumed by any mainline
+code.  Relative to Command/Descriptor v1 the schema versions the artifact
+explicitly (``COMMAND_SCHEMA_VERSION``, mirrored in the manifest) and defines
+the pivot-policy fields of ``FRONT_DESC``; the 32B command, 64B descriptor and
+64B completion record layouts are unchanged.  v1 records are rejected instead
+of being reinterpreted: a v1 ``FRONT_DESC`` leaves the policy words at zero,
+which v2 validation refuses.
 
 The records in this module are device-facing and always little-endian.  Token
-state vector helpers exist only for shared cross-language test fixtures; the v1
+state vector helpers exist only for shared cross-language test fixtures; the
 device ABI does not define an in-memory scoreboard layout.
 """
 
@@ -14,9 +24,16 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 
 NONE = 0xFFFFFFFF
+COMMAND_SCHEMA_VERSION = 2
 COMMAND_RECORD_BYTES = 32
 DESCRIPTOR_RECORD_BYTES = 64
 COMPLETION_RECORD_BYTES = 64
+
+# P-vector regions are initialized to this INT32 sentinel ("not written yet").
+# PANEL_LU must overwrite every entry (STATIC writes the explicit identity);
+# a zero-filled P-vector is never interpreted as identity.
+PVECTOR_INIT_VALUE = -1
+PVECTOR_ELEMENT_BYTES = 4
 
 
 class Opcode(IntEnum):
@@ -57,6 +74,18 @@ class DescriptorType(IntEnum):
     DEPENDENCY_DESC = 0x08
 
 
+class PivotPolicy(IntEnum):
+    """Device pivot policy declared by FRONT_DESC body[8].
+
+    Value 0 is deliberately not a policy: it marks "unset" so that a v1 record
+    (all-zero policy words) can never be mistaken for a valid v2 policy, and so
+    that the policy is never guessed from the P-vector contents.
+    """
+
+    STATIC = 0x01
+    DYNAMIC_PANEL = 0x02
+
+
 class DataFormat(IntEnum):
     FP64 = 0x01
     FP32 = 0x02
@@ -79,18 +108,45 @@ class SolveDirection(IntEnum):
 
 
 class StatusCode(IntEnum):
+    """Completion status codes (v2).
+
+    Failure reporting contract (see docs/interface/Command_Schema_v2.md):
+
+    * requested pivot policy not implemented / not supported by the executor:
+      ``POLICY_NOT_SUPPORTED``; the command is refused before execution and no
+      READY token is published (``未实现``/``未支持``).
+    * malformed policy encoding, illegal P-vector reference or mixed schema
+      records: ``BAD_COMMAND`` / ``BAD_DESCRIPTOR`` at validation time.
+    * numeric pivot failure during elimination (``主元失败``):
+
+      - ``STATIC_PIVOT_FAILURE``: the fixed elimination order produced a zero
+        pivot under ``STATIC``.  This is *not* a claim that the matrix is
+        singular.
+      - ``PIVOT_UNSTABLE``: the actual pivot was below the declared relative
+        threshold (nonzero but too small).
+      - ``PIVOT_NOT_FOUND``: ``DYNAMIC_PANEL`` found no admissible pivot inside
+        the pivot block (search never crosses the pivot-block boundary).
+      - ``NON_FINITE_VALUE``: NaN/Inf in inputs or produced by elimination.
+
+    A failed command never publishes its READY token; the host retry must
+    restart from the original inputs or from fully rebuilt state.
+    """
+
     OK = 0x0000
     BAD_COMMAND = 0x0001
     BAD_DESCRIPTOR = 0x0002
     ADDRESS_FAULT = 0x0003
     BUFFER_FULL = 0x0004
     DEPENDENCY_FAILED = 0x0005
+    POLICY_NOT_SUPPORTED = 0x0006
 
     PIVOT_NOT_FOUND = 0x0100
     PIVOT_UNSTABLE = 0x0101
     NUMERIC_OVERFLOW = 0x0102
     QUANTIZATION_SATURATION = 0x0103
     PRECISION_RETRY = 0x0104
+    STATIC_PIVOT_FAILURE = 0x0105
+    NON_FINITE_VALUE = 0x0106
 
     TIMEOUT = 0x0200
     ABORTED = 0x0201
@@ -189,7 +245,7 @@ class Command:
 
 _RESERVED_BODY_WORDS = {
     DescriptorType.REGION_DESC: range(9, 10),
-    DescriptorType.FRONT_DESC: range(8, 10),
+    DescriptorType.FRONT_DESC: range(10, 10),
     DescriptorType.CONTRIBUTION_DESC: range(9, 10),
     DescriptorType.FACTOR_DESC: range(7, 10),
     DescriptorType.KERNEL_DESC: range(10, 10),
@@ -197,6 +253,59 @@ _RESERVED_BODY_WORDS = {
     DescriptorType.SCALE_DESC: range(6, 10),
     DescriptorType.DEPENDENCY_DESC: range(1, 10),
 }
+
+
+def normalize_pivot_threshold(ratio: float) -> float:
+    """Return the single effective threshold shared by host and device.
+
+    The device stores the threshold as IEEE-754 binary32 bits
+    (``FRONT_DESC.body_words[9]``).  Every consumer — configuration, manifest,
+    host reference and descriptor — must use the *same* effective value, so the
+    ratio is normalized to its binary32 value here exactly once.
+
+    Rejected cases:
+
+    * ratio outside ``[0.0, 1.0)``;
+    * positive ratio that underflows to zero in binary32 (the device would
+      silently lose the threshold);
+    * ratio that rounds to ``1.0`` in binary32 (would leave the legal range).
+    """
+
+    value = float(ratio)
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"threshold ratio must be in [0.0, 1.0), got {ratio}")
+    (normalized,) = struct.unpack("<f", struct.pack("<f", value))
+    normalized = float(normalized)
+    if value != 0.0 and normalized == 0.0:
+        raise ValueError(
+            f"threshold ratio {ratio!r} underflows to zero in binary32"
+        )
+    if not 0.0 <= normalized < 1.0:
+        raise ValueError(
+            f"threshold ratio {ratio!r} rounds to {normalized} in binary32, "
+            "outside [0.0, 1.0)"
+        )
+    return normalized
+
+
+def encode_pivot_threshold(ratio: float) -> int:
+    """Encode the effective threshold as IEEE-754 binary32 bits."""
+
+    normalized = normalize_pivot_threshold(ratio)
+    bits = struct.unpack("<I", struct.pack("<f", normalized))[0]
+    if decode_pivot_threshold(bits) != normalized:  # pragma: no cover - exact by construction
+        raise ValueError("pivot threshold encoding is not lossless")
+    return bits
+
+
+def decode_pivot_threshold(bits: int) -> float:
+    """Decode IEEE-754 binary32 threshold bits back to a ratio in [0, 1)."""
+
+    _check_uint("pivot threshold bits", bits, _U32_MAX)
+    (value,) = struct.unpack("<f", struct.pack("<I", bits))
+    if not (0.0 <= value < 1.0):
+        raise ValueError(f"pivot threshold ratio must be in [0.0, 1.0), got {value}")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -266,6 +375,22 @@ class Descriptor:
                 required = (rows - 1) * row_stride + cols * element_size
                 if required > byte_size:
                     raise ValueError("REGION_DESC dimensions exceed byte_size")
+        elif descriptor_type == DescriptorType.FRONT_DESC:
+            if self.payload_bytes != 0:
+                raise ValueError("FRONT_DESC does not define a variable payload")
+            policy_word = self.body_words[8]
+            threshold_word = self.body_words[9]
+            try:
+                PivotPolicy(policy_word)
+            except ValueError as exc:
+                raise ValueError(
+                    f"unknown pivot policy {policy_word:#x} "
+                    "(v1 FRONT_DESC records are not valid schema v2)"
+                ) from exc
+            try:
+                decode_pivot_threshold(threshold_word)
+            except ValueError as exc:
+                raise ValueError(f"FRONT_DESC pivot threshold: {exc}") from exc
         elif descriptor_type == DescriptorType.CONTRIBUTION_DESC:
             expected = 4 * (self.body_words[4] + self.body_words[5])
             if self.payload_offset % 4:
@@ -284,7 +409,7 @@ class Descriptor:
                 )
         elif self.payload_bytes != 0:
             raise ValueError(
-                f"{descriptor_type.name} does not define a v1 variable payload"
+                f"{descriptor_type.name} does not define a v2 variable payload"
             )
 
     def to_bytes(self) -> bytes:
@@ -444,7 +569,7 @@ def validate_command_batch(
     token_count: int,
     max_wait_tokens: Optional[int] = None,
 ) -> None:
-    """Validate v1 cross-record descriptor and token references.
+    """Validate v2 cross-record descriptor and token references.
 
     This validates the static batch contract only; it does not execute commands
     or implement the GCU token state machine.

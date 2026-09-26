@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from src.command_codec import normalize_pivot_threshold
+
 
 @dataclass(frozen=True)
 class MatrixInputConfig:
@@ -56,6 +58,67 @@ class EquilibrationConfig:
 
 
 @dataclass(frozen=True)
+class MatchingConfig:
+    """Host-side numeric preprocessing: global one-to-one row matching.
+
+    ``weighted_matching`` computes a maximum-product perfect matching on the
+    nonzero pattern and converts it into a row permutation that strengthens the
+    diagonal.  ``none`` disables the stage (baseline and ablation runs).
+    """
+
+    method: str = "weighted_matching"
+    objective: str = "max_product"
+
+    _VALID_METHODS: ClassVar[frozenset[str]] = frozenset({"none", "weighted_matching"})
+    _VALID_OBJECTIVES: ClassVar[frozenset[str]] = frozenset({"max_product"})
+
+    def __post_init__(self) -> None:
+        if self.method not in self._VALID_METHODS:
+            raise ValueError(
+                f"matching method must be one of "
+                f"{sorted(self._VALID_METHODS)}, got {self.method!r}"
+            )
+        if self.objective not in self._VALID_OBJECTIVES:
+            raise ValueError(
+                f"matching objective must be one of "
+                f"{sorted(self._VALID_OBJECTIVES)}, got {self.objective!r}"
+            )
+
+
+@dataclass(frozen=True)
+class PivotPolicyConfig:
+    """Device pivot policy declared at compile time (batch-level, uniform).
+
+    ``STATIC``: fixed pivot order = post-ordering diagonal order; no candidate
+    search and no row interchange on the device; the HPU/ATU dynamic mapping
+    path is bypassed.  ``DYNAMIC_PANEL``: pivot search restricted to the
+    current pivot block.  Threshold rejections are relative to
+    ``front_pre_elimination_max_abs`` (max |A_front| of the assembled front
+    before elimination of that front).
+
+    ``threshold_ratio`` is normalized once to its IEEE-754 binary32 value (the
+    device storage format), so configuration, manifest, host reference and the
+    descriptor share one effective threshold.  Values that underflow to zero or
+    round to 1.0 in binary32 are rejected at configuration time.
+    """
+
+    policy: str = "STATIC"
+    threshold_ratio: float = 0.0
+
+    _VALID_POLICIES: ClassVar[frozenset[str]] = frozenset({"STATIC", "DYNAMIC_PANEL"})
+
+    def __post_init__(self) -> None:
+        if self.policy not in self._VALID_POLICIES:
+            raise ValueError(
+                f"pivot policy must be one of "
+                f"{sorted(self._VALID_POLICIES)}, got {self.policy!r}"
+            )
+        object.__setattr__(
+            self, "threshold_ratio", normalize_pivot_threshold(self.threshold_ratio)
+        )
+
+
+@dataclass(frozen=True)
 class CommandCompilerConfig:
     alignment: int = 64
     tile_size: int = 16
@@ -84,6 +147,13 @@ class PipelineConfig:
     matrix: MatrixInputConfig = MatrixInputConfig()
     ordering: OrderingConfig = OrderingConfig()
     equilibration: EquilibrationConfig = EquilibrationConfig()
+    matching: MatchingConfig = MatchingConfig()
+    pivot: PivotPolicyConfig = PivotPolicyConfig()
     command: CommandCompilerConfig = CommandCompilerConfig()
     solve: SolveInputConfig = SolveInputConfig()
+    # Explicit opt-in: run the host FP64 front-tree reference (preflight +
+    # residual metrics) around compilation.  Normal compilation never depends
+    # on the numeric solve succeeding, so inputs that must fail on the device
+    # can still be compiled.  Independent entry: src.verify.front_reference.
+    reference_check: bool = False
     out_dir: Path = Path("out")
