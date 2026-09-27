@@ -1,6 +1,6 @@
 # 毕业设计当前任务状态
 
-状态：**T00–T03 已完成（含主元策略调整与 Command/Descriptor schema v2 演进），下一阶段从 T04 开始。**
+状态：**T00–T04 已完成（含主元策略调整、Command/Descriptor schema v2 演进与 SystemC Command 数据面），下一阶段从 T05 开始。**
 
 > 本文档只记录当前主线已经完成的工作、验证证据和后续边界，不再按月份或周数安排进度。
 
@@ -33,7 +33,14 @@
     与通用 dense partial-pivot `panel_lu` 明确分离）；
   - 独立 ATU / HPU 模块（DYNAMIC_PANEL 用）与测试；
   - `tools/fp64_reference_smoke` 数值冒烟入口。
-- **SystemC Command 执行器尚未实现**，属于后续 T04/T05。
+- **T04 SystemC Command 数据面已实现**：schema v2 artifact/manifest 加载与交叉
+  校验、byte-addressable device memory、运行时 descriptor reader、片上
+  buffer（slot + generation、所有权与生命周期）、单通道 DMA（1D/2D、延迟、
+  背压、reset）、trace 与最终 snapshot；见
+  `docs/systemc/T04_SystemC_数据面设计.md`。
+- **SystemC Command 控制面（T05）与数值 kernel 尚未实现**：command fetch、
+  GCU/token scoreboard、资源调度、completion 写回属 T05；Panel-LU/TRSM/
+  GEMM/solve 数值 kernel 按后续任务实现。T04 不执行命令、不写 completion。
 
 ## 2. 已完成任务
 
@@ -112,6 +119,44 @@
 - graduation-code/software/src/memory/planner.py
 - graduation-code/software/src/verify/manifest.py
 - graduation-code/software/src/main.py
+
+### T04：SystemC Command 数据面 [x]
+
+- [x] 独立 schema v2 ArtifactLoader / DeviceBootConfig：manifest 与 memory_image
+  校验（版本、记录大小、区域对齐/重叠/溢出、command/descriptor/completion
+  解码、descriptor 引用、FRONT_DESC 策略/阈值、P-vector 哨兵与跨 descriptor
+  一致性、静态 batch 元数据）；设备运行目录可只有 manifest + image。
+- [x] 统一 byte-addressable DeviceMemory 与 RegionRegistry：u64 偏移、跨
+  region/padding 检查、按访问类型对齐、只读控制区域、非法写不改内存、
+  零长度成功空操作（不得绕过区域检查）。
+- [x] MemoryService：DescriptorReader 与 DMA 共享的单端口 FIFO 服务、固定
+  启动/beat 延迟、队列背压、非法访问单终态 AddressFault、reset epoch。
+- [x] DescriptorReader 与类型化视图（Region/Front/Factor/Contribution/
+  Kernel/Solve/Dependency）：全部经设备事务读取、无 cache；校验引用、形状、
+  stride、format、layout、payload；STATIC/DYNAMIC_PANEL 原样保留。
+- [x] BufferManager / Scratchpad：slot + generation、owner、容量、有效范围、
+  FREE→RESERVED→LOADING→READY→COMPUTING→DIRTY→WRITING_BACK→READY→FREE
+  生命周期、端口/占用冲突、错误 owner/过期 handle/重复释放拒绝。
+- [x] 单通道 DmaEngine：明确 request/response + valid/ready、一个活动传输、
+  顺序完成、1D/2D（offset/stride/尾块）、非法请求无部分写入、响应稳定、
+  reset 中断语义。
+- [x] 双 buffer ping-pong：DMA 装载 B 时消费者可读 A，显式所有权移交。
+- [x] Trace/统计：transactions.csv、buffers.csv、summary.json、
+  final_memory_image.bin；请求等待、内存服务、响应背压分开计数。
+- [x] 测试：普通 C++ 加载/内存/buffer/服务测试；SystemC 时序测试；
+  真实 artifact 集成（STATIC/DYNAMIC_PANEL、单节点/多节点/多根/256 阶、
+  外部 RHS 且 `reference_check=False`）；Release 与 sanitizer CTest 8/8。
+
+主要产物：
+
+- graduation-code/systemc/include/dataplane/
+- graduation-code/systemc/src/dataplane/
+- graduation-code/systemc/src/dataplane_smoke.cpp
+- graduation-code/systemc/tests/dataplane_core_tests.cpp
+- graduation-code/systemc/tests/dataplane_systemc_tests.cpp
+- graduation-code/systemc/tests/dataplane_artifact_tests.cpp
+- graduation-code/systemc/tools/t04_fixture_gen.py
+- docs/systemc/T04_SystemC_数据面设计.md
 
 ### 本轮：主元策略调整与 schema v2 演进 [x]
 
@@ -193,6 +238,10 @@
 | 独立 C++ FP64 reference 数值冒烟（原始 A、b） | n=256 相对残差 3.1e-17 / 后向 1.0e-12 / 解误差 1.6e-7；n=576 5.0e-17 / 1.7e-11 / 5.6e-5；n=1024 2.8e-17 / 1.6e-6 / 2.4e-6 |
 | 重复编译确定性 | manifest 与 memory image 字节级一致（复核） |
 | 同策略整树 Python/C++ 交叉验证 | 9 个共享 fixture 用例两侧全部一致（x_hat、局部 P-vector、失败分类） |
+| T04 主线 SystemC CTest | 8/8 passed（3 个既有 + t04_generate_fixtures + core + systemc + artifact + smoke） |
+| T04 sanitizer CTest | 8/8 passed（ASan+UBSan） |
+| T04 数据面测试规模 | core 144 checks、systemc 187 checks、artifact 90 checks |
+| T04 真实 artifact 集成 | 单节点/22 节点/2 根森林/DYNAMIC_PANEL/256 阶；256 阶 image 1,472,984 B、最大搬运 tile 67×67 = 17,956 B、scratchpad 容量 65,536 B |
 
 说明：
 
@@ -204,12 +253,10 @@
 
 以下内容不属于已完成范围，不能作为当前能力对外宣称：
 
-- [ ] SystemC 对 Command schema v2 artifact 和 manifest 的加载。
-- [ ] SystemC byte-addressable device memory。
-- [ ] Descriptor Reader、Buffer Handle、DMA Engine。
-- [ ] 基于 token scoreboard 的 GCU 调度与运行时 Completion 写回。
-- [ ] SystemC Panel-LU（STATIC 固定主元 + 数值检查）、TRSM、GEMM、assemble、update 和 solve 执行 kernel。
-- [ ] DYNAMIC_PANEL 的设备执行（HPU/ATU 动态选择与映射），未实现前必须 `POLICY_NOT_SUPPORTED` 拒绝。
+- [ ] 基于 token scoreboard 的 GCU 调度与运行时 Completion 写回（T05）。
+- [ ] Command Fetch 固定宽度读取与 command ring 截断（T05）。
+- [ ] SystemC Panel-LU（STATIC 固定主元 + 数值检查）、TRSM、GEMM、assemble、update 和 solve 执行 kernel（后续任务）。
+- [ ] DYNAMIC_PANEL 的设备执行（HPU/ATU 动态选择与映射），未实现前必须 `POLICY_NOT_SUPPORTED` 拒绝（T05/后续）。
 - [ ] FP32 Command 全链路数值闭环。
 - [ ] 局部 INT32 / BFP GEMM（需重新评估对静态主元的影响）。
 - [ ] RTL Command Processor、GCU、DMA、HPU/PE 和完整 RTL 仿真闭环。
@@ -217,42 +264,57 @@
 
 ## 5. 下一阶段
 
-### T04：SystemC Command 数据面 [ ]
+### T05：SystemC Command 控制面（调度、依赖与派发）[ ]
 
-- [ ] 加载 manifest（schema v2）、Command、Descriptor、Completion 和 memory image。
-- [ ] 实现统一 byte-addressable memory 与严格 region/bounds 检查。
-- [ ] 实现 Descriptor Reader 和轻量 Buffer Handle。
-- [ ] 实现带请求/响应、延迟和背压语义的 DMA Engine。
-- [ ] 覆盖非法 descriptor、越界访问、错误 data format/layout 和背压场景。
+范围澄清：**T05 负责命令调度、依赖和派发**——固定宽度 Command Fetch、
+GCU token scoreboard、资源调度、按 descriptor 解释命令并派发到执行单元、
+Completion 成功/失败写回与错误传播。**正式数值 kernel 按后续任务实现**：
+T05 可以先使用行为占位/测试 kernel 打通控制流，但不得把占位结果宣称为
+PASS；`DYNAMIC_PANEL` 数值执行未实现前必须以 `POLICY_NOT_SUPPORTED`
+拒绝执行、不发布 READY token。
 
-### T05：SystemC Command 控制面与执行 kernel [ ]
-
-- [ ] 实现固定宽度 Command Fetch。
-- [ ] 实现 GCU token scoreboard 与 token 状态机（失败命令不发 READY token）。
-- [ ] 按 descriptor 解释命令并派发到执行 kernel；先实现 STATIC 固定主元
-      Panel-LU 及其零主元/阈值/非有限检查。
+- [ ] 固定宽度 Command Fetch（32B 记录、ID/flags/descriptor 引用校验）。
+- [ ] GCU token scoreboard 与 token 状态机（失败命令不发 READY token）。
+- [ ] 资源调度至少区分 DMA/DDR 端口与 buffer 资源；命令级 ready/valid、
+  下游 busy、buffer 满、command ring 截断。
+- [ ] 按 descriptor 派发命令到执行单元；Panel-LU 的 STATIC 固定顺序执行
+  语义与主元检查（零主元/阈值/非有限）作为控制流接口，数值核后续接入。
 - [ ] DYNAMIC_PANEL 经 HPU/ATU 作为可选能力；未实现时以 `POLICY_NOT_SUPPORTED`
-      拒绝执行，不得猜测策略。
+  拒绝执行，不得猜测策略。
 - [ ] Completion 成功/失败写回（`pivot_count` 失败时为首个失败列）、错误传播和完成顺序验证。
-- [ ] 建立 Command 级 golden interpreter/reference，对照 SystemC 执行结果。
+- [ ] 建立 Command 级 golden interpreter/reference，对照 SystemC 控制流结果。
 - [ ] 不重新引入 NodeTask 或 NodeTask ABI v2 adapter。
 
-后续 T06 及 RTL 阶段只有在 T04/T05 完成并形成可验证闭环后再展开。
+后续 T06 及 RTL 阶段只有在 T05（及所需数值 kernel）完成并形成可验证闭环后
+再展开。
 
-### T04 开始时使用的明确接口
+### T05 可直接使用的 T04 接口
 
-- 二进制契约：`docs/interface/Command_Schema_v2.md`（manifest `abi.version=2`；
-  记录 32/64/64B；`FRONT_DESC.body_words[8..9]` = 策略 + 阈值）。
-- Python codec：`graduation-code/software/src/command_codec.py`；C++ codec：
-  `graduation-code/systemc/include/command_codec.hpp`（`hw::command`）。
-- 共用 fixture：`graduation-code/fixtures/command_schema_v2/`。
-- 主元语义与失败口径：schema v2 文档 §4–§7；manifest 的 `pivot` 与
-  `required_device_capabilities` 块为执行语义来源。
+- 设备运行目录加载：`hw::dataplane::load_artifact(device_dir)` →
+  `LoadedArtifact { DeviceBootConfig config; image; }`（校验 schema v2、
+  region、descriptor、P-vector、completion 模板；不要求 reference 文件）。
+- 内存与事务：`DeviceMemory`（region/权限/对齐/零长度语义）、
+  `MemoryService`（`submit(request, issue_cycle)`、`tick(cycle)`、
+  `try_pop_response`、`reset`、epoch/统计）。
+- 运行时 descriptor：`DescriptorReader::request(ReadKind, descriptor_id, cycle)`
+  + `poll`，产出 `RegionView/FrontView/FactorView/ContributionView/
+  KernelView/SolveView/DependencyView`；无 cache，全部计入访存。
+- 片上 buffer：`BufferManager`（allocate/begin_load/finish_load/
+  begin_write/end_write/begin_read/release_lease/begin_writeback/
+  finish_writeback/transfer_owner/release/abort_lease/reset，
+  slot+generation、owner、容量、有效范围、端口冲突）。
+- 数据搬运：`DmaEngine`（单通道、一个活动传输、DMA request/response
+  valid/ready、1D/2D、背压、reset），通过 `DataPlane::run_dma_request`
+  或自行驱动握手。
+- 编排与 trace：`DataPlane`（固定 tick 顺序、内存响应路由）、
+  `TraceRecorder`（transactions.csv/buffers.csv）、`run_dataplane_selftest`。
+- 契约与 fixture：`docs/interface/Command_Schema_v2.md`；
+  `fixtures/command_schema_v2/`；`tools/t04_fixture_gen.py` 生成设备运行目录。
+- 设备数值数据类型：front/factor/update/RHS/solution FP32，P-vector INT32
+  （初值 -1，STATIC 写显式 identity）。
 - 数值对照：C++ `hw::reference_fp64::panel_lu_policy` / `factor_front_tree` /
   `solve_front_tree`；host 侧 `graduation-code/software/src/verify/front_reference.py`；
   同策略交叉验证 fixture：`graduation-code/fixtures/reference_tree/`。
-- 设备数值数据类型：front/factor/update/RHS/solution FP32，P-vector INT32
-  （初值 -1，STATIC 写显式 identity）。
 
 ## 6. 固定边界
 

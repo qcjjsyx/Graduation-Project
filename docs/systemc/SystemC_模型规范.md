@@ -12,8 +12,11 @@ SystemC 的目标是同时回答三类问题：
 2. GCU、buffer、HPU、ATU 和计算引擎之间的时序/依赖是否正确；
 3. 在不同精度、带宽、buffer 和资源配置下，周期和数值误差如何变化。
 
-当前状态：T04/T05 的 SystemC Command executor（数据面/控制面、DMA、descriptor reader、
-token scoreboard 运行时、FP32 数值闭环）尚未实现；本文描述目标模型规范。
+当前状态：**T04 SystemC Command 数据面已实现**（ArtifactLoader、byte-addressable
+DeviceMemory、MemoryService、DescriptorReader、BufferManager、DMA Engine、Trace；
+见 [T04_SystemC_数据面设计](T04_SystemC_数据面设计.md)）；T05 控制面（Command Fetch、
+GCU/token scoreboard、资源调度、completion 写回）与后续数值 kernel（Panel-LU/TRSM/
+GEMM/solve）尚未实现。本文其余部分描述目标模型规范。
 
 ## 2. 三种后端
 
@@ -36,15 +39,17 @@ pivot-block 置换范围。host 侧 Python front-tree 参考只用于显式开�
 
 主硬件架构路径。所有算子都通过 SystemC 模块、buffer 和状态机执行，数值计算使用 FP32 或 FP64 行为运算，具体精度由配置决定。
 
-必须具备：
+必须具备（T04 已实现数据面部分，命令执行部分属于 T05）：
 
 - command fetch（消费 Command/Descriptor schema v2，manifest `abi.version = 2`）；
-- descriptor 读取；
-- explicit front/scratchpad buffer；
-- 算子启动、运行、完成和异常状态；
-- load/compute/writeback 延迟；
-- ready/valid 和反压；
-- cycle、bytes、资源占用和状态 trace。
+- descriptor 读取（T04：运行时经设备事务，无 cache）；
+- explicit front/scratchpad buffer（T04：slot + generation、所有权、容量、
+  有效范围、端口/延迟）；
+- 算子启动、运行、完成和异常状态（T05 及后续 kernel）；
+- load/compute/writeback 延迟（T04 已含 DMA 装载/写回延迟与 DDR 服务延迟）；
+- ready/valid 和反压（T04：DMA 请求/响应、内存服务队列、buffer 端口）；
+- cycle、bytes、资源占用和状态 trace（T04：transactions.csv、buffers.csv、
+  summary.json、final_memory_image.bin）。
 
 ### 2.3 `FP32_SYSTEMC_INT32_GEMM`
 
@@ -184,7 +189,8 @@ C  = qC × 2^(eA+eB)
 - DYNAMIC_PANEL：主元搜索与行映射限于当前 pivot block 内 `k .. pivot_dim-1` 行（HPU
   搜索、ATU 行映射），tie-break 取最小逻辑行号；跨 pivot block 才能继续时显式失败
   （`PIVOT_NOT_FOUND`）。
-- 当前状态：DYNAMIC_PANEL 仅契约表达 + 参考行为，设备执行未实现；T04/T05 executor
+- 当前状态：DYNAMIC_PANEL 仅契约表达 + 参考行为，设备执行未实现；T04 数据面
+  对 STATIC/DYNAMIC_PANEL 均可加载、解析和搬运数据，T05 控制面与数值 kernel
   尚未实现。
 
 ## 8. 设备执行闭环
@@ -202,6 +208,9 @@ LOAD
 ```
 
 整树必须体现 child update 写回完成后父节点才能装配，不能只依赖初始化时预装的 C++ 数据。
+当前 T04 只交付“descriptor → DMA → scratchpad → 消费者拷贝 → DMA 写回”的
+数据面闭环（写回内容是测试数据，不是已求出的因子或解）；上面的节点闭环属于
+T05 控制面与后续数值 kernel。
 
 solve 阶段在 SystemC 中通过 `SOLVE_FORWARD` 和 `SOLVE_BACKWARD` 完成，并读取已经提交的因子和 RHS。
 
