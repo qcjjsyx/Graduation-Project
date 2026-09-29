@@ -1,8 +1,10 @@
 # 毕业设计当前任务状态
 
-状态：**T00–T04 已完成（含主元策略调整、Command/Descriptor schema v2 演进与 SystemC Command 数据面），下一阶段从 T05 开始。**
+状态：**T00–T06 已完成（含主元策略、schema v2、SystemC 数据面与控制面、Panel-LU 硬件架构与多模式 PE 接口/时序原型）；下一步为 T07 STATIC Panel-LU 数值引擎（协调 T08）；T14 后移至 STATIC 数值闭环之后。**
 
 > 本文档只记录当前主线已经完成的工作、验证证据和后续边界，不再按月份或周数安排进度。
+> T06 完成的是硬件设计、可编译内部契约与可执行时序/资源原型，**不是**正式数值
+> 后端，也不能据此宣称 FP32 数值闭环或加速比。
 
 ## 1. 当前主线
 
@@ -36,11 +38,23 @@
 - **T04 SystemC Command 数据面已实现**：schema v2 artifact/manifest 加载与交叉
   校验、byte-addressable device memory、运行时 descriptor reader、片上
   buffer（slot + generation、所有权与生命周期）、单通道 DMA（1D/2D、延迟、
-  背压、reset）、trace 与最终 snapshot；见
+  背压、reset）、trace 与最终 snapshot；设计权威见
+  `docs/systemc/DataPlane_设计.md`，任务记录见
   `docs/systemc/T04_SystemC_数据面设计.md`。
-- **SystemC Command 控制面（T05）与数值 kernel 尚未实现**：command fetch、
-  GCU/token scoreboard、资源调度、completion 写回属 T05；Panel-LU/TRSM/
-  GEMM/solve 数值 kernel 按后续任务实现。T04 不执行命令、不写 completion。
+- **T05 SystemC Command 控制面已实现**：固定宽度取指、token scoreboard、
+  双 front 驻留与共享单元池调度、执行派发、completion/token 写回、
+  abort/reset 与统计；设计权威见 `docs/systemc/ControlPlane_设计.md`，
+  任务记录见 `docs/systemc/T05_SystemC_控制面设计.md`。
+- **正式数值 kernel 尚未实现**：Panel-LU/TRSM/GEMM/solve 数值核按后续任务
+  实现；T05 以显式 test stub 验证控制流，结果标记
+  `execution_backend=test_stub`，不得宣称数值正确性或加速比。
+- **T06 共享多模式 PE 架构/原型已交付**：详细设计见
+  `docs/architecture/Panel-LU架构设计.md`；内部 task/config/response 契约
+  （`include/panel_lu/task_types.hpp`）与可执行时序/资源原型
+  （`src/panel_lu/`）覆盖 16×16 tile/尾块、PE 跨模式排他、有界队列与端口/
+  写回背压、同目标版本顺序、定向 abort 与 reset 失效、可复现 trace。
+  原型标记 `architecture_prototype=true`、`numerical_validation=not_performed`，
+  不是数值后端，未接入 T05 `CommandDevice`。
 
 ## 2. 已完成任务
 
@@ -156,7 +170,81 @@
 - graduation-code/systemc/tests/dataplane_systemc_tests.cpp
 - graduation-code/systemc/tests/dataplane_artifact_tests.cpp
 - graduation-code/systemc/tools/t04_fixture_gen.py
-- docs/systemc/T04_SystemC_数据面设计.md
+- docs/systemc/DataPlane_设计.md
+- docs/systemc/T04_SystemC_数据面设计.md（任务记录）
+
+### T05：SystemC Command 控制面（双 front 并行）[x]
+
+- [x] CommandFetch：32B 固定宽度取指、有界 FIFO/窗口、valid/ready、
+  运行时故障（截断/非法 opcode）与 loader 校验分离测试。
+- [x] TokenScoreboard：PENDING/READY/FAILED、唯一生产者、单次终态、
+  NONE 不入表、失败持续传播。
+- [x] 双 front：`max_resident_fronts=1/2`、共享单元池
+  （panel/trsm/gemm/solve/assemble 数量可配）、FrontContext 生命周期、
+  窗口准入门控（未准入节点不堵窗）、原子资源获取与回滚。
+- [x] 软件命令交错（交错宽度 2）+ NODE_BEGIN 准入依赖 + manifest/验证器
+  同步（producer<consumer、token 稠密、completion 槽=command_id 不变）。
+- [x] 执行接口 ExecRequest/ExecResponse 与可替换单元；TestStubUnit 显式
+  启用（确定性延迟、busy、响应背压、测试变换、错误注入、多实例、epoch）；
+  `RequireRealKernels` 启动即拒绝。
+- [x] 主元契约：策略只取 FRONT_DESC；DYNAMIC_PANEL → POLICY_NOT_SUPPORTED；
+  STATIC 成功写 identity P-vector 并等写完成；注入失败传播三类数值失败码。
+- [x] 全 opcode 控制路径（NODE_BEGIN/LOAD/ASSEMBLE/PANEL/TRSM/GEMM/
+  STORE_FACTOR(L/U 布局)/STORE_UPDATE/COMMIT/SOLVE/ABORT_NODE）。
+- [x] Completion/token 可见性、失败与独立清理、abort/reset、统计与
+  commands/units/fronts.csv + summary.json。
+- [x] 测试：core 203 checks、systemc 31 checks（sc_clock、重叠证据、周期
+  对比）、artifact 354 checks（真实 artifact + 独立解释器对照 + 注入 +
+  周期对比）；CTest 12/12（Release 与 sanitizer）。
+
+主要产物：
+
+- graduation-code/systemc/include/controlplane/
+- graduation-code/systemc/src/controlplane/
+- graduation-code/systemc/src/command_device_smoke.cpp
+- graduation-code/systemc/tests/controlplane_core_tests.cpp
+- graduation-code/systemc/tests/controlplane_systemc_tests.cpp
+- graduation-code/systemc/tests/controlplane_artifact_tests.cpp
+- graduation-code/systemc/tests/control_reference.hpp
+- graduation-code/systemc/tests/control_test_artifact.hpp
+- docs/systemc/ControlPlane_设计.md
+- docs/systemc/T05_SystemC_控制面设计.md（任务记录）
+
+### T06：Panel-LU 硬件架构与多模式 PE 接口/时序原型 [x]
+
+- [x] 详细设计 `docs/architecture/Panel-LU架构设计.md`：
+  controller→tile task generator/scoreboard→shared dispatcher→PE pool→
+  tile writeback→command completion；16×16 阵列、角除法/倒数通路、反馈
+  链路、输入 FIFO、目标累加缓冲、task slot/双缓冲；四种模式数据流；
+  端口/带宽/容量/latency/II；依赖与并行条件；有界推进与公平性；同目标
+  tile 顺序、输出版本与可见性；全 front 扫描依赖；packed LU/单位对角/
+  STORE_FACTOR 关系；FP32 舍入/FMA/subnormal/阈值乘积规则；
+  `descriptor.tile_size` 能力检查；参数依据与限制（不挪用论文综合结果）。
+- [x] 内部 task/config/response 契约（复用 `StatusCode`/`BufferHandle`，
+  不改外部 schema v2 二进制布局）：`include/panel_lu/task_types.hpp`、
+  `tile_kernels.hpp`、`tile_store.hpp`、`pe_model.hpp`、
+  `tile_dispatcher.hpp`、`panel_controller.hpp`、`panel_lu_prototype.hpp`。
+- [x] 可执行时序/资源原型（`src/panel_lu/`、
+  `src/panel_lu_prototype_smoke.cpp`）：有界 dispatcher 队列、`pe_count`
+  共享多模式 PE、一 PE 一任务、装载/执行/写回/完成事件、端口与写回背压、
+  同目标版本提交、定向 abort、reset/epoch 旧响应失效、CSV/JSON trace。
+- [x] 测试：`panel_lu_prototype_tests` 871 checks、`panel_lu_systemc_tests`
+  48 checks（sc_clock 逐周期与纯 C++ tick 模型对照）、p=23 尾块与双 front
+  混合 trace smoke；期望来自独立手算与资源不变量，不调用被测时延函数自证。
+- [x] T07 接入清单与未决项见设计文档 §9（TestStubUnit 类型绑定、独立 kind
+  池→共享 PE 池、任务汇聚、buffer ownership、定向取消、统计与最小真实
+  tile 原语复用；STORE_FACTOR 单位对角补 1、bank 细化、容量上限、失败结果
+  可见性列为未决项）。
+
+主要产物：
+
+- graduation-code/systemc/include/panel_lu/
+- graduation-code/systemc/src/panel_lu/
+- graduation-code/systemc/src/panel_lu_prototype_smoke.cpp
+- graduation-code/systemc/tests/panel_lu_prototype_tests.cpp
+- graduation-code/systemc/tests/panel_lu_systemc_tests.cpp
+- docs/architecture/Panel-LU架构设计.md
+- docs/systemc/T05_SystemC_控制面设计.md（任务记录）
 
 ### 本轮：主元策略调整与 schema v2 演进 [x]
 
@@ -242,6 +330,16 @@
 | T04 sanitizer CTest | 8/8 passed（ASan+UBSan） |
 | T04 数据面测试规模 | core 144 checks、systemc 187 checks、artifact 90 checks |
 | T04 真实 artifact 集成 | 单节点/22 节点/2 根森林/DYNAMIC_PANEL/256 阶；256 阶 image 1,472,984 B、最大搬运 tile 67×67 = 17,956 B、scratchpad 容量 65,536 B |
+| T05 主线 SystemC CTest | 12/12 passed（含 T04 回归），sanitizer 12/12 |
+| T05 控制面测试规模 | core 203 checks、systemc 31 checks、artifact 354 checks |
+| T05 双 front 重叠证据 | panel/gemm 单元区间交叠（units.csv）：node0 [457,757) ∩ node1 [537,837) 等 |
+| T05 周期对比（test_stub） | 两根 artifact：1front/1unit=7595 → 2front/2unit=6107；小例子 1048 → 1021 |
+| T05 真实 artifact 控制流 | 7/259/110/259(DYNAMIC 全拒绝)/818 commands 全部终态并与独立解释器一致 |
+| T06 主线 SystemC CTest | 16/16 passed（12 个既有 + panel_lu 4 项） |
+| T06 sanitizer CTest | 16/16 passed（ASan+UBSan） |
+| T06 原型测试规模 | prototype 871 checks、SystemC 48 checks |
+| T06 尾块/混合 trace | p=23 pe=1 尾块 5 任务；p=40 双 front 双 PE 混合模式全部提交 |
+| T06 手算周期证据 | p=16 LU_DIAG exec 136、wb_done 199；TRSM_RIGHT 57 拍（div 敏感）；p=32 GEMM 16³ exec 34、wb_done 496；失败列 1/1/0 分别 10/10/1 拍 |
 
 说明：
 
@@ -253,42 +351,41 @@
 
 以下内容不属于已完成范围，不能作为当前能力对外宣称：
 
-- [ ] 基于 token scoreboard 的 GCU 调度与运行时 Completion 写回（T05）。
-- [ ] Command Fetch 固定宽度读取与 command ring 截断（T05）。
-- [ ] SystemC Panel-LU（STATIC 固定主元 + 数值检查）、TRSM、GEMM、assemble、update 和 solve 执行 kernel（后续任务）。
-- [ ] DYNAMIC_PANEL 的设备执行（HPU/ATU 动态选择与映射），未实现前必须 `POLICY_NOT_SUPPORTED` 拒绝（T05/后续）。
-- [ ] FP32 Command 全链路数值闭环。
+- [ ] SystemC Panel-LU（STATIC 固定主元 + 数值检查）、TRSM、GEMM、assemble、update 和 solve 正式执行 kernel（后续任务）。
+- [ ] DYNAMIC_PANEL 的设备执行（HPU/ATU 动态选择与映射），未实现前必须 `POLICY_NOT_SUPPORTED` 拒绝（后续）。
+- [ ] FP32 Command 全链路数值闭环（当前控制流正确性已闭环，数值由 test stub 透传/测试变换）。
 - [ ] 局部 INT32 / BFP GEMM（需重新评估对静态主元的影响）。
 - [ ] RTL Command Processor、GCU、DMA、HPU/PE 和完整 RTL 仿真闭环。
 - [ ] 性能、带宽和面积证据。
 
 ## 5. 下一阶段
 
-### T05：SystemC Command 控制面（调度、依赖与派发）[ ]
+### T06/T08：硬件设计与共享 PE 接口/时序原型 [x/T06 完成]
 
-范围澄清：**T05 负责命令调度、依赖和派发**——固定宽度 Command Fetch、
-GCU token scoreboard、资源调度、按 descriptor 解释命令并派发到执行单元、
-Completion 成功/失败写回与错误传播。**正式数值 kernel 按后续任务实现**：
-T05 可以先使用行为占位/测试 kernel 打通控制流，但不得把占位结果宣称为
-PASS；`DYNAMIC_PANEL` 数值执行未实现前必须以 `POLICY_NOT_SUPPORTED`
-拒绝执行、不发布 READY token。
+已确认目标：[共享多模式 PE、16×16 tile 与任务粒度模拟](docs/architecture/多模式PE与16x16分块计算基线.md)；保留全 front 扫描和主元冻结语义。
 
-- [ ] 固定宽度 Command Fetch（32B 记录、ID/flags/descriptor 引用校验）。
-- [ ] GCU token scoreboard 与 token 状态机（失败命令不发 READY token）。
-- [ ] 资源调度至少区分 DMA/DDR 端口与 buffer 资源；命令级 ready/valid、
-  下游 busy、buffer 满、command ring 截断。
-- [ ] 按 descriptor 派发命令到执行单元；Panel-LU 的 STATIC 固定顺序执行
-  语义与主元检查（零主元/阈值/非有限）作为控制流接口，数值核后续接入。
-- [ ] DYNAMIC_PANEL 经 HPU/ATU 作为可选能力；未实现时以 `POLICY_NOT_SUPPORTED`
-  拒绝执行，不得猜测策略。
-- [ ] Completion 成功/失败写回（`pivot_count` 失败时为首个失败列）、错误传播和完成顺序验证。
-- [ ] 建立 Command 级 golden interpreter/reference，对照 SystemC 控制流结果。
-- [ ] 不重新引入 NodeTask 或 NodeTask ABI v2 adapter。
+- [x] T06 完成 Panel-LU 硬件架构、共享 PE/task 契约、可编译接口及可执行时序/资源原型，验证多模式争用、tail、背压与定向 abort；不宣称正式数值完成。设计见 `docs/architecture/Panel-LU架构设计.md`，原型与测试见 `include/panel_lu/`、`src/panel_lu/`、`tests/panel_lu_*`。
+- [x] 不替换 T05 生产 backend；T07 接入清单（类型绑定、共享 PE 池、任务汇聚、buffer ownership、定向取消、统计）写入设计文档 §9。
+- [ ] 协调 T08 的 Panel/TRSM/GEMM/solve 职责边界；设计评审后再进入数值核编码。
+- [ ] STATIC 设计和实现不等待 T14；DYNAMIC_PANEL 保留为后续显式扩展，未实现时继续返回 `POLICY_NOT_SUPPORTED`。
 
-后续 T06 及 RTL 阶段只有在 T05（及所需数值 kernel）完成并形成可验证闭环后
-再展开。
+### 正式数值 kernel（T07/T09/T10 → T11/T12）[ ]
 
-### T05 可直接使用的 T04 接口
+- [ ] 实现 STATIC 固定顺序 Panel-LU 数值核（含消元后实际主元检查）并接入
+      `IExecutionUnit`（替换 test stub 的对应槽位）。
+- [ ] T07 提供 Panel 所需的最小 tile LU/TRSM/GEMM 原语；T09/T10 复用并接入顶层 TRSM/GEMM controller，共享同一批物理 PE；assemble/solve 后续接入。
+- [ ] 每接入一个 kernel 重新评估其对控制流统计、错误语义与（INT32 路径）
+      `STATIC` 主元触发率的影响。
+- [ ] FP32 全链路数值闭环与 FP64 residual/backward 对照（沿用验证口径）。
+
+### 后移的 T14、DYNAMIC_PANEL 扩展及 RTL 阶段 [ ]
+
+- [ ] T11/T12 先形成 STATIC FP32 分解—求解闭环，再展开 T14 HPU/ATU SystemC 行为与 RTL 契约统一。
+- [ ] T14 完成后接入动态数值路径，补充 T07/T09/T11/T12 的 DYNAMIC_PANEL 验收；独立 HPU/ATU 测试不代表设备动态路径已完成。
+- [ ] T13/T15 仍依赖 T14；任务编号已重排，原有交付要求不变，T14 保持未完成状态。
+- [ ] T10 可先接入 FP32，再完成局部 INT32；各任务的阶段验收与完整完成状态分开记录。完整依赖以 `docs/项目实现任务说明书.md` 为准。
+
+### 后续 kernel/RTL 可直接使用的 T04/T05 接口
 
 - 设备运行目录加载：`hw::dataplane::load_artifact(device_dir)` →
   `LoadedArtifact { DeviceBootConfig config; image; }`（校验 schema v2、
@@ -315,6 +412,10 @@ PASS；`DYNAMIC_PANEL` 数值执行未实现前必须以 `POLICY_NOT_SUPPORTED`
 - 数值对照：C++ `hw::reference_fp64::panel_lu_policy` / `factor_front_tree` /
   `solve_front_tree`；host 侧 `graduation-code/software/src/verify/front_reference.py`；
   同策略交叉验证 fixture：`graduation-code/fixtures/reference_tree/`。
+- 控制面（T05）：`CommandDevice`（`start/tick/run/abort_node/reset/
+  inject_failure/write_reports`）、`IExecutionUnit`/`ExecRequest`/`ExecResponse`
+  （kernel 接入点，替换 `TestStubUnit`）、`TokenScoreboard`、`DmaArbiter`、
+  `CompletionWriter`；控制流期望可由 `tests/control_reference.hpp` 复算。
 
 ## 6. 固定边界
 

@@ -21,5 +21,6 @@ Reference conventions:
 - relative residual is `||Ax-b||₂ / (||A||F ||x||₂ + ||b||₂)`.
 
 `solve_front_tree` supports the static child-to-parent fixtures used by T02. It
-rejects delayed/cross-front pivots; those policies belong to T07 and later
-device work.
+rejects delayed/cross-front pivots; they remain outside the supported scope.
+T06 defines the Panel-LU architecture, and T14 covers the optional HPU/ATU
+contract for pivot-block-local DYNAMIC_PANEL execution.

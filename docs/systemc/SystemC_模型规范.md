@@ -14,9 +14,19 @@ SystemC 的目标是同时回答三类问题：
 
 当前状态：**T04 SystemC Command 数据面已实现**（ArtifactLoader、byte-addressable
 DeviceMemory、MemoryService、DescriptorReader、BufferManager、DMA Engine、Trace；
-见 [T04_SystemC_数据面设计](T04_SystemC_数据面设计.md)）；T05 控制面（Command Fetch、
-GCU/token scoreboard、资源调度、completion 写回）与后续数值 kernel（Panel-LU/TRSM/
-GEMM/solve）尚未实现。本文其余部分描述目标模型规范。
+设计权威见 [DataPlane_设计](DataPlane_设计.md)，任务记录见
+[T04_SystemC_数据面设计](T04_SystemC_数据面设计.md)）；T05 双 front 控制面已实现
+（设计权威见 [ControlPlane_设计](ControlPlane_设计.md)，任务记录见
+[T05_SystemC_控制面设计](T05_SystemC_控制面设计.md)），当前仅显式 test stub
+验证控制流。T06 已交付共享多模式 PE 的硬件设计、内部 task 契约与可执行
+时序/资源原型（设计权威见
+[Panel-LU架构设计](../architecture/Panel-LU架构设计.md)，模块在
+`include/panel_lu/`、`src/panel_lu/`），原型使用显式合成负载、标记
+`architecture_prototype=true`、`numerical_validation=not_performed`，**未接入**
+本规范第 8 节的设备执行闭环。正式 Panel-LU/TRSM/GEMM/assemble/solve 数值
+kernel 尚未实现。下一步为 T07 Panel-LU 数值引擎并协调 T08；T14 HPU/ATU
+契约统一后移至 STATIC 数值闭环之后，不阻塞 STATIC 设计、实现与阶段验收。
+本文其余部分描述目标模型规范。
 
 ## 2. 三种后端
 
@@ -74,9 +84,11 @@ SystemC top
  ├─ AssemblyEngine
  ├─ HPU（DYNAMIC_PANEL 单元）
  ├─ ATU（DYNAMIC_PANEL 单元）
- ├─ PanelLuEngine
- ├─ TrsmEngine
- ├─ GemmFpEngine / Int32GemmBehavioral
+ ├─ 全 front 扫描/尺度归约
+ ├─ Panel / TRSM / GEMM Controllers
+ ├─ Tile Task Queue / Scoreboard / Dispatcher
+ ├─ 多模式 PE 池（16×16 tile，LU/TRSM/GEMM 模式）
+ ├─ Int32GemmBehavioral（后续）
  ├─ PrecisionAdapter
  ├─ ResultWriter
  ├─ SolveController
@@ -106,6 +118,8 @@ Panel-LU、TRSM、GEMM 和 solve engine 只能消费 descriptor、scratchpad、s
 
 ### 4.3 必须显式建模算子状态
 
+目标资源架构以 [多模式 PE 计算基线](../architecture/多模式PE与16x16分块计算基线.md) 为准。Panel 先完成全 front 扫描，再生成 A11 内部 tile 任务。以下为逻辑阶段，不要求逐拍模拟每个 ALU；tile 粒度的执行必须保持这些阶段的数值依赖和外部可观察事件。
+
 Panel-LU 至少拆分为：
 
 ```text
@@ -128,6 +142,10 @@ ERROR
 ### 4.4 必须显式建模延迟和反压
 
 乘法、累加、比较归约、除法/倒数、行映射、DMA 和写回都应有可配置延迟。资源不足、buffer 满或下游未 ready 时，模块必须停顿而不是瞬间完成。
+
+### 4.5 任务粒度 PE 模拟
+
+允许数值功能计算与时序推进分离，但任务时延须由阵列数据流、流水 latency/II、有效维度与装载/排空推导。真实建模输入到齐、共享 PE 排他、有限队列、bank/端口、写回与背压；结果在写回完成前不可见。数据相关失败按实际失败进度返回。不得使用任意固定延迟或提前发布结果，也不得把未综合校准的参数宣称为实测硬件性能。
 
 ## 5. INT32 GEMM 行为模型
 
@@ -190,8 +208,9 @@ C  = qC × 2^(eA+eB)
   搜索、ATU 行映射），tie-break 取最小逻辑行号；跨 pivot block 才能继续时显式失败
   （`PIVOT_NOT_FOUND`）。
 - 当前状态：DYNAMIC_PANEL 仅契约表达 + 参考行为，设备执行未实现；T04 数据面
-  对 STATIC/DYNAMIC_PANEL 均可加载、解析和搬运数据，T05 控制面与数值 kernel
-  尚未实现。
+  对 STATIC/DYNAMIC_PANEL 均可加载、解析和搬运数据；T05 控制面已实现并对
+  DYNAMIC_PANEL 返回 `POLICY_NOT_SUPPORTED`，正式数值 kernel 尚未实现。
+  后移的 T14 及动态数值路径完成前，STATIC 阶段验收不包含动态数值能力。
 
 ## 8. 设备执行闭环
 

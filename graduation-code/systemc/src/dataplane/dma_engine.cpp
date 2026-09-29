@@ -299,13 +299,15 @@ void DmaEngine::accept_request(std::uint64_t cycle) {
     BufferResult buffer_result;
     if (active_.direction == DmaDirection::MemoryToBuffer) {
         buffer_result = buffers_.begin_load(
-            active_.buffer, "dma", active_.buffer_offset, span, cycle);
+            active_.buffer, active_.owner, active_.buffer_offset, span, cycle);
     } else {
         buffer_result = buffers_.begin_writeback(
-            active_.buffer, "dma", active_.buffer_offset, span, cycle);
+            active_.buffer, active_.owner, active_.buffer_offset, span, cycle);
     }
     if (!buffer_result.ok) {
-        fail_transfer(buffer_result.status, buffer_result.reason, cycle);
+        fail_transfer(
+            buffer_result.status, buffer_result.reason, cycle,
+            buffer_result.transient);
         return;
     }
     lease_ = buffer_result.lease;
@@ -452,7 +454,8 @@ void DmaEngine::finish_transfer(std::uint64_t cycle) {
 void DmaEngine::fail_transfer(
     hw::command::StatusCode status,
     const std::string& reason,
-    std::uint64_t cycle) {
+    std::uint64_t cycle,
+    bool retryable) {
     if (have_lease_) {
         buffers_.abort_lease(lease_.lease_id, cycle);
         have_lease_ = false;
@@ -461,6 +464,7 @@ void DmaEngine::fail_transfer(
     memory_response_ready_ = false;
     response_.status = status;
     response_.reason = reason;
+    response_.retryable = retryable && bytes_done_ == 0;
     response_.bytes = bytes_done_;
     response_.read_bytes = 0;
     response_.write_bytes = 0;

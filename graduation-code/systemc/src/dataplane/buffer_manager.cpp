@@ -45,6 +45,9 @@ BufferResult BufferManager::failure(
     result.ok = false;
     result.status = status;
     result.reason = std::move(reason);
+    result.transient =
+        result.reason.find("conflicting active access") != std::string::npos ||
+        result.reason.find("ports are busy") != std::string::npos;
     if (trace_ != nullptr && slot != hw::command::NONE && slot < slots_.size()) {
         const Slot& entry = slots_[slot];
         trace_->add_buffer(BufferRow{
@@ -208,10 +211,11 @@ BufferResult BufferManager::release(
             cycle,
             handle.slot);
     }
-    if (slot->state != BufferState::Ready && slot->state != BufferState::Dirty) {
+    if (slot->state != BufferState::Ready && slot->state != BufferState::Dirty &&
+        slot->state != BufferState::Reserved) {
         return failure(
             hw::command::StatusCode::BufferFull,
-            "only READY or DIRTY buffers may be released",
+            "only RESERVED, READY or DIRTY buffers may be released",
             cycle,
             handle.slot);
     }
@@ -261,6 +265,44 @@ BufferResult BufferManager::transfer_owner(
     log_transition(
         mutable_slot, handle.slot, new_owner, mutable_slot.state,
         mutable_slot.state, "transfer_owner", cycle);
+    BufferResult result;
+    result.ok = true;
+    result.handle = handle;
+    return result;
+}
+
+BufferResult BufferManager::rearm(
+    const BufferHandle& handle,
+    const std::string& owner,
+    std::uint64_t cycle) {
+    hw::command::StatusCode status = hw::command::StatusCode::Ok;
+    std::string reason;
+    const Slot* slot = checked_slot(handle, owner, &status, &reason);
+    if (slot == nullptr) {
+        return failure(status, std::move(reason), cycle, handle.slot);
+    }
+    if (slot->state != BufferState::Ready && slot->state != BufferState::Dirty) {
+        return failure(
+            hw::command::StatusCode::BufferFull,
+            "rearm requires a READY or DIRTY buffer",
+            cycle,
+            handle.slot);
+    }
+    if (slot->active_lease != 0 || range_conflicts(*slot, true)) {
+        return failure(
+            hw::command::StatusCode::BufferFull,
+            "cannot rearm a buffer with an active transaction or access",
+            cycle,
+            handle.slot);
+    }
+    Slot& mutable_slot = slots_[handle.slot];
+    const BufferState previous = mutable_slot.state;
+    mutable_slot.state = BufferState::Reserved;
+    mutable_slot.valid_offset = 0;
+    mutable_slot.valid_bytes = 0;
+    mutable_slot.reserved_bytes = config_.capacity_bytes;
+    log_transition(
+        mutable_slot, handle.slot, owner, previous, BufferState::Reserved, "rearm", cycle);
     BufferResult result;
     result.ok = true;
     result.handle = handle;

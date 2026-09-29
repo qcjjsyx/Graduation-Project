@@ -41,6 +41,12 @@ class CommandCompileError(ValueError):
     pass
 
 
+# How many nodes may interleave in the command stream at once. Two matches the
+# dual-front device: two independent fronts alternate command-by-command, and
+# wider forests are emitted pair by pair (documented command-order constraint).
+INTERLEAVE_WIDTH = 2
+
+
 @dataclass(frozen=True)
 class CompiledCommandArtifact:
     image: bytes
@@ -575,14 +581,160 @@ def _build_static_descriptors(
     return descriptors
 
 
+@dataclass(frozen=True)
+class _CommandTemplate:
+    """Command template with symbolic dependency references (node_id, token_name)."""
+
+    opcode: Opcode
+    node_id: int
+    descriptor_name: str | None
+    wait_refs: tuple[tuple[int, str], ...]
+    token_name: str | None
+
+
+def _node_command_plan(
+    nodes: Sequence[NodeCompileRecord],
+    map_tables: Sequence[Sequence[MapTableEntry]],
+    node: NodeCompileRecord,
+) -> list[_CommandTemplate]:
+    node_id = node.node_id
+    prefix = f"node.{node_id}"
+
+    def child_token(child_id: int) -> str:
+        return "update_stored" if nodes[child_id].update_dim else "commit"
+
+    children = sorted(map_tables[node_id], key=lambda item: item.child_id)
+    # Admission: a parent front waits for every child to complete (its
+    # NODE_COMMIT token) before it may request residency.
+    admission_refs = tuple((entry.child_id, "commit") for entry in children)
+    plan: list[_CommandTemplate] = [
+        # Admission dependency: a parent front may only start once its
+        # required children completed. The device must never infer the tree
+        # from host side state; it only sees these dependency tokens.
+        _CommandTemplate(
+            Opcode.NODE_BEGIN, node_id, f"{prefix}.front", admission_refs, "begin"
+        ),
+        _CommandTemplate(
+            Opcode.LOAD_FRONT,
+            node_id,
+            f"{prefix}.front",
+            ((node_id, "begin"),),
+            "loaded",
+        ),
+    ]
+    current = "loaded"
+    for entry in children:
+        assembled = f"assembled_child_{entry.child_id}"
+        plan.append(
+            _CommandTemplate(
+                Opcode.ASSEMBLE_EXTEND_ADD,
+                node_id,
+                f"{prefix}.contribution.{entry.child_id}",
+                ((node_id, current), (entry.child_id, child_token(entry.child_id))),
+                assembled,
+            )
+        )
+        current = assembled
+    plan.append(
+        _CommandTemplate(
+            Opcode.PANEL_LU, node_id, f"{prefix}.front", ((node_id, current),), "panel"
+        )
+    )
+    if node.update_dim:
+        plan.extend(
+            [
+                _CommandTemplate(
+                    Opcode.TRSM_LEFT,
+                    node_id,
+                    f"{prefix}.kernel.trsm_left",
+                    ((node_id, "panel"),),
+                    "trsm_left",
+                ),
+                _CommandTemplate(
+                    Opcode.TRSM_RIGHT,
+                    node_id,
+                    f"{prefix}.kernel.trsm_right",
+                    ((node_id, "panel"),),
+                    "trsm_right",
+                ),
+                _CommandTemplate(
+                    Opcode.GEMM_SCHUR,
+                    node_id,
+                    f"{prefix}.kernel.gemm",
+                    ((node_id, "trsm_left"), (node_id, "trsm_right")),
+                    "schur",
+                ),
+                _CommandTemplate(
+                    Opcode.STORE_FACTOR,
+                    node_id,
+                    f"{prefix}.factor",
+                    ((node_id, "trsm_left"), (node_id, "trsm_right")),
+                    "factor_stored",
+                ),
+                _CommandTemplate(
+                    Opcode.STORE_UPDATE,
+                    node_id,
+                    f"region:{prefix}.update",
+                    ((node_id, "schur"),),
+                    "update_stored",
+                ),
+                _CommandTemplate(
+                    Opcode.NODE_COMMIT,
+                    node_id,
+                    f"{prefix}.front",
+                    ((node_id, "factor_stored"), (node_id, "update_stored")),
+                    "commit",
+                ),
+            ]
+        )
+    else:
+        plan.extend(
+            [
+                _CommandTemplate(
+                    Opcode.STORE_FACTOR,
+                    node_id,
+                    f"{prefix}.factor",
+                    ((node_id, "panel"),),
+                    "factor_stored",
+                ),
+                _CommandTemplate(
+                    Opcode.NODE_COMMIT,
+                    node_id,
+                    f"{prefix}.front",
+                    ((node_id, "factor_stored"),),
+                    "commit",
+                ),
+            ]
+        )
+    return plan
+
+
 def _build_commands(
     nodes: Sequence[NodeCompileRecord],
     map_tables: Sequence[Sequence[MapTableEntry]],
     parent: Sequence[int],
 ) -> tuple[list[_CommandSpec], dict[int, list[int]], dict[int, dict[str, int]]]:
+    """Emit the command stream.
+
+    Node blocks are emitted in an interleaved topological order: a node becomes
+    ready once every dependency reference of its next command is already
+    emitted (cross-node references are the child completion tokens of
+    NODE_BEGIN/ASSEMBLE).  At most INTERLEAVE_WIDTH nodes are open at once and
+    take turns command-by-command, so two independent fronts alternate in the
+    stream with O(1) command spacing while a wider forest is emitted pair by
+    pair.  command_id, signal_token and completion slots are (re)assigned
+    densely in emission order; every wait token therefore references a strictly
+    earlier command, which the manifest and C++ validators require.  Solve
+    commands stay in a trailing chain.
+    """
+
+    plans: dict[int, list[_CommandTemplate]] = {
+        node.node_id: _node_command_plan(nodes, map_tables, node) for node in nodes
+    }
     commands: list[_CommandSpec] = []
     node_command_ids: dict[int, list[int]] = {node.node_id: [] for node in nodes}
     node_tokens: dict[int, dict[str, int]] = {node.node_id: {} for node in nodes}
+    emitted_refs: set[tuple[int, str]] = set()
 
     def emit(
         opcode: Opcode,
@@ -602,100 +754,57 @@ def _build_commands(
             node_tokens[node_id][token_name] = token
         return token
 
-    for node_id in sibling_friendly_order(list(parent)):
-        node = nodes[node_id]
-        prefix = f"node.{node_id}"
-        begin = emit(Opcode.NODE_BEGIN, node_id, f"{prefix}.front", token_name="begin")
-        current = emit(
-            Opcode.LOAD_FRONT,
-            node_id,
-            f"{prefix}.front",
-            (begin,),
-            "loaded",
-        )
-        for entry in sorted(map_tables[node_id], key=lambda item: item.child_id):
-            child_token = node_tokens[entry.child_id].get("update_stored")
-            if child_token is None:
-                child_token = node_tokens[entry.child_id]["commit"]
-            current = emit(
-                Opcode.ASSEMBLE_EXTEND_ADD,
-                node_id,
-                f"{prefix}.contribution.{entry.child_id}",
-                (current, child_token),
-                f"assembled_child_{entry.child_id}",
-            )
-        panel = emit(
-            Opcode.PANEL_LU,
-            node_id,
-            f"{prefix}.front",
-            (current,),
-            "panel",
-        )
-        commit_waits: tuple[int, ...]
-        if node.update_dim:
-            trsm_left = emit(
-                Opcode.TRSM_LEFT,
-                node_id,
-                f"{prefix}.kernel.trsm_left",
-                (panel,),
-                "trsm_left",
-            )
-            trsm_right = emit(
-                Opcode.TRSM_RIGHT,
-                node_id,
-                f"{prefix}.kernel.trsm_right",
-                (panel,),
-                "trsm_right",
-            )
-            gemm = emit(
-                Opcode.GEMM_SCHUR,
-                node_id,
-                f"{prefix}.kernel.gemm",
-                (trsm_left, trsm_right),
-                "schur",
-            )
-            factor = emit(
-                Opcode.STORE_FACTOR,
-                node_id,
-                f"{prefix}.factor",
-                (trsm_left, trsm_right),
-                "factor_stored",
-            )
-            update = emit(
-                Opcode.STORE_UPDATE,
-                node_id,
-                f"region:{prefix}.update",
-                (gemm,),
-                "update_stored",
-            )
-            commit_waits = (factor, update)
-        else:
-            factor = emit(
-                Opcode.STORE_FACTOR,
-                node_id,
-                f"{prefix}.factor",
-                (panel,),
-                "factor_stored",
-            )
-            commit_waits = (factor,)
-        emit(
-            Opcode.NODE_COMMIT,
-            node_id,
-            f"{prefix}.front",
-            commit_waits,
-            "commit",
-        )
+    preference = sibling_friendly_order(list(parent))
+    cursors = {node_id: 0 for node_id in plans}
+    open_nodes: list[int] = []
+    rotation = 0
+    total_commands = sum(len(plan) for plan in plans.values())
+
+    def next_ready(node_id: int) -> bool:
+        cursor = cursors[node_id]
+        if cursor >= len(plans[node_id]):
+            return False
+        return all(ref in emitted_refs for ref in plans[node_id][cursor].wait_refs)
+
+    while len(commands) < total_commands:
+        open_nodes = [
+            node_id for node_id in open_nodes if cursors[node_id] < len(plans[node_id])
+        ]
+        for node_id in preference:
+            if len(open_nodes) >= INTERLEAVE_WIDTH:
+                break
+            if node_id in open_nodes or cursors[node_id] >= len(plans[node_id]):
+                continue
+            if next_ready(node_id):
+                open_nodes.append(node_id)
+        ready = [node_id for node_id in open_nodes if next_ready(node_id)]
+        if not ready:
+            raise CommandCompileError("command templates contain a dependency cycle")
+        chosen: int | None = None
+        for step in range(len(open_nodes)):
+            index = (rotation + step) % len(open_nodes)
+            if open_nodes[index] in ready:
+                chosen = open_nodes[index]
+                rotation = (index + 1) % max(1, len(open_nodes))
+                break
+        assert chosen is not None
+        template = plans[chosen][cursors[chosen]]
+        waits = tuple(node_tokens[ref_node][ref_name] for ref_node, ref_name in template.wait_refs)
+        emit(template.opcode, chosen, template.descriptor_name, waits, template.token_name)
+        if template.token_name is not None:
+            emitted_refs.add((chosen, template.token_name))
+        cursors[chosen] += 1
 
     previous: int | None = None
     for node in nodes:
-        waits = [node_tokens[node.node_id]["commit"]]
+        solve_waits = [node_tokens[node.node_id]["commit"]]
         if previous is not None:
-            waits.append(previous)
+            solve_waits.append(previous)
         previous = emit(
             Opcode.SOLVE_FORWARD,
             node.node_id,
             f"node.{node.node_id}.solve_forward",
-            waits,
+            solve_waits,
             "solve_forward",
         )
     for node in reversed(nodes):
@@ -931,6 +1040,11 @@ def _build_manifest(
             "token_count": len(command_specs),
             "max_wait_tokens": config.max_wait_tokens,
             "static_batch": True,
+            "ordering": "interleaved_topological",
+            "admission_dependencies": (
+                "NODE_BEGIN waits on the completion tokens of its children; "
+                "the device must not infer the elimination forest itself"
+            ),
         },
         "descriptor_table": {
             "region": "descriptor_table",

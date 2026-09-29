@@ -112,6 +112,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
             max_wait_tokens=_as_int(batch["max_wait_tokens"], "max_wait_tokens"),
         )
         _validate_command_semantics(commands, descriptors, image, token_count)
+        _validate_admission_dependencies(manifest, commands, descriptors, image)
         _validate_completion_templates(commands, completions)
         node_count = _validate_symbolic_and_nodes(manifest, commands, regions)
         _validate_descriptor_references(descriptors)
@@ -214,6 +215,48 @@ def _validate_command_semantics(commands, descriptors, image: bytes, token_count
             if any(token >= command.command_id for token in waits):
                 raise ManifestValidationError(
                     f"command {command.command_id} waits on a non-preceding token"
+                )
+
+
+def _validate_admission_dependencies(manifest, commands, descriptors, image: bytes) -> None:
+    """NODE_BEGIN must wait on the completion token of every child.
+
+    The device only sees dependency tokens and must never infer the
+    elimination forest itself; this check keeps the admission contract
+    compiler-visible instead of implicit.
+    """
+    parent = [_as_int(value, "parent") for value in manifest["symbolic"]["parent"]]
+    node_count = len(parent)
+    begin_command: dict[int, int] = {}
+    commit_token: dict[int, int] = {}
+    for command in commands:
+        if command.opcode == Opcode.NODE_BEGIN:
+            begin_command[command.node_id] = command.command_id
+        elif command.opcode == Opcode.NODE_COMMIT:
+            commit_token[command.node_id] = command.signal_token
+    for node_id in range(node_count):
+        if node_id not in begin_command or node_id not in commit_token:
+            raise ManifestValidationError(
+                f"node {node_id} is missing NODE_BEGIN or NODE_COMMIT"
+            )
+    for node_id in range(node_count):
+        children = [child for child, p in enumerate(parent) if p == node_id]
+        if not children:
+            continue
+        begin = commands[begin_command[node_id]]
+        if begin.wait_list_id == 0xFFFFFFFF:
+            raise ManifestValidationError(
+                f"node {node_id} NODE_BEGIN is missing its admission dependency"
+            )
+        waits = set(
+            descriptors[begin.wait_list_id].dependency_tokens(
+                image, token_count=len(commands)
+            )
+        )
+        for child in children:
+            if commit_token[child] not in waits:
+                raise ManifestValidationError(
+                    f"node {node_id} NODE_BEGIN must wait for child {child} to complete"
                 )
 
 

@@ -112,6 +112,93 @@ target_link_libraries(dataplane_smoke PRIVATE dataplane)
 enable_project_warnings(dataplane_smoke)
 enable_project_sanitizers(dataplane_smoke)
 
+# ---------------------------------------------------------------------------
+# T05 control plane (command fetch / scoreboard / scheduling / completion)
+# ---------------------------------------------------------------------------
+
+add_library(controlplane STATIC
+    src/controlplane/command_fetch.cpp
+    src/controlplane/token_scoreboard.cpp
+    src/controlplane/completion_writer.cpp
+    src/controlplane/dma_arbiter.cpp
+    src/controlplane/test_stub_unit.cpp
+    src/controlplane/control_plane.cpp
+)
+target_include_directories(controlplane
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_link_libraries(controlplane PUBLIC dataplane)
+enable_project_warnings(controlplane)
+enable_project_sanitizers(controlplane)
+
+add_executable(controlplane_core_tests tests/controlplane_core_tests.cpp)
+target_include_directories(controlplane_core_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_link_libraries(controlplane_core_tests PRIVATE controlplane)
+enable_project_warnings(controlplane_core_tests)
+enable_project_sanitizers(controlplane_core_tests)
+
+add_executable(controlplane_systemc_tests tests/controlplane_systemc_tests.cpp)
+target_include_directories(controlplane_systemc_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_link_libraries(controlplane_systemc_tests PRIVATE controlplane SystemC::systemc)
+enable_project_warnings(controlplane_systemc_tests)
+enable_project_sanitizers(controlplane_systemc_tests)
+if(SYSTEMC_HOME AND APPLE)
+    set_target_properties(
+        controlplane_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
+endif()
+
+add_executable(controlplane_artifact_tests tests/controlplane_artifact_tests.cpp)
+target_include_directories(controlplane_artifact_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+target_link_libraries(controlplane_artifact_tests PRIVATE controlplane)
+enable_project_warnings(controlplane_artifact_tests)
+enable_project_sanitizers(controlplane_artifact_tests)
+
+add_executable(command_device_smoke src/command_device_smoke.cpp)
+target_link_libraries(command_device_smoke PRIVATE controlplane)
+enable_project_warnings(command_device_smoke)
+enable_project_sanitizers(command_device_smoke)
+
+# ---------------------------------------------------------------------------
+# T06 Panel-LU architecture + multi-mode PE timing/resource prototype
+# ---------------------------------------------------------------------------
+
+add_library(panel_lu STATIC
+    src/panel_lu/task_types.cpp
+    src/panel_lu/tile_kernels.cpp
+    src/panel_lu/tile_store.cpp
+    src/panel_lu/pe_model.cpp
+    src/panel_lu/tile_dispatcher.cpp
+    src/panel_lu/panel_controller.cpp
+    src/panel_lu/panel_lu_prototype.cpp
+)
+target_include_directories(panel_lu
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(panel_lu PUBLIC dataplane)
+enable_project_warnings(panel_lu)
+enable_project_sanitizers(panel_lu)
+
+add_executable(panel_lu_prototype_tests tests/panel_lu_prototype_tests.cpp)
+target_link_libraries(panel_lu_prototype_tests PRIVATE panel_lu)
+enable_project_warnings(panel_lu_prototype_tests)
+enable_project_sanitizers(panel_lu_prototype_tests)
+
+add_executable(panel_lu_systemc_tests tests/panel_lu_systemc_tests.cpp)
+target_link_libraries(panel_lu_systemc_tests PRIVATE panel_lu SystemC::systemc)
+enable_project_warnings(panel_lu_systemc_tests)
+enable_project_sanitizers(panel_lu_systemc_tests)
+if(SYSTEMC_HOME AND APPLE)
+    set_target_properties(
+        panel_lu_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
+endif()
+
+add_executable(panel_lu_prototype_smoke src/panel_lu_prototype_smoke.cpp)
+target_link_libraries(panel_lu_prototype_smoke PRIVATE panel_lu)
+enable_project_warnings(panel_lu_prototype_smoke)
+enable_project_sanitizers(panel_lu_prototype_smoke)
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME atu_hpu_demo COMMAND atu_hpu_demo)
@@ -160,4 +247,40 @@ if(BUILD_TESTING)
         --out "${CMAKE_CURRENT_BINARY_DIR}/t04_output/smoke")
     set_tests_properties(dataplane_smoke PROPERTIES
         DEPENDS t04_generate_fixtures)
+
+    add_test(NAME controlplane_core_tests COMMAND controlplane_core_tests)
+
+    add_test(NAME controlplane_systemc_tests COMMAND controlplane_systemc_tests)
+
+    add_test(NAME controlplane_artifact_tests COMMAND controlplane_artifact_tests
+        "${T04_FIXTURE_DIR}")
+    set_tests_properties(controlplane_artifact_tests PROPERTIES
+        DEPENDS t04_generate_fixtures)
+
+    add_test(NAME command_device_smoke COMMAND command_device_smoke
+        --device-dir "${T04_FIXTURE_DIR}/multiroot_static/device"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/t05_output/smoke")
+    set_tests_properties(command_device_smoke PROPERTIES
+        DEPENDS t04_generate_fixtures)
+
+    add_test(NAME panel_lu_prototype_tests COMMAND panel_lu_prototype_tests
+        "${CMAKE_CURRENT_BINARY_DIR}/t06_output")
+
+    add_test(NAME panel_lu_systemc_tests COMMAND panel_lu_systemc_tests)
+    set_tests_properties(panel_lu_systemc_tests PROPERTIES
+        DEPENDS panel_lu_prototype_tests)
+
+    # Cross-tile tail trace (p = 23 > 16) and mixed multi-mode load, generated
+    # as reproducible T06 evidence.
+    add_test(
+        NAME panel_lu_smoke_tail
+        COMMAND panel_lu_prototype_smoke
+            --mode tail --front-dim 23 --pivot-dim 23 --pe-count 1
+            --trace-dir "${CMAKE_CURRENT_BINARY_DIR}/t06_output/tail_p23_pe1")
+
+    add_test(
+        NAME panel_lu_smoke_mixed
+        COMMAND panel_lu_prototype_smoke
+            --mode mixed --front-dim 40 --pivot-dim 40 --pe-count 2
+            --trace-dir "${CMAKE_CURRENT_BINARY_DIR}/t06_output/mixed_p40_pe2")
 endif()

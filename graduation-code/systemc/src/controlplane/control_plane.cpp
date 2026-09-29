@@ -1,0 +1,1859 @@
+#include "controlplane/control_plane.hpp"
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+namespace hw::controlplane {
+
+namespace cmd = hw::command;
+namespace dp = hw::dataplane;
+
+const char* batch_state_name(BatchState state) {
+    switch (state) {
+    case BatchState::Idle: return "idle";
+    case BatchState::Running: return "running";
+    case BatchState::Completed: return "completed";
+    case BatchState::Faulted: return "faulted";
+    }
+    return "unknown";
+}
+
+namespace {
+
+bool opcode_touches_front(cmd::Opcode opcode) {
+    switch (opcode) {
+    case cmd::Opcode::NodeBegin:
+    case cmd::Opcode::LoadFront:
+    case cmd::Opcode::AssembleExtendAdd:
+    case cmd::Opcode::PanelLu:
+    case cmd::Opcode::TrsmLeft:
+    case cmd::Opcode::TrsmRight:
+    case cmd::Opcode::GemmSchur:
+    case cmd::Opcode::StoreFactor:
+    case cmd::Opcode::StoreUpdate:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool opcode_needs_view(cmd::Opcode opcode) {
+    switch (opcode) {
+    case cmd::Opcode::NodeBegin:
+    case cmd::Opcode::LoadFront:
+    case cmd::Opcode::PanelLu:
+    case cmd::Opcode::AssembleExtendAdd:
+    case cmd::Opcode::TrsmLeft:
+    case cmd::Opcode::TrsmRight:
+    case cmd::Opcode::GemmSchur:
+    case cmd::Opcode::StoreFactor:
+    case cmd::Opcode::StoreUpdate:
+    case cmd::Opcode::SolveForward:
+    case cmd::Opcode::SolveBackward:
+        return true;
+    case cmd::Opcode::NodeCommit:
+    case cmd::Opcode::AbortNode:
+        return false;
+    }
+    return false;
+}
+
+dp::ReadKind view_kind_for(cmd::Opcode opcode) {
+    switch (opcode) {
+    case cmd::Opcode::NodeBegin:
+    case cmd::Opcode::LoadFront:
+    case cmd::Opcode::PanelLu:
+        return dp::ReadKind::Front;
+    case cmd::Opcode::AssembleExtendAdd:
+        return dp::ReadKind::Contribution;
+    case cmd::Opcode::TrsmLeft:
+    case cmd::Opcode::TrsmRight:
+    case cmd::Opcode::GemmSchur:
+        return dp::ReadKind::Kernel;
+    case cmd::Opcode::StoreFactor:
+        return dp::ReadKind::Factor;
+    case cmd::Opcode::StoreUpdate:
+        return dp::ReadKind::Region;
+    case cmd::Opcode::SolveForward:
+    case cmd::Opcode::SolveBackward:
+        return dp::ReadKind::Solve;
+    case cmd::Opcode::NodeCommit:
+    case cmd::Opcode::AbortNode:
+        break;
+    }
+    return dp::ReadKind::Region;
+}
+
+std::vector<std::uint8_t> identity_pvector(std::uint32_t dim) {
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(dim) * 4);
+    for (std::uint32_t index = 0; index < dim; ++index) {
+        for (unsigned b = 0; b < 4; ++b) {
+            bytes[static_cast<std::size_t>(index) * 4 + b] =
+                static_cast<std::uint8_t>((index >> (8 * b)) & 0xFF);
+        }
+    }
+    return bytes;
+}
+
+}  // namespace
+
+CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig config)
+    : artifact_(std::move(artifact)),
+      config_(config),
+      plane_(
+          artifact_,
+          [&config]() {
+              dp::DataPlaneConfig data_config;
+              data_config.memory = config.memory;
+              data_config.buffers.slot_count = config.buffer_slot_count;
+              data_config.buffers.capacity_bytes = config.buffer_capacity_bytes;
+              data_config.buffers.port_count = config.buffer_port_count;
+              data_config.buffers.access_cycles = 1;
+              data_config.dma = config.dma;
+              return data_config;
+          }()),
+      trace_(plane_.trace()),
+      fetch_(
+          plane_.memory_service(),
+          CommandFetch::Config{
+              plane_.boot().command_table_addr, plane_.boot().command_count,
+              config.command_window_depth + 2},
+          &trace_),
+      completion_writer_(
+          plane_.memory_service(),
+          plane_.boot().completion_table_addr,
+          config.completion_queue_depth,
+          &trace_),
+      dma_arbiter_(plane_.dma(), config.dma_queue_depth),
+      total_commands_(plane_.boot().command_count) {
+    plane_.set_memory_sink(dp::MemoryClient::CommandFetch, &fetch_);
+    plane_.set_memory_sink(dp::MemoryClient::CompletionWriter, &completion_writer_);
+    plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
+
+    auto make_units = [this](UnitKind kind, std::uint32_t count) {
+        for (std::uint32_t index = 0; index < count; ++index) {
+            units_.push_back(std::make_unique<TestStubUnit>(
+                kind, index, config_.stub, &plane_.buffers()));
+        }
+    };
+    make_units(UnitKind::Assemble, config_.assemble_unit_count);
+    make_units(UnitKind::Panel, config_.panel_unit_count);
+    make_units(UnitKind::Trsm, config_.trsm_unit_count);
+    make_units(UnitKind::Gemm, config_.gemm_unit_count);
+    make_units(UnitKind::Solve, config_.solve_unit_count);
+
+    front_slots_.resize(config_.max_resident_fronts);
+    scoreboard_.init(plane_.boot().token_count);
+}
+
+bool CommandDevice::start(std::string* error) {
+    if (config_.backend == ExecBackend::RequireRealKernels) {
+        if (error != nullptr) {
+            *error =
+                "no real Panel-LU/TRSM/GEMM/solve kernels are implemented; "
+                "refusing to run instead of silently using a test stub";
+        }
+        return false;
+    }
+    if (!config_.enable_test_stub) {
+        if (error != nullptr) {
+            *error = "the test execution backend must be explicitly enabled";
+        }
+        return false;
+    }
+    // Resource configurations that can never make progress are refused up
+    // front instead of deadlocking at runtime.
+    auto reject = [&](const std::string& message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (config_.max_resident_fronts < 1 || config_.max_resident_fronts > 2) {
+        return reject("max_resident_fronts must be 1 or 2 in this version");
+    }
+    if (config_.command_window_depth < 1) {
+        return reject("command_window_depth must be at least 1");
+    }
+    if (config_.completion_queue_depth < 1) {
+        return reject("completion_queue_depth must be at least 1");
+    }
+    if (config_.dma_queue_depth < 2) {
+        // STORE_FACTOR submits its L and U write-backs as one atomic pair.
+        return reject("dma_queue_depth must be at least 2 (atomic job pairs)");
+    }
+    if (config_.buffer_capacity_bytes == 0) {
+        return reject("buffer_capacity_bytes must be positive");
+    }
+    if (config_.buffer_port_count < 2) {
+        // ASSEMBLE holds a front write lease and a temp read lease at the same
+        // time; with a single port that need can never be satisfied, so the
+        // configuration is refused instead of stalling forever.
+        return reject(
+            "buffer_port_count must be at least 2 (assembly holds two buffer "
+            "leases at once)");
+    }
+    const std::uint32_t required_slots =
+        2 * config_.max_resident_fronts + 1;  // front+temp per front + solve scratch
+    if (config_.buffer_slot_count < required_slots) {
+        return reject(
+            "buffer_slot_count must be at least 2*max_resident_fronts+1 "
+            "(front+temp per resident front and one solve scratch slot)");
+    }
+    if (config_.panel_unit_count < 1 || config_.trsm_unit_count < 1 ||
+        config_.gemm_unit_count < 1 || config_.solve_unit_count < 1 ||
+        config_.assemble_unit_count < 1) {
+        return reject("every execution unit pool needs at least one unit");
+    }
+    state_ = BatchState::Running;
+    return true;
+}
+
+void CommandDevice::fault(const std::string& reason, std::uint64_t cycle) {
+    (void)cycle;
+    if (state_ == BatchState::Faulted) {
+        return;
+    }
+    state_ = BatchState::Faulted;
+    fault_reason_ = reason;
+}
+
+bool CommandDevice::finished() const {
+    return state_ != BatchState::Running;
+}
+
+void CommandDevice::tick() {
+    if (state_ != BatchState::Running) {
+        return;
+    }
+    const std::uint64_t cycle = plane_.begin_tick();
+    plane_.tick_memory_and_route();
+    update_phase(cycle);
+    if (state_ == BatchState::Running) {
+        dispatch_phase(cycle);
+        issue_phase(cycle);
+    }
+    plane_.tick_clients();
+
+    if (state_ == BatchState::Running && fetch_.finished() &&
+        completed_commands_ == total_commands_) {
+        bool quiescent = true;
+        for (const auto& tracker : trackers_) {
+            quiescent = quiescent && tracker->phase == Tracker::Phase::Done;
+        }
+        if (quiescent && dma_arbiter_.idle() && exec_inbox_.empty()) {
+            state_ = BatchState::Completed;
+        }
+    }
+}
+
+void CommandDevice::run(std::uint64_t max_cycles) {
+    const std::uint64_t start = plane_.cycle();
+    while (state_ == BatchState::Running && plane_.cycle() - start < max_cycles) {
+        tick();
+    }
+    if (state_ == BatchState::Running) {
+        fault("batch timeout", plane_.cycle());
+    }
+}
+
+CommandDevice::Tracker* CommandDevice::find_tracker(std::uint32_t command_id) {
+    for (auto& tracker : trackers_) {
+        if (tracker->command.command_id == command_id) {
+            return tracker.get();
+        }
+    }
+    return nullptr;
+}
+
+CommandDevice::Tracker* CommandDevice::find_tracker_by_txn(std::uint64_t txn_id) {
+    const auto found = txn_map_.find(txn_id);
+    return found == txn_map_.end() ? nullptr : find_tracker(found->second);
+}
+
+CommandDevice::Tracker* CommandDevice::find_tracker_by_job(std::uint64_t job_id) {
+    const auto found = job_map_.find(job_id);
+    return found == job_map_.end() ? nullptr : find_tracker(found->second);
+}
+
+CommandDevice::Tracker* CommandDevice::find_tracker_by_pvector(std::uint64_t request_id) {
+    const auto found = pvector_map_.find(request_id);
+    return found == pvector_map_.end() ? nullptr : find_tracker(found->second);
+}
+
+std::optional<std::uint32_t> CommandDevice::context_for_node(std::uint32_t node_id) const {
+    for (std::uint32_t index = 0; index < front_slots_.size(); ++index) {
+        if (front_slots_[index].active && front_slots_[index].node_id == node_id) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: module updates and command state transitions.
+// ---------------------------------------------------------------------------
+void CommandDevice::update_phase(std::uint64_t cycle) {
+    fetch_.update(cycle);
+    if (fetch_.faulted()) {
+        fault("command fetch fault: " + fetch_.fault_reason(), cycle);
+        return;
+    }
+
+    completion_writer_.update(cycle);
+    if (completion_writer_.faulted()) {
+        fault("completion fault: " + completion_writer_.fault_reason(), cycle);
+    }
+    drain_completion_results(cycle);
+
+    dma_arbiter_.update(cycle);
+    DmaArbiter::Completion job;
+    while (dma_arbiter_.take_completion(job)) {
+        const auto mapping = job_map_.find(job.job_id);
+        if (mapping == job_map_.end()) {
+            continue;
+        }
+        Tracker* tracker = find_tracker(mapping->second);
+        job_map_.erase(mapping);
+        if (tracker != nullptr) {
+            handle_job_done(*tracker, job, cycle);
+        }
+    }
+
+    for (auto& unit : units_) {
+        unit->tick(cycle);
+        ExecResponse response;
+        if (unit->poll_response(response)) {
+            Tracker* tracker = find_tracker_by_txn(response.txn_id);
+            txn_map_.erase(response.txn_id);
+            const auto record = open_unit_records_.find(response.txn_id);
+            if (record != open_unit_records_.end()) {
+                UnitBusyRecord busy = record->second;
+                busy.finish = response.finish_cycle;
+                unit_records_.push_back(busy);
+                open_unit_records_.erase(record);
+            }
+            if (tracker != nullptr) {
+                handle_exec_response(*tracker, response, cycle);
+            }
+        }
+    }
+
+    // Descriptor and dependency-payload resolution completions.
+    std::vector<std::uint64_t> resolve_ids;
+    for (auto& tracker : trackers_) {
+        if (tracker->phase == Tracker::Phase::Resolving) {
+            if (tracker->resolve_pending) {
+                resolve_ids.push_back(tracker->resolve_request_id);
+            }
+            if (tracker->wait_request_id != 0) {
+                resolve_ids.push_back(tracker->wait_request_id);
+            }
+        }
+    }
+    for (const auto request_id : resolve_ids) {
+        if (plane_.reader().pending(request_id)) {
+            continue;
+        }
+        dp::ReadOutcome outcome;
+        if (!plane_.reader().poll(request_id, outcome)) {
+            continue;
+        }
+        for (auto& tracker : trackers_) {
+            if (tracker->phase != Tracker::Phase::Resolving) {
+                continue;
+            }
+            if (tracker->resolve_pending && tracker->resolve_request_id == request_id) {
+                tracker->resolve_pending = false;
+                if (outcome.status != cmd::StatusCode::Ok) {
+                    finish_command(
+                        *tracker, outcome.status,
+                        "descriptor resolution failed: " + outcome.reason, cycle);
+                    break;
+                }
+                switch (outcome.kind) {
+                case dp::ReadKind::Front: tracker->front_view = outcome.front; break;
+                case dp::ReadKind::Contribution:
+                    tracker->contribution_view = outcome.contribution;
+                    break;
+                case dp::ReadKind::Kernel: tracker->kernel_view = outcome.kernel; break;
+                case dp::ReadKind::Factor: tracker->factor_view = outcome.factor; break;
+                case dp::ReadKind::Solve: tracker->solve_view = outcome.solve; break;
+                case dp::ReadKind::Region: tracker->region_view = outcome.region; break;
+                case dp::ReadKind::Dependency: break;
+                }
+                tracker->view_ready = true;
+            } else if (tracker->wait_request_id == request_id) {
+                tracker->wait_request_id = 0;
+                if (outcome.status != cmd::StatusCode::Ok) {
+                    finish_command(
+                        *tracker, outcome.status,
+                        "dependency payload read failed: " + outcome.reason, cycle);
+                    break;
+                }
+                tracker->waits = outcome.dependency.tokens;
+                tracker->waits_ready = true;
+            }
+            if (!tracker->resolve_pending && tracker->waits_ready &&
+                tracker->phase == Tracker::Phase::Resolving) {
+                tracker->phase = Tracker::Phase::Waiting;
+            }
+        }
+    }
+
+    // P-vector identity writes (submit retries and completions).
+    for (auto& tracker : trackers_) {
+        if (tracker->pvector_pending && tracker->pvector_request_id == 0 &&
+            tracker->phase == Tracker::Phase::PostExec) {
+            submit_pvector_write(*tracker, cycle);
+        }
+    }
+    for (auto iterator = exec_inbox_.begin(); iterator != exec_inbox_.end();) {
+        Tracker* tracker = find_tracker_by_pvector(iterator->first);
+        pvector_map_.erase(iterator->first);
+        const auto response = std::move(iterator->second);
+        iterator = exec_inbox_.erase(iterator);
+        if (tracker != nullptr) {
+            handle_pvector_done(*tracker, response, cycle);
+        }
+    }
+
+    // Waiting trackers: dependency verdicts and resource retries. Commands of
+    // an aborted node are cancelled first so abort semantics stay
+    // deterministic: their status is always ABORTED and their token FAILED.
+    for (auto& tracker : trackers_) {
+        if (tracker->phase == Tracker::Phase::Waiting) {
+            if (aborted_nodes_.count(tracker->command.node_id) != 0 &&
+                tracker->command.opcode != cmd::Opcode::AbortNode) {
+                finish_command(
+                    *tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+                continue;
+            }
+            switch (scoreboard_.check(tracker->waits)) {
+            case TokenScoreboard::Deps::Failed:
+                finish_command(
+                    *tracker, cmd::StatusCode::DependencyFailed,
+                    "a dependency command failed", cycle);
+                break;
+            case TokenScoreboard::Deps::Pending:
+                ++tracker->stall_dep;  // exclusive per-tick wait class
+                break;
+            case TokenScoreboard::Deps::Ready:
+                try_execute(*tracker, cycle);
+                break;
+            }
+        } else if (tracker->phase == Tracker::Phase::Running) {
+            while (!tracker->job_retries.empty()) {
+                dp::DmaRequest retry = tracker->job_retries.front();
+                retry.request_id = plane_.memory_service().next_request_id();
+                if (requeue_dma_job(*tracker, retry, cycle) == 0) {
+                    break;  // queue still busy; retry next cycle
+                }
+                tracker->job_retries.erase(tracker->job_retries.begin());
+            }
+            if (tracker->solve_load_pending) {
+                issue_solve_load(*tracker, cycle);
+            } else if (tracker->stage2_pending) {
+                try_execute(*tracker, cycle);
+            } else if (tracker->solve_store_pending) {
+                issue_solve_store(*tracker, cycle);
+            }
+        } else if (tracker->phase == Tracker::Phase::PostExec &&
+                   !tracker->pvector_pending) {
+            // Completion enqueue retries while the output writes are done.
+            enqueue_completion(*tracker, cycle);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: bounded window management and dispatch attempts.
+// ---------------------------------------------------------------------------
+void CommandDevice::dispatch_phase(std::uint64_t cycle) {
+    // Pull new commands into the bounded scheduler window. Rules (documented
+    // in the T05 design note):
+    //   * front-touching commands of a node that is not yet admitted stay in
+    //     the fetch FIFO (admission gate) and do NOT consume window space;
+    //   * a NODE_BEGIN of an un-admitted node is "parked": tracked, not
+    //     counted against the window, so an un-admitted node can never block
+    //     the window of an active front;
+    //   * everything else counts against command_window_depth (pre-dispatch
+    //     only; running commands are not part of the scheduling window).
+    // The fetch FIFO is scanned for the first pullable entry, so a gated entry
+    // cannot jam the commands behind it.
+    while (!fetch_.window_empty()) {
+        std::size_t counted = 0;
+        for (const auto& tracker : trackers_) {
+            const bool pre_dispatch =
+                tracker->phase == Tracker::Phase::InWindow ||
+                tracker->phase == Tracker::Phase::Resolving ||
+                tracker->phase == Tracker::Phase::Waiting;
+            const bool parked =
+                tracker->command.opcode == cmd::Opcode::NodeBegin &&
+                context_for_node(tracker->command.node_id) == std::nullopt &&
+                aborted_nodes_.count(tracker->command.node_id) == 0;
+            if (pre_dispatch && !parked) {
+                ++counted;
+            }
+        }
+
+        // A node whose NODE_BEGIN terminated without creating a context will
+        // never be admitted; its remaining commands must still stream through
+        // (they end as DEPENDENCY_FAILED / ABORTED).
+        auto admission_closed = [this](std::uint32_t node_id) {
+            for (const auto& tracker : trackers_) {
+                if (tracker->command.node_id == node_id &&
+                    tracker->command.opcode == cmd::Opcode::NodeBegin &&
+                    tracker->finish_cycle != 0 &&
+                    !context_for_node(node_id).has_value()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        std::optional<std::size_t> pick;
+        for (std::size_t index = 0; index < fetch_.window_size(); ++index) {
+            const auto& command = fetch_.at(index);
+            const bool aborted = aborted_nodes_.count(command.node_id) != 0;
+            const bool admitted =
+                context_for_node(command.node_id).has_value() || aborted ||
+                admission_closed(command.node_id);
+            const bool touches = opcode_touches_front(command.opcode);
+            if (touches && command.opcode != cmd::Opcode::NodeBegin && !admitted) {
+                continue;  // admission gate
+            }
+            const bool parked_entry =
+                command.opcode == cmd::Opcode::NodeBegin && !admitted;
+            if (!parked_entry && counted >= config_.command_window_depth) {
+                continue;  // window full for counted entries
+            }
+            pick = index;
+            break;
+        }
+        if (!pick.has_value()) {
+            break;
+        }
+        auto tracker = std::make_unique<Tracker>();
+        tracker->command = fetch_.at(*pick);
+        fetch_.remove_at(*pick);
+        tracker->fetch_cycle = cycle;
+        tracker->admit_cycle = cycle;
+        tracker->phase = Tracker::Phase::InWindow;
+        if (tracker->command.signal_token != cmd::NONE) {
+            scoreboard_.register_producer(
+                tracker->command.signal_token, tracker->command.command_id);
+        }
+        if (tracker->command.opcode == cmd::Opcode::NodeCommit) {
+            commit_seen_.insert(tracker->command.node_id);
+        }
+        trackers_.push_back(std::move(tracker));
+    }
+
+    // Start descriptor/dependency reads for fresh window entries in stream
+    // order (earliest first).
+    for (auto& tracker : trackers_) {
+        if (tracker->phase != Tracker::Phase::InWindow) {
+            continue;
+        }
+        tracker->phase = Tracker::Phase::Resolving;
+        tracker->waits_ready = tracker->command.wait_list_id == cmd::NONE;
+        if (!tracker->waits_ready) {
+            tracker->wait_request_id = plane_.reader().request(
+                dp::ReadKind::Dependency, tracker->command.wait_list_id, cycle);
+        }
+        if (opcode_needs_view(tracker->command.opcode)) {
+            tracker->resolve_pending = true;
+            tracker->resolve_request_id = plane_.reader().request(
+                view_kind_for(tracker->command.opcode),
+                tracker->command.descriptor_id, cycle);
+        } else {
+            tracker->view_ready = true;
+        }
+    }
+}
+
+void CommandDevice::issue_phase(std::uint64_t cycle) {
+    fetch_.tick(cycle);
+    completion_writer_.tick(cycle);
+    dma_arbiter_.tick(cycle);
+}
+
+// ---------------------------------------------------------------------------
+// Execution attempts (atomic resource acquisition with rollback).
+// ---------------------------------------------------------------------------
+bool CommandDevice::acquire_exec_resources(
+    Tracker& tracker,
+    UnitKind kind,
+    bool need_front_write,
+    bool need_temp_read,
+    std::uint64_t cycle) {
+    const auto context_index = context_for_node(tracker.command.node_id);
+    if ((need_front_write || need_temp_read) && !context_index.has_value()) {
+        finish_command(
+            tracker, cmd::StatusCode::BadCommand,
+            "no resident front for this command", cycle);
+        return false;
+    }
+
+    if (need_front_write) {
+        const auto& context = front_slots_[*context_index];
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(context.front_view.total_dim) *
+            context.front_view.total_dim * 4;
+        const auto result =
+            plane_.buffers().begin_write(context.front, context.owner, 0, bytes, cycle);
+        if (!result.ok) {
+            ++tracker.stall_resource;
+            return false;
+        }
+        tracker.front_lease = result.lease;
+        tracker.has_front_lease = true;
+        tracker.front_write_lease = true;
+    }
+    if (need_temp_read) {
+        const auto& context = front_slots_[*context_index];
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(tracker.contribution_view.col_count) *
+            tracker.contribution_view.col_count * 4;
+        const auto result = plane_.buffers().begin_read(
+            context.temp, context.owner, 0, bytes, cycle);
+        if (!result.ok) {
+            if (tracker.has_front_lease) {
+                plane_.buffers().end_write(
+                    tracker.front_lease.lease_id, tracker.front_lease.length, cycle);
+                tracker.has_front_lease = false;
+                tracker.front_write_lease = false;
+            }
+            ++tracker.stall_resource;
+            return false;
+        }
+        tracker.temp_lease = result.lease;
+        tracker.has_temp_lease = true;
+    }
+
+    TestStubUnit* unit = nullptr;
+    for (auto& candidate : units_) {
+        if (candidate->kind() == kind && !candidate->busy()) {
+            unit = candidate.get();
+            break;
+        }
+    }
+    if (unit == nullptr) {
+        release_command_resources(tracker, cycle);
+        ++tracker.stall_resource;
+        return false;
+    }
+
+    ExecRequest request;
+    request.txn_id = next_txn_id_++;
+    request.epoch = epoch_;
+    request.command_id = tracker.command.command_id;
+    request.node_id = tracker.command.node_id;
+    request.opcode = tracker.command.opcode;
+    request.unit_id = unit->unit_id();
+    request.front = tracker.front_view;
+    request.factor = tracker.factor_view;
+    request.contribution = tracker.contribution_view;
+    request.kernel = tracker.kernel_view;
+    request.solve = tracker.solve_view;
+    request.front_slot = front_slots_[*context_index].front;
+    request.temp_slot = front_slots_[*context_index].temp;
+    request.total_dim = front_slots_[*context_index].front_view.total_dim;
+    request.update_dim = tracker.contribution_view.col_count;
+    request.front_lease = tracker.front_lease;
+    request.temp_lease = tracker.temp_lease;
+    request.has_front_lease = tracker.has_front_lease;
+    request.has_temp_lease = tracker.has_temp_lease;
+    request.range_bytes =
+        static_cast<std::uint64_t>(request.total_dim) * request.total_dim * 4;
+    request.policy = tracker.front_view.policy;
+    request.threshold_bits = tracker.front_view.threshold_bits;
+
+    if (!unit->submit(request, cycle)) {
+        release_command_resources(tracker, cycle);
+        ++tracker.stall_resource;
+        return false;
+    }
+    tracker.unit_kind = kind;
+    tracker.unit_id = unit->unit_id();
+    tracker.unit_active = true;
+    tracker.txn_id = request.txn_id;
+    txn_map_[request.txn_id] = tracker.command.command_id;
+    UnitBusyRecord busy;
+    busy.kind = unit_kind_name(kind);
+    busy.unit_id = unit->unit_id();
+    busy.command_id = tracker.command.command_id;
+    busy.node_id = tracker.command.node_id;
+    busy.start = cycle;
+    open_unit_records_[request.txn_id] = busy;
+    if (tracker.start_cycle == 0) {
+        tracker.start_cycle = cycle;
+    }
+    tracker.phase = Tracker::Phase::Running;
+    tracker.stage2_pending = false;
+    return true;
+}
+
+std::uint64_t CommandDevice::enqueue_dma_job(
+    Tracker& tracker,
+    const dp::DmaRequest& request,
+    std::uint64_t cycle) {
+    DmaArbiter::Job job;
+    job.front_tag = tracker.command.node_id;
+    job.command_id = tracker.command.command_id;
+    job.node_id = tracker.command.node_id;
+    job.request = request;
+    const std::uint64_t job_id = dma_arbiter_.enqueue(std::move(job), cycle);
+    if (job_id == 0) {
+        ++tracker.stall_dma;
+        return 0;
+    }
+    job_map_[job_id] = tracker.command.command_id;
+    ++tracker.dma_jobs_total;  // issued logical jobs (cancelled ones tracked apart)
+    return job_id;
+}
+
+bool CommandDevice::submit_pvector_write(Tracker& tracker, std::uint64_t cycle) {
+    const auto context = context_for_node(tracker.command.node_id);
+    if (!context.has_value()) {
+        release_command_resources(tracker, cycle);
+        finish_command(
+            tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+        return false;
+    }
+    const auto& slot = front_slots_[*context];
+    dp::MemoryRequest request;
+    request.request_id = plane_.memory_service().next_request_id();
+    request.client = dp::MemoryClient::ExecUnit;
+    request.write = true;
+    request.address = slot.front_view.p.base_addr;
+    request.length = static_cast<std::uint64_t>(slot.front_view.pivot_dim) * 4;
+    request.kind = dp::AccessKind::Int32Data;
+    request.write_data = identity_pvector(slot.front_view.pivot_dim);
+    request.command_id = tracker.command.command_id;
+    request.node_id = tracker.command.node_id;
+    request.label = slot.front_view.p.name;
+    if (!plane_.memory_service().submit(request, cycle)) {
+        return false;  // retry next tick; resources stay held
+    }
+    tracker.pvector_pending = true;
+    tracker.pvector_request_id = request.request_id;
+    pvector_map_[request.request_id] = tracker.command.command_id;
+    return true;
+}
+
+bool CommandDevice::issue_solve_load(Tracker& tracker, std::uint64_t cycle) {
+    const auto& view = tracker.solve_view;
+    const std::uint64_t chunk = std::min<std::uint64_t>(
+        tracker.tile_width, tracker.solve_cols - tracker.solve_elem);
+    const std::string owner =
+        "solve:" + std::to_string(tracker.command.command_id);
+    const dp::BufferHandle handle{
+        tracker.context_slot, plane_.buffers().generation(tracker.context_slot)};
+    if (plane_.buffers().state(tracker.context_slot) != dp::BufferState::Reserved) {
+        // Refill path: previous chunks leave the scratch READY/DIRTY.
+        const auto rearm = plane_.buffers().rearm(handle, owner, cycle);
+        if (!rearm.ok) {
+            ++tracker.stall_resource;
+            return false;
+        }
+    }
+    dp::DmaRequest load;
+    load.request_id = plane_.memory_service().next_request_id();
+    load.has_command = true;
+    load.command_id = tracker.command.command_id;
+    load.node_id = tracker.command.node_id;
+    load.direction = dp::DmaDirection::MemoryToBuffer;
+    load.ddr_region = view.rhs;
+    load.owner = owner;
+    load.buffer = handle;
+    load.ddr_offset =
+        static_cast<std::uint64_t>(tracker.solve_row) * view.rhs.row_stride +
+        static_cast<std::uint64_t>(tracker.solve_elem) * 4;
+    load.rows = 1;
+    load.cols = static_cast<std::uint32_t>(chunk);
+    load.buffer_row_stride = chunk * 4;
+    load.element_bytes = 4;
+    load.label = view.rhs.name;
+    if (enqueue_dma_job(tracker, load, cycle) == 0) {
+        return false;
+    }
+    tracker.solve_load_pending = false;
+    tracker.solve_store_issued = false;
+    return true;
+}
+
+bool CommandDevice::issue_solve_store(Tracker& tracker, std::uint64_t cycle) {
+    const auto& view = tracker.solve_view;
+    const std::uint64_t chunk = std::min<std::uint64_t>(
+        tracker.tile_width, tracker.solve_cols - tracker.solve_elem);
+    dp::DmaRequest store;
+    store.request_id = plane_.memory_service().next_request_id();
+    store.has_command = true;
+    store.command_id = tracker.command.command_id;
+    store.node_id = tracker.command.node_id;
+    store.direction = dp::DmaDirection::BufferToMemory;
+    store.ddr_region = view.solution;
+    store.owner = "solve:" + std::to_string(tracker.command.command_id);
+    store.buffer = dp::BufferHandle{
+        tracker.context_slot, plane_.buffers().generation(tracker.context_slot)};
+    store.ddr_offset =
+        static_cast<std::uint64_t>(tracker.solve_row) * view.solution.row_stride +
+        static_cast<std::uint64_t>(tracker.solve_elem) * 4;
+    store.rows = 1;
+    store.cols = static_cast<std::uint32_t>(chunk);
+    store.buffer_row_stride = chunk * 4;
+    store.element_bytes = 4;
+    store.label = view.solution.name;
+    if (!enqueue_dma_job(tracker, store, cycle)) {
+        return false;
+    }
+    tracker.solve_store_pending = false;
+    tracker.solve_store_issued = true;
+    return true;
+}
+
+void CommandDevice::advance_solve(Tracker& tracker, std::uint64_t cycle) {
+    const std::uint64_t chunk = std::min<std::uint64_t>(
+        tracker.tile_width, tracker.solve_cols - tracker.solve_elem);
+    tracker.solve_elem += static_cast<std::uint32_t>(chunk);
+    if (tracker.solve_elem >= tracker.solve_cols) {
+        tracker.solve_elem = 0;
+        ++tracker.solve_row;
+    }
+    if (tracker.solve_row >= tracker.solve_rows) {
+        if (tracker.owns_temp) {
+            const std::string owner =
+                "solve:" + std::to_string(tracker.command.command_id);
+            plane_.buffers().release(
+                dp::BufferHandle{
+                    tracker.context_slot,
+                    plane_.buffers().generation(tracker.context_slot)},
+                owner,
+                cycle);
+            tracker.owns_temp = false;
+        }
+        finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+        return;
+    }
+    tracker.solve_load_pending = true;
+    issue_solve_load(tracker, cycle);
+}
+
+void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
+    const auto opcode = tracker.command.opcode;
+    if (tracker.stage2_pending) {
+        const bool is_assemble = opcode == cmd::Opcode::AssembleExtendAdd;
+        if (is_assemble) {
+            acquire_exec_resources(tracker, UnitKind::Assemble, true, true, cycle);
+            return;
+        }
+        // Solve stage 2: solve unit + temp write lease on the solve scratch.
+        const std::string owner =
+            "solve:" + std::to_string(tracker.command.command_id);
+        const auto lease = plane_.buffers().begin_write(
+            dp::BufferHandle{
+                tracker.context_slot,
+                plane_.buffers().generation(tracker.context_slot)},
+            owner,
+            0,
+            static_cast<std::uint64_t>(tracker.tile_width) * 4,
+            cycle);
+        if (!lease.ok) {
+            ++tracker.stall_resource;
+            return;
+        }
+        tracker.temp_lease = lease.lease;
+        tracker.has_temp_lease = true;
+        TestStubUnit* unit = nullptr;
+        for (auto& candidate : units_) {
+            if (candidate->kind() == UnitKind::Solve && !candidate->busy()) {
+                unit = candidate.get();
+                break;
+            }
+        }
+        if (unit == nullptr) {
+            release_command_resources(tracker, cycle);
+            ++tracker.stall_resource;
+            return;
+        }
+        ExecRequest request;
+        request.txn_id = next_txn_id_++;
+        request.epoch = epoch_;
+        request.command_id = tracker.command.command_id;
+        request.node_id = tracker.command.node_id;
+        request.opcode = opcode;
+        request.unit_id = unit->unit_id();
+        request.solve = tracker.solve_view;
+        request.temp_slot = dp::BufferHandle{
+            tracker.context_slot, plane_.buffers().generation(tracker.context_slot)};
+        request.temp_lease = tracker.temp_lease;
+        request.has_temp_lease = true;
+        request.range_bytes = static_cast<std::uint64_t>(tracker.tile_width) * 4;
+        if (!unit->submit(request, cycle)) {
+            release_command_resources(tracker, cycle);
+            ++tracker.stall_resource;
+            return;
+        }
+        tracker.unit_kind = UnitKind::Solve;
+        tracker.unit_id = unit->unit_id();
+        tracker.unit_active = true;
+        tracker.txn_id = request.txn_id;
+        txn_map_[request.txn_id] = tracker.command.command_id;
+        UnitBusyRecord busy;
+        busy.kind = unit_kind_name(UnitKind::Solve);
+        busy.unit_id = unit->unit_id();
+        busy.command_id = tracker.command.command_id;
+        busy.node_id = tracker.command.node_id;
+        busy.start = cycle;
+        open_unit_records_[request.txn_id] = busy;
+        tracker.stage2_pending = false;
+        return;
+    }
+    if (!tracker.view_ready) {
+        return;
+    }
+    if (aborted_nodes_.count(tracker.command.node_id) != 0 &&
+        opcode != cmd::Opcode::AbortNode) {
+        finish_command(tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+        return;
+    }
+    if (opcode_touches_front(opcode) && opcode != cmd::Opcode::NodeBegin) {
+        const auto context = context_for_node(tracker.command.node_id);
+        if (!context.has_value()) {
+            finish_command(
+                tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+            return;
+        }
+        // Conservative v1 rule: one front-touching command per resident front
+        // at a time; different fronts still run in parallel.
+        if (front_slots_[*context].busy) {
+            ++tracker.stall_resource;
+            return;
+        }
+    }
+
+    switch (opcode) {
+    case cmd::Opcode::NodeBegin: {
+        const auto& view = tracker.front_view;
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(view.total_dim) * view.total_dim * 4;
+        if (bytes > config_.buffer_capacity_bytes) {
+            finish_command(
+                tracker, cmd::StatusCode::BufferFull,
+                "front tile exceeds the scratchpad capacity", cycle);
+            return;
+        }
+        std::uint32_t resident = 0;
+        for (const auto& slot : front_slots_) {
+            resident += slot.active ? 1 : 0;
+        }
+        if (resident >= config_.max_resident_fronts) {
+            ++tracker.stall_resource;
+            return;
+        }
+        const std::string owner =
+            "front:" + std::to_string(tracker.command.node_id);
+        auto front = plane_.buffers().allocate(owner, bytes, cycle);
+        if (!front.ok) {
+            ++tracker.stall_resource;
+            return;
+        }
+        auto temp = plane_.buffers().allocate(owner, bytes, cycle);
+        if (!temp.ok) {
+            plane_.buffers().release(front.handle, owner, cycle);
+            ++tracker.stall_resource;
+            return;
+        }
+        for (auto& slot : front_slots_) {
+            if (!slot.active) {
+                slot.active = true;
+                slot.node_id = tracker.command.node_id;
+                slot.owner = owner;
+                slot.front = front.handle;
+                slot.temp = temp.handle;
+                slot.occupy_start = cycle;
+                slot.front_view = view;
+                break;
+            }
+        }
+        tracker.owns_context = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+        return;
+    }
+    case cmd::Opcode::LoadFront: {
+        const auto context = context_for_node(tracker.command.node_id);
+        if (!context.has_value()) {
+            finish_command(
+                tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+            return;
+        }
+        const auto& slot = front_slots_[*context];
+        dp::DmaRequest request;
+        request.request_id = plane_.memory_service().next_request_id();
+        request.has_command = true;
+        request.command_id = tracker.command.command_id;
+        request.node_id = tracker.command.node_id;
+        request.direction = dp::DmaDirection::MemoryToBuffer;
+        request.ddr_region = tracker.front_view.front;
+        request.ddr_row_stride = tracker.front_view.front.row_stride;
+        request.owner = slot.owner;
+        request.buffer = slot.front;
+        request.rows = tracker.front_view.total_dim;
+        request.cols = tracker.front_view.total_dim;
+        request.buffer_row_stride =
+            static_cast<std::uint64_t>(tracker.front_view.total_dim) * 4;
+        request.element_bytes = 4;
+        request.label = tracker.front_view.front.name;
+        if (enqueue_dma_job(tracker, request, cycle) == 0) {
+            return;
+        }
+        tracker.front_slot_index = *context;
+        front_slots_[*context].busy = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        tracker.phase = Tracker::Phase::Running;
+        return;
+    }
+    case cmd::Opcode::AssembleExtendAdd: {
+        const auto context = context_for_node(tracker.command.node_id);
+        if (!context.has_value()) {
+            finish_command(
+                tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+            return;
+        }
+        const auto& slot = front_slots_[*context];
+        if (plane_.buffers().state(slot.temp.slot) != dp::BufferState::Reserved) {
+            // Refill path: a previously used temp slot must be re-armed before
+            // the DMA load; a freshly allocated one is already RESERVED.
+            const auto rearm = plane_.buffers().rearm(slot.temp, slot.owner, cycle);
+            if (!rearm.ok) {
+                ++tracker.stall_resource;
+                return;
+            }
+        }
+        dp::DmaRequest request;
+        request.request_id = plane_.memory_service().next_request_id();
+        request.has_command = true;
+        request.command_id = tracker.command.command_id;
+        request.node_id = tracker.command.node_id;
+        request.direction = dp::DmaDirection::MemoryToBuffer;
+        request.ddr_region = tracker.contribution_view.source;
+        request.ddr_row_stride = tracker.contribution_view.source.row_stride;
+        request.owner = slot.owner;
+        request.buffer = slot.temp;
+        request.rows = tracker.contribution_view.col_count;
+        request.cols = tracker.contribution_view.col_count;
+        request.buffer_row_stride =
+            static_cast<std::uint64_t>(tracker.contribution_view.col_count) * 4;
+        request.element_bytes = 4;
+        request.label = tracker.contribution_view.source.name;
+        if (enqueue_dma_job(tracker, request, cycle) == 0) {
+            return;
+        }
+        tracker.front_slot_index = *context;
+        front_slots_[*context].busy = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        tracker.phase = Tracker::Phase::Running;
+        return;
+    }
+    case cmd::Opcode::PanelLu: {
+        if (tracker.front_view.policy == cmd::PivotPolicy::DynamicPanel) {
+            finish_command(
+                tracker, cmd::StatusCode::PolicyNotSupported,
+                "DYNAMIC_PANEL device execution is not implemented", cycle);
+            return;
+        }
+        if (acquire_exec_resources(tracker, UnitKind::Panel, true, false, cycle)) {
+            const auto slot_index = context_for_node(tracker.command.node_id);
+            tracker.front_slot_index = *slot_index;
+            front_slots_[*slot_index].busy = true;
+        }
+        return;
+    }
+    case cmd::Opcode::TrsmLeft:
+    case cmd::Opcode::TrsmRight:
+    case cmd::Opcode::GemmSchur: {
+        const UnitKind kind = opcode == cmd::Opcode::GemmSchur ? UnitKind::Gemm
+                                                              : UnitKind::Trsm;
+        if (acquire_exec_resources(tracker, kind, true, false, cycle)) {
+            const auto slot_index = context_for_node(tracker.command.node_id);
+            tracker.front_slot_index = *slot_index;
+            front_slots_[*slot_index].busy = true;
+        }
+        return;
+    }
+    case cmd::Opcode::StoreFactor: {
+        const auto context = context_for_node(tracker.command.node_id);
+        if (!context.has_value()) {
+            finish_command(
+                tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+            return;
+        }
+        const auto& slot = front_slots_[*context];
+        const auto& factor = tracker.factor_view;
+        const std::uint32_t total = factor.total_dim;
+        const std::uint32_t pivot = factor.pivot_dim;
+
+        dp::DmaRequest l_request;
+        l_request.request_id = plane_.memory_service().next_request_id();
+        l_request.has_command = true;
+        l_request.command_id = tracker.command.command_id;
+        l_request.node_id = tracker.command.node_id;
+        l_request.direction = dp::DmaDirection::BufferToMemory;
+        l_request.ddr_region = factor.l;
+        l_request.ddr_row_stride = factor.l.row_stride;
+        l_request.owner = slot.owner;
+        l_request.buffer = slot.front;
+        l_request.rows = total;
+        l_request.cols = pivot;
+        l_request.buffer_row_stride = static_cast<std::uint64_t>(total) * 4;
+        l_request.element_bytes = 4;
+        l_request.label = factor.l.name;
+
+        dp::DmaRequest u_request = l_request;
+        u_request.request_id = plane_.memory_service().next_request_id();
+        u_request.ddr_region = factor.u;
+        u_request.ddr_row_stride = factor.u.row_stride;
+        u_request.rows = pivot;
+        u_request.cols = total;
+        u_request.label = factor.u.name;
+
+        // Atomic: both jobs must fit into the shared DMA queue.
+        if (!dma_arbiter_.can_enqueue(2)) {
+            ++tracker.stall_dma;
+            return;
+        }
+        if (enqueue_dma_job(tracker, l_request, cycle) == 0 ||
+            enqueue_dma_job(tracker, u_request, cycle) == 0) {
+            for (const auto job_id :
+                 dma_arbiter_.drop_queued_command(tracker.command.command_id)) {
+                job_map_.erase(job_id);
+            }
+            return;
+        }
+        tracker.front_slot_index = *context;
+        front_slots_[*context].busy = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        tracker.phase = Tracker::Phase::Running;
+        return;
+    }
+    case cmd::Opcode::StoreUpdate: {
+        const auto context = context_for_node(tracker.command.node_id);
+        if (!context.has_value()) {
+            finish_command(
+                tracker, cmd::StatusCode::BadCommand, "missing front context", cycle);
+            return;
+        }
+        const auto& slot = front_slots_[*context];
+        const std::uint32_t total = slot.front_view.total_dim;
+        const std::uint32_t pivot = slot.front_view.pivot_dim;
+        const std::uint32_t update = total - pivot;
+        dp::DmaRequest request;
+        request.request_id = plane_.memory_service().next_request_id();
+        request.has_command = true;
+        request.command_id = tracker.command.command_id;
+        request.node_id = tracker.command.node_id;
+        request.direction = dp::DmaDirection::BufferToMemory;
+        request.ddr_region = tracker.region_view;
+        request.ddr_row_stride = tracker.region_view.row_stride;
+        request.owner = slot.owner;
+        request.buffer = slot.front;
+        request.buffer_offset =
+            static_cast<std::uint64_t>(pivot) * total * 4 +
+            static_cast<std::uint64_t>(pivot) * 4;
+        request.rows = update;
+        request.cols = update;
+        request.buffer_row_stride = static_cast<std::uint64_t>(total) * 4;
+        request.element_bytes = 4;
+        request.label = tracker.region_view.name;
+        if (enqueue_dma_job(tracker, request, cycle) == 0) {
+            return;
+        }
+        tracker.front_slot_index = *context;
+        front_slots_[*context].busy = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        tracker.phase = Tracker::Phase::Running;
+        return;
+    }
+    case cmd::Opcode::NodeCommit: {
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+        return;
+    }
+    case cmd::Opcode::SolveForward:
+    case cmd::Opcode::SolveBackward: {
+        // The full RHS is traversed in scratchpad-sized chunks; a prefix-only
+        // transfer would silently truncate data.
+        const auto& view = tracker.solve_view;
+        const std::uint64_t capacity = config_.buffer_capacity_bytes;
+        const std::uint32_t rows =
+            std::min(view.rhs.rows, view.solution.rows);
+        const std::uint32_t cols =
+            std::min(view.rhs.cols, view.solution.cols);
+        const std::uint32_t chunk = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>({cols, capacity / 4}));
+        if (rows == 0 || cols == 0) {
+            finish_command(
+                tracker, cmd::StatusCode::BufferFull,
+                "solve regions have no movable elements", cycle);
+            return;
+        }
+        if (chunk == 0) {
+            finish_command(
+                tracker, cmd::StatusCode::BufferFull,
+                "solve tile exceeds the scratchpad capacity", cycle);
+            return;
+        }
+        const std::string owner =
+            "solve:" + std::to_string(tracker.command.command_id);
+        auto temp = plane_.buffers().allocate(
+            owner, static_cast<std::uint64_t>(chunk) * 4, cycle);
+        if (!temp.ok) {
+            ++tracker.stall_resource;
+            return;
+        }
+        tracker.owns_temp = true;
+        tracker.context_slot = temp.handle.slot;
+        tracker.tile_width = chunk;
+        tracker.solve_rows = rows;
+        tracker.solve_cols = cols;
+        tracker.solve_row = 0;
+        tracker.solve_elem = 0;
+        tracker.solve_load_pending = true;
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        tracker.phase = Tracker::Phase::Running;
+        issue_solve_load(tracker, cycle);
+        return;
+    }
+    case cmd::Opcode::AbortNode: {
+        abort_node(tracker.command.node_id);
+        if (tracker.start_cycle == 0) {
+            tracker.start_cycle = cycle;
+        }
+        finish_command(tracker, cmd::StatusCode::Ok, "node aborted", cycle);
+        return;
+    }
+    }
+}
+
+void CommandDevice::handle_job_done(
+    Tracker& tracker,
+    const DmaArbiter::Completion& completion,
+    std::uint64_t cycle) {
+    const auto& response = completion.response;
+    tracker.bytes_read += response.read_bytes;
+    tracker.bytes_written += response.write_bytes;
+    const auto all_jobs_settled = [&tracker]() {
+        return tracker.dma_jobs_done + tracker.dma_jobs_cancelled >=
+               tracker.dma_jobs_total;
+    };
+
+    if (tracker.aborted) {
+        // Any settled job (finished or rejected) counts; only actual in-flight
+        // transactions are awaited after an abort.
+        if (response.status == cmd::StatusCode::Ok) {
+            tracker.dma_jobs_done += 1;
+        } else {
+            tracker.dma_jobs_cancelled += 1;
+        }
+        if (all_jobs_settled()) {
+            finish_command(
+                tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+        }
+        return;
+    }
+    if (response.status != cmd::StatusCode::Ok) {
+        if (response.retryable) {
+            // Transient buffer/port contention raised before the first beat:
+            // nothing has been written, so the same logical job is re-queued
+            // later instead of failing the command.
+            tracker.job_retries.push_back(completion.request);
+            ++dma_retry_count_;
+            return;
+        }
+        // Permanent failure: drop jobs of this command that are still queued
+        // (in-flight ones finish naturally; writes are not rolled back).
+        for (const auto job_id :
+             dma_arbiter_.drop_queued_command(tracker.command.command_id)) {
+            const auto mapping = job_map_.find(job_id);
+            if (mapping != job_map_.end()) {
+                job_map_.erase(mapping);
+                tracker.dma_jobs_cancelled += 1;
+            }
+        }
+        finish_command(tracker, response.status, response.reason, cycle);
+        return;
+    }
+    tracker.dma_jobs_done += 1;
+    switch (tracker.command.opcode) {
+    case cmd::Opcode::AssembleExtendAdd:
+        tracker.stage2_pending = true;
+        return;
+    case cmd::Opcode::SolveForward:
+    case cmd::Opcode::SolveBackward:
+        if (!tracker.solve_store_issued) {
+            tracker.stage2_pending = true;  // chunk loaded: run the solve unit
+            return;
+        }
+        tracker.solve_store_issued = false;
+        advance_solve(tracker, cycle);
+        return;
+    case cmd::Opcode::StoreFactor:
+        if (all_jobs_settled()) {
+            finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+        }
+        return;
+    case cmd::Opcode::LoadFront:
+    case cmd::Opcode::StoreUpdate:
+        finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+        return;
+    default:
+        return;
+    }
+}
+
+std::uint64_t CommandDevice::requeue_dma_job(
+    Tracker& tracker,
+    const dp::DmaRequest& request,
+    std::uint64_t cycle) {
+    DmaArbiter::Job job;
+    job.front_tag = tracker.command.node_id;
+    job.command_id = tracker.command.command_id;
+    job.node_id = tracker.command.node_id;
+    job.request = request;
+    const std::uint64_t job_id = dma_arbiter_.enqueue(std::move(job), cycle);
+    if (job_id == 0) {
+        ++tracker.stall_dma;
+        return 0;
+    }
+    job_map_[job_id] = tracker.command.command_id;
+    return job_id;  // logical job was already counted when first submitted
+}
+
+void CommandDevice::handle_exec_response(
+    Tracker& tracker,
+    const ExecResponse& response,
+    std::uint64_t cycle) {
+    tracker.unit_active = false;
+    tracker.pivot_count = response.pivot_count;
+    tracker.overflow_count = response.overflow_count;
+    tracker.bytes_read += response.bytes_read;
+    tracker.bytes_written += response.bytes_written;
+    if (response.status != cmd::StatusCode::Ok) {
+        release_command_resources(tracker, cycle);
+        finish_command(tracker, response.status, response.reason, cycle);
+        return;
+    }
+    const auto opcode = tracker.command.opcode;
+    if (response.needs_pvector_write) {
+        // Phase 3 records the need; the p-vector write is issued in the same
+        // update phase's retry step and awaited before completion.
+        tracker.pvector_pending = true;
+        tracker.pvector_request_id = 0;
+        tracker.phase = Tracker::Phase::PostExec;
+        return;
+    }
+    release_command_resources(tracker, cycle);
+    if (opcode == cmd::Opcode::SolveForward ||
+        opcode == cmd::Opcode::SolveBackward) {
+        tracker.solve_store_pending = true;
+        return;
+    }
+    finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+}
+
+void CommandDevice::handle_pvector_done(
+    Tracker& tracker,
+    const dp::MemoryResponse& response,
+    std::uint64_t cycle) {
+    tracker.pvector_pending = false;
+    tracker.bytes_written += response.bytes;
+    release_command_resources(tracker, cycle);
+    if (tracker.aborted) {
+        // Aborted while the output write was in flight: the write may have
+        // landed, but the command must not report success.
+        finish_command(
+            tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+        return;
+    }
+    if (response.status != cmd::StatusCode::Ok) {
+        finish_command(tracker, response.status, response.reason, cycle);
+        return;
+    }
+    finish_command(tracker, cmd::StatusCode::Ok, "", cycle);
+}
+
+void CommandDevice::release_command_resources(Tracker& tracker, std::uint64_t cycle) {
+    if (tracker.has_front_lease) {
+        if (tracker.front_write_lease) {
+            plane_.buffers().end_write(
+                tracker.front_lease.lease_id, tracker.front_lease.length, cycle);
+        } else {
+            plane_.buffers().release_lease(tracker.front_lease.lease_id, cycle);
+        }
+        tracker.has_front_lease = false;
+        tracker.front_write_lease = false;
+    }
+    if (tracker.has_temp_lease) {
+        if (tracker.temp_lease.write) {
+            plane_.buffers().end_write(
+                tracker.temp_lease.lease_id, tracker.temp_lease.length, cycle);
+        } else {
+            plane_.buffers().release_lease(tracker.temp_lease.lease_id, cycle);
+        }
+        tracker.has_temp_lease = false;
+    }
+}
+
+void CommandDevice::finish_command(
+    Tracker& tracker,
+    cmd::StatusCode status,
+    const std::string& reason,
+    std::uint64_t cycle) {
+    if (tracker.finish_cycle != 0 || tracker.phase == Tracker::Phase::Completing ||
+        tracker.phase == Tracker::Phase::Done) {
+        return;
+    }
+    release_command_resources(tracker, cycle);
+    tracker.status = status;
+    tracker.reason = reason;
+    tracker.finish_cycle = cycle;
+    if (tracker.front_slot_index != cmd::NONE &&
+        tracker.front_slot_index < front_slots_.size()) {
+        front_slots_[tracker.front_slot_index].busy = false;
+    }
+    const std::uint64_t end = tracker.start_cycle != 0 ? tracker.start_cycle : cycle;
+    tracker.stall_window = end > tracker.fetch_cycle ? end - tracker.fetch_cycle : 0;
+    tracker.phase = Tracker::Phase::PostExec;
+    enqueue_completion(tracker, cycle);
+}
+
+void CommandDevice::enqueue_completion(Tracker& tracker, std::uint64_t cycle) {
+    CompletionWriter::Item item;
+    item.slot = tracker.command.command_id;
+    item.record.command_id = tracker.command.command_id;
+    item.record.node_id = tracker.command.node_id;
+    item.record.status_code = tracker.status;
+    item.record.pivot_count = tracker.pivot_count;
+    item.record.start_cycle = tracker.start_cycle;
+    item.record.finish_cycle = tracker.finish_cycle;
+    item.record.read_bytes = tracker.bytes_read;
+    item.record.write_bytes = tracker.bytes_written;
+    // Mutually exclusive per-tick wait classes only; stall_window measures the
+    // whole pre-start residency and must not be added on top.
+    item.record.stall_cycles =
+        tracker.stall_dep + tracker.stall_resource + tracker.stall_dma;
+    item.record.overflow_count = tracker.overflow_count;
+    item.record.retry_count = 0;
+    if (!completion_writer_.enqueue(item, cycle)) {
+        return;  // queue backpressure: retried from update_phase
+    }
+    tracker.phase = Tracker::Phase::Completing;
+}
+
+void CommandDevice::drain_completion_results(std::uint64_t cycle) {
+    std::uint32_t slot = 0;
+    bool confirmed = false;
+    while (completion_writer_.take_result(slot, confirmed)) {
+        Tracker* tracker = find_tracker(slot);
+        if (tracker == nullptr || tracker->phase == Tracker::Phase::Done) {
+            continue;
+        }
+        tracker->phase = Tracker::Phase::Done;
+        ++completed_commands_;
+        completion_status_[slot] = tracker->status;
+        const bool ready = confirmed && tracker->status == cmd::StatusCode::Ok;
+        scoreboard_.signal(
+            tracker->command.signal_token,
+            ready ? TokenScoreboard::State::Ready : TokenScoreboard::State::Failed,
+            tracker->command.command_id);
+
+        CommandStats stats;
+        stats.command_id = tracker->command.command_id;
+        stats.node_id = tracker->command.node_id;
+        stats.opcode = std::to_string(
+            static_cast<std::uint32_t>(tracker->command.opcode));
+        stats.unit_kind =
+            tracker->unit_id == cmd::NONE ? "" : unit_kind_name(tracker->unit_kind);
+        stats.unit_id = tracker->unit_id == cmd::NONE
+                            ? -1
+                            : static_cast<std::int32_t>(tracker->unit_id);
+        stats.fetch_cycle = tracker->fetch_cycle;
+        stats.admit_cycle = tracker->admit_cycle;
+        stats.start_cycle = tracker->start_cycle;
+        stats.finish_cycle = tracker->finish_cycle;
+        stats.completion_cycle = cycle;
+        stats.status = dp::status_name(tracker->status);
+        stats.reason = tracker->reason;
+        stats.bytes_read = tracker->bytes_read;
+        stats.bytes_written = tracker->bytes_written;
+        stats.stall_window = tracker->stall_window;
+        stats.stall_dep = tracker->stall_dep;
+        stats.stall_resource = tracker->stall_resource;
+        stats.stall_dma = tracker->stall_dma;
+        stats.stall_cycles =
+            tracker->stall_dep + tracker->stall_resource + tracker->stall_dma;
+        stats.pivot_count = tracker->pivot_count;
+        stats.overflow_count = tracker->overflow_count;
+        stats.dma_jobs = tracker->dma_jobs_total;
+        command_stats_.push_back(stats);
+
+        if (tracker->owns_temp) {
+            const std::string owner =
+                "solve:" + std::to_string(tracker->command.command_id);
+            plane_.buffers().release(
+                dp::BufferHandle{
+                    tracker->context_slot,
+                    plane_.buffers().generation(tracker->context_slot)},
+                owner,
+                cycle);
+            tracker->owns_temp = false;
+        }
+        maybe_cleanup_node(tracker->command.node_id, cycle);
+    }
+}
+
+void CommandDevice::maybe_cleanup_node(std::uint32_t node_id, std::uint64_t cycle) {
+    if (commit_seen_.count(node_id) == 0 && aborted_nodes_.count(node_id) == 0) {
+        return;  // the node's command stream is not finished yet
+    }
+    const auto context_index = context_for_node(node_id);
+    if (!context_index.has_value()) {
+        return;
+    }
+    for (const auto& tracker : trackers_) {
+        if (tracker->command.node_id != node_id ||
+            tracker->phase == Tracker::Phase::Done) {
+            continue;
+        }
+        // Slot-referencing commands of the node block cleanup until they are
+        // terminal; SOLVE commands of the same node use their own scratch and
+        // must not block the release.
+        if (opcode_touches_front(tracker->command.opcode)) {
+            return;
+        }
+    }
+    // The scheduler pulls commands out of order, so later commands of the node
+    // may still sit in the fetch FIFO; releasing the slots while they are
+    // untracked would break them.
+    for (std::size_t index = 0; index < fetch_.window_size(); ++index) {
+        const auto& command = fetch_.at(index);
+        if (command.node_id == node_id && opcode_touches_front(command.opcode)) {
+            return;
+        }
+    }
+    auto& slot = front_slots_[*context_index];
+    const std::string owner = slot.owner;
+    plane_.buffers().release(slot.front, owner, cycle);
+    plane_.buffers().release(slot.temp, owner, cycle);
+    FrontBusyRecord record;
+    record.slot = slot.front.slot;
+    record.node_id = slot.node_id;
+    record.start = slot.occupy_start;
+    record.finish = cycle;
+    front_records_.push_back(record);
+    slot.active = false;
+}
+
+void CommandDevice::abort_node(std::uint32_t node_id) {
+    const std::uint64_t cycle = plane_.cycle();
+    aborted_nodes_.insert(node_id);
+    // Queued DMA jobs never ran a beat: drop them and count them as cancelled
+    // so the tracker only waits for actual in-flight transactions.
+    for (const auto job_id : dma_arbiter_.drop_queued(node_id)) {
+        const auto mapping = job_map_.find(job_id);
+        if (mapping != job_map_.end()) {
+            Tracker* tracker = find_tracker(mapping->second);
+            if (tracker != nullptr) {
+                tracker->dma_jobs_cancelled += 1;
+            }
+            job_map_.erase(mapping);
+        }
+    }
+    for (auto& tracker : trackers_) {
+        if (tracker->command.node_id != node_id ||
+            tracker->phase == Tracker::Phase::Done ||
+            tracker->phase == Tracker::Phase::Completing) {
+            continue;
+        }
+        if (tracker->phase == Tracker::Phase::PostExec) {
+            if (tracker->finish_cycle != 0 || !tracker->pvector_pending) {
+                continue;  // outputs are done; the command already commits
+            }
+            // Output writes are still in flight: the command must not publish
+            // a success token after the abort. It terminates as ABORTED once
+            // the in-flight write settles.
+            tracker->aborted = true;
+            if (tracker->pvector_request_id == 0) {
+                tracker->pvector_pending = false;
+                release_command_resources(*tracker, cycle);
+                finish_command(
+                    *tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+            }
+            continue;
+        }
+        tracker->aborted = true;
+        // Staged work that was never submitted is not awaited.
+        tracker->solve_load_pending = false;
+        tracker->solve_store_pending = false;
+        tracker->stage2_pending = false;
+        tracker->job_retries.clear();
+        if (tracker->unit_active) {
+            for (auto& unit : units_) {
+                if (unit->unit_id() == tracker->unit_id &&
+                    unit->kind() == tracker->unit_kind) {
+                    unit->abort_epoch(epoch_, cycle);
+                }
+            }
+            tracker->unit_active = false;
+            const auto record = open_unit_records_.find(tracker->txn_id);
+            if (record != open_unit_records_.end()) {
+                UnitBusyRecord busy = record->second;
+                busy.finish = cycle;
+                unit_records_.push_back(busy);
+                open_unit_records_.erase(record);
+            }
+            release_command_resources(*tracker, cycle);
+        }
+        if (tracker->dma_jobs_done + tracker->dma_jobs_cancelled <
+            tracker->dma_jobs_total) {
+            // The in-flight DMA job cannot be cancelled; it finishes normally
+            // and the tracker then terminates as Aborted. Its writes are not
+            // rolled back.
+            continue;
+        }
+        finish_command(*tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+    }
+}
+
+void CommandDevice::reset() {
+    plane_.reset();
+    fetch_.reset();
+    completion_writer_.reset();
+    dma_arbiter_.reset();
+    plane_.set_memory_sink(dp::MemoryClient::CommandFetch, &fetch_);
+    plane_.set_memory_sink(dp::MemoryClient::CompletionWriter, &completion_writer_);
+    plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
+    for (auto& unit : units_) {
+        unit->reset();
+    }
+    scoreboard_ = TokenScoreboard();
+    scoreboard_.init(plane_.boot().token_count);
+    trackers_.clear();
+    front_slots_.clear();
+    front_slots_.resize(config_.max_resident_fronts);
+    aborted_nodes_.clear();
+    commit_seen_.clear();
+    completion_status_.clear();
+    job_map_.clear();
+    txn_map_.clear();
+    pvector_map_.clear();
+    exec_inbox_.clear();
+    open_unit_records_.clear();
+    ++epoch_;
+    completed_commands_ = 0;
+    command_stats_.clear();
+    unit_records_.clear();
+    front_records_.clear();
+    fault_reason_.clear();
+    state_ = BatchState::Idle;
+}
+
+void CommandDevice::inject_failure(std::uint32_t command_id, ExecFailure failure) {
+    for (auto& unit : units_) {
+        unit->inject_failure(command_id, failure);
+    }
+}
+
+void CommandDevice::deliver_memory_response(const dp::MemoryResponse& response) {
+    exec_inbox_[response.request_id] = response;
+}
+
+std::uint32_t CommandDevice::pending_pvector_command() const {
+    for (const auto& tracker : trackers_) {
+        if (tracker->pvector_pending && tracker->finish_cycle == 0 &&
+            tracker->pvector_request_id != 0) {
+            return tracker->command.command_id;
+        }
+    }
+    return cmd::NONE;
+}
+
+bool CommandDevice::command_dma_progress(
+    std::uint32_t command_id,
+    std::uint32_t* issued,
+    std::uint32_t* done,
+    std::uint32_t* cancelled) const {
+    for (const auto& tracker : trackers_) {
+        if (tracker->command.command_id != command_id) {
+            continue;
+        }
+        if (issued != nullptr) {
+            *issued = tracker->dma_jobs_total;
+        }
+        if (done != nullptr) {
+            *done = tracker->dma_jobs_done;
+        }
+        if (cancelled != nullptr) {
+            *cancelled = tracker->dma_jobs_cancelled;
+        }
+        return true;
+    }
+    return false;
+}
+
+std::string CommandDevice::debug_dump() const {
+    std::string out;
+    for (std::uint32_t index = 0; index < front_slots_.size(); ++index) {
+        const auto& slot = front_slots_[index];
+        out += "front[" + std::to_string(index) + "] active=" +
+               std::to_string(slot.active) + " busy=" + std::to_string(slot.busy) +
+               " node=" + std::to_string(slot.node_id) + "\n";
+    }
+    for (std::uint32_t index = 0; index < config_.buffer_slot_count; ++index) {
+        out += "buf[" + std::to_string(index) + "] state=" +
+               std::to_string(static_cast<int>(plane_.buffers().state(index))) +
+               "\n";
+    }
+    out += "fetch: window=" + std::to_string(fetch_.window_size()) +
+           " fetched=" + std::to_string(fetch_.fetched_count()) +
+           " total=" + std::to_string(total_commands_) +
+           " window_full_cycles=" + std::to_string(fetch_.window_full_cycles()) +
+           "\n";
+    for (const auto& tracker : trackers_) {
+        if (tracker->phase == Tracker::Phase::Done) {
+            continue;
+        }
+        out += "cmd " + std::to_string(tracker->command.command_id) + " node " +
+               std::to_string(tracker->command.node_id) + " op " +
+               std::to_string(static_cast<std::uint32_t>(tracker->command.opcode));
+        switch (tracker->phase) {
+        case Tracker::Phase::InWindow: out += " phase=InWindow"; break;
+        case Tracker::Phase::Resolving:
+            out += " phase=Resolving resolve_pending=" +
+                   std::to_string(tracker->resolve_pending) + " wait_id=" +
+                   std::to_string(tracker->wait_request_id) +
+                   " waits_ready=" + std::to_string(tracker->waits_ready);
+            break;
+        case Tracker::Phase::Waiting:
+            out += " phase=Waiting waits_ready=" + std::to_string(tracker->waits_ready);
+            break;
+        case Tracker::Phase::Running:
+            out += " phase=Running dma=" + std::to_string(tracker->dma_jobs_done) +
+                   "+c" + std::to_string(tracker->dma_jobs_cancelled) +
+                   "/" + std::to_string(tracker->dma_jobs_total) +
+                   " retries=" + std::to_string(tracker->job_retries.size()) +
+                   " unit=" + std::to_string(tracker->unit_active) +
+                   " stage2=" + std::to_string(tracker->stage2_pending) +
+                   " store=" + std::to_string(tracker->solve_store_pending);
+            break;
+        case Tracker::Phase::PostExec:
+            out += " phase=PostExec pvector=" + std::to_string(tracker->pvector_pending);
+            break;
+        case Tracker::Phase::Completing: out += " phase=Completing"; break;
+        case Tracker::Phase::Done: break;
+        }
+        out += " stalls(res=" + std::to_string(tracker->stall_resource) +
+               ",dma=" + std::to_string(tracker->stall_dma) +
+               ") owns_temp=" + std::to_string(tracker->owns_temp) +
+               " view=" + std::to_string(tracker->view_ready) + " waits=[";
+        for (const auto token : tracker->waits) {
+            out += std::to_string(token) + ":" +
+                   std::to_string(static_cast<int>(scoreboard_.state(token))) + " ";
+        }
+        out += "]\n";
+    }
+    return out;
+}
+
+void CommandDevice::write_reports(const std::string& output_dir) const {
+    std::filesystem::create_directories(output_dir);
+    plane_.trace().write_csv(output_dir);
+
+    {
+        std::ofstream out(output_dir + "/commands.csv");
+        out << "command_id,node_id,opcode,unit_kind,unit_id,fetch_cycle,admit_cycle,"
+               "start_cycle,finish_cycle,completion_cycle,status,reason,bytes_read,"
+               "bytes_written,stall_window,stall_cycles,stall_dep,stall_resource,"
+               "stall_dma,pivot_count,overflow_count,dma_jobs\n";
+        for (const auto& row : command_stats_) {
+            out << row.command_id << ',' << row.node_id << ',' << row.opcode << ','
+                << row.unit_kind << ',' << row.unit_id << ',' << row.fetch_cycle << ','
+                << row.admit_cycle << ',' << row.start_cycle << ',' << row.finish_cycle
+                << ',' << row.completion_cycle << ',' << row.status << ','
+                << row.reason << ',' << row.bytes_read << ',' << row.bytes_written
+                << ',' << row.stall_window << ',' << row.stall_cycles << ','
+                << row.stall_dep << ',' << row.stall_resource << ','
+                << row.stall_dma << ',' << row.pivot_count << ','
+                << row.overflow_count << ',' << row.dma_jobs << '\n';
+        }
+    }
+    {
+        std::ofstream out(output_dir + "/units.csv");
+        out << "kind,unit_id,command_id,node_id,start_cycle,finish_cycle\n";
+        for (const auto& row : unit_records_) {
+            out << row.kind << ',' << row.unit_id << ',' << row.command_id << ','
+                << row.node_id << ',' << row.start << ',' << row.finish << '\n';
+        }
+    }
+    {
+        std::ofstream out(output_dir + "/fronts.csv");
+        out << "slot,node_id,occupy_start,occupy_end\n";
+        for (const auto& row : front_records_) {
+            out << row.slot << ',' << row.node_id << ',' << row.start << ','
+                << row.finish << '\n';
+        }
+    }
+    {
+        std::ofstream out(output_dir + "/summary.json");
+        out << "{\n"
+            << "  \"tool\": \"t05_command_control_plane\",\n"
+            << "  \"execution_backend\": \"" << exec_backend_name(config_.backend)
+            << "\",\n"
+            << "  \"control_flow_pass\": "
+            << (state_ == BatchState::Completed ? "true" : "false") << ",\n"
+            << "  \"numerical_validation\": \"not_performed\",\n"
+            << "  \"batch_state\": \"" << batch_state_name(state_) << "\",\n"
+            << "  \"fault_reason\": \"" << fault_reason_ << "\",\n"
+            << "  \"cycles\": " << plane_.cycle() << ",\n"
+            << "  \"commands\": " << command_stats_.size() << ",\n"
+            << "  \"completions_written\": " << completion_writer_.written_count()
+            << ",\n"
+            << "  \"config\": {\n"
+            << "    \"max_resident_fronts\": " << config_.max_resident_fronts
+            << ",\n"
+            << "    \"panel_unit_count\": " << config_.panel_unit_count << ",\n"
+            << "    \"trsm_unit_count\": " << config_.trsm_unit_count << ",\n"
+            << "    \"gemm_unit_count\": " << config_.gemm_unit_count << ",\n"
+            << "    \"solve_unit_count\": " << config_.solve_unit_count << ",\n"
+            << "    \"assemble_unit_count\": " << config_.assemble_unit_count
+            << ",\n"
+            << "    \"buffer_slot_count\": " << config_.buffer_slot_count << ",\n"
+            << "    \"buffer_capacity_bytes\": " << config_.buffer_capacity_bytes
+            << ",\n"
+            << "    \"command_window_depth\": " << config_.command_window_depth
+            << "\n"
+            << "  }\n"
+            << "}\n";
+    }
+}
+
+}  // namespace hw::controlplane

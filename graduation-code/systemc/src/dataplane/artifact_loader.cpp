@@ -602,6 +602,55 @@ void validate_nodes(const json& manifest, const ArtifactProbe& probe) {
     if (seen_commands.size() != probe.commands->size()) {
         fail("manifest does not assign every command to a node");
     }
+
+    // Admission contract: NODE_BEGIN must wait on the completion token of
+    // every child so the device never has to infer the elimination forest.
+    std::map<std::uint32_t, std::uint32_t> begin_command;
+    std::map<std::uint32_t, std::uint32_t> commit_token;
+    for (const auto& command : *probe.commands) {
+        if (command.opcode == cmd::Opcode::NodeBegin) {
+            begin_command[command.node_id] = command.command_id;
+        } else if (command.opcode == cmd::Opcode::NodeCommit) {
+            commit_token[command.node_id] = command.signal_token;
+        }
+    }
+    for (std::uint32_t node_id = 0; node_id < node_count; ++node_id) {
+        std::vector<std::uint32_t> children;
+        for (std::uint32_t child = 0; child < node_count; ++child) {
+            if (parent.at(child).get<std::int64_t>() == static_cast<std::int64_t>(node_id)) {
+                children.push_back(child);
+            }
+        }
+        if (children.empty()) {
+            continue;
+        }
+        const auto begin = begin_command.find(node_id);
+        if (begin == begin_command.end() || commit_token.find(node_id) == commit_token.end()) {
+            fail("node " + std::to_string(node_id) + " is missing NODE_BEGIN or NODE_COMMIT");
+        }
+        const auto& begin_cmd = probe.commands->at(begin->second);
+        if (begin_cmd.wait_list_id == cmd::NONE) {
+            fail("node " + std::to_string(node_id) +
+                 " NODE_BEGIN is missing its admission dependency");
+        }
+        const auto dependency = descriptor_at(probe, begin_cmd.wait_list_id, "admission");
+        if (dependency.descriptor_type != cmd::DescriptorType::Dependency) {
+            fail("NODE_BEGIN wait_list_id is not a DEPENDENCY_DESC");
+        }
+        const auto waits = cmd::DescriptorCodec::dependency_tokens(
+            dependency, *probe.image, probe.config->token_count, probe.config->max_wait_tokens);
+        const std::set<std::uint32_t> wait_set(waits.begin(), waits.end());
+        for (const auto child : children) {
+            const auto token = commit_token.find(child);
+            if (token == commit_token.end() || wait_set.count(token->second) == 0) {
+                fail(
+                    "node " + std::to_string(node_id) +
+                    " NODE_BEGIN must wait for child " + std::to_string(child) +
+                    " to complete");
+            }
+        }
+    }
+
     if (probe.config->token_count != 0) {
         std::set<std::uint32_t> signals;
         for (const auto& command : *probe.commands) {

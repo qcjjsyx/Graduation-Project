@@ -195,3 +195,74 @@ def test_p_vector_regions_hold_the_unset_sentinel():
         for descriptor in artifact.descriptors
         if descriptor.descriptor_type == DescriptorType.FRONT_DESC
     }
+
+
+def _two_root_fixture():
+    nodes = [
+        NodeCompileRecord(0, -1, NodeRange(0, 1), (0, 1)),
+        NodeCompileRecord(1, -1, NodeRange(1, 2), (1, 2)),
+    ]
+    maps: list[list[MapTableEntry]] = [[], []]
+    fronts = [
+        np.array([[4.0, 1.0], [2.0, 3.0]], dtype=np.float64),
+        np.array([[5.0, 0.5], [0.5, 6.0]], dtype=np.float64),
+    ]
+    return compile_command_artifact(
+        nodes=nodes,
+        map_tables=maps,
+        local_fronts=fronts,
+        permutation=[0, 1, 2],
+        rhs=np.array([1.0, 2.0, 3.0]),
+        config=CommandCompilerConfig(),
+        pivot=PivotPolicyConfig(),
+    )
+
+
+def test_independent_fronts_interleave_round_robin():
+    artifact = _two_root_fixture()
+    body = [c for c in artifact.commands if c.opcode != Opcode.SOLVE_FORWARD and c.opcode != Opcode.SOLVE_BACKWARD]
+    owners = [c.node_id for c in body]
+    alternations = sum(1 for a, b in zip(owners, owners[1:]) if a != b)
+    # Two ready nodes take turns: consecutive commands of the block phase keep
+    # switching between the two independent fronts.
+    assert alternations == len(owners) - 1
+    assert owners[0] == 0 and owners[1] == 1
+
+
+def test_node_begin_waits_on_child_completion_token():
+    artifact = _tree_fixture()
+    commands = artifact.commands
+    child_commit = next(
+        c for c in commands if c.node_id == 0 and c.opcode == Opcode.NODE_COMMIT
+    )
+    parent_begin = next(
+        c for c in commands if c.node_id == 1 and c.opcode == Opcode.NODE_BEGIN
+    )
+    waits = artifact.descriptors[parent_begin.wait_list_id].dependency_tokens(
+        artifact.image, token_count=len(commands)
+    )
+    assert child_commit.signal_token in waits
+    assert parent_begin.command_id > child_commit.command_id
+
+
+def test_interleaved_stream_keeps_order_invariants():
+    artifact = _two_root_fixture()
+    commands = artifact.commands
+    assert [c.command_id for c in commands] == list(range(len(commands)))
+    assert [c.signal_token for c in commands] == list(range(len(commands)))
+    for command in commands:
+        if command.wait_list_id == 0xFFFFFFFF:
+            continue
+        waits = artifact.descriptors[command.wait_list_id].dependency_tokens(
+            artifact.image, token_count=len(commands)
+        )
+        assert all(token < command.command_id for token in waits)
+    # Solve phase stays trailing (forward chain then backward chain).
+    first_solve = min(
+        i for i, c in enumerate(commands) if c.opcode in (Opcode.SOLVE_FORWARD, Opcode.SOLVE_BACKWARD)
+    )
+    assert all(
+        c.opcode in (Opcode.SOLVE_FORWARD, Opcode.SOLVE_BACKWARD)
+        for c in commands[first_solve:]
+    )
+    assert commands[-1].opcode == Opcode.SOLVE_BACKWARD

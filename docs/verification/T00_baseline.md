@@ -167,6 +167,8 @@ ctest --test-dir build --output-on-failure
 
 - T01（command/descriptor/status 契约）实现时，必须保留旧 CLI `--mode fp64|fixed|both` 可运行（迁移期不得删除旧入口），并维持相同输入下产物字节稳定（本基线已验证 fp64/fixed 复现性）。
 - 本基线固定的小型夹具（n=16/density=0.2/seed=3/rhs-seed=11/amd）与真实矩阵（256X256JJ.mat + 256fuv.mat）可直接作为 T01/T02 的回归输入。
-- fixed 路径在真实矩阵上的大解误差与精度救援是既有限制；后续精度/后端工作（T11、T13、T16）需单独报告，不得用黄金结果覆盖设备路径。
-- RTL 联调（T14/T15）前需先安装仿真器（iverilog/verilator）并补齐 `gcu_top` 等占位模块；当前环境无仿真器，L4 级验证暂缓。
+> 以下后续任务引用已于 2026-09-27 按新编号更新；不改变本基线记录的实现状态和实验结果。
+
+- fixed 路径在真实矩阵上的大解误差与精度救援是既有限制；后续精度/后端工作（T10、T12、T16）需单独报告，不得用黄金结果覆盖设备路径。
+- RTL 联调（T13/T15）前需先安装仿真器（iverilog/verilator）并补齐 `gcu_top` 等占位模块；当前环境无仿真器，L4 级验证暂缓。
 - 历史目录 `optimization-v1/v2/v3`、`archive/`、`unused/` 仅只读，本基线未读取其代码、未复制其逻辑回主线。

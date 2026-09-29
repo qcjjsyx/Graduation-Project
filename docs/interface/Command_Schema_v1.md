@@ -330,9 +330,9 @@ saturation_policy
 overflow_policy
 ```
 
-INT32 量化是否采用二的幂 scale、具体累加宽度和 tile 级策略在 T11 冻结；T01 只冻结引用边界和“不扩散到整棵树”的原则。
+INT32 量化是否采用二的幂 scale、具体累加宽度和 tile 级策略在 T10 冻结；T01 只冻结引用边界和“不扩散到整棵树”的原则。
 
-`SCALE_DESC` 的核心参数使用 word 0–5，具体布局为 `scale_a/scale_b/output_scale/rounding_mode/saturation_policy/overflow_policy`；word 6–9 必须为 0。具体数值编码和计算策略在 T11 冻结。
+`SCALE_DESC` 的核心参数使用 word 0–5，具体布局为 `scale_a/scale_b/output_scale/rounding_mode/saturation_policy/overflow_policy`；word 6–9 必须为 0。具体数值编码和计算策略在 T10 冻结。
 
 ### 5.9 DEPENDENCY_DESC
 

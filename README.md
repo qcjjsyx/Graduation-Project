@@ -43,6 +43,10 @@ selected RTL prototypes
 
 当前 artifact 是 Command/Descriptor schema v2：32B command、64B descriptor、64B completion 和同一 `memory_image.bin` 中的显式数据区域。`FRONT_DESC` 显式携带主元策略：默认 `STATIC`（软件数值预处理 + 硬件固定主元顺序，旁路 HPU/ATU 动态映射），`DYNAMIC_PANEL` 为显式可选能力（仅限 pivot block 内选主元）。旧 `NodeTask` ABI v2 已归档，与 schema v2 无关，不参与当前构建。
 
+当前推进顺序：T00–T05 已实现，T05 仅验证 test stub 控制流；下一步先完成 T06 STATIC Panel-LU 设计并协调 T08，再推进正式数值 kernel 与 T11/T12 STATIC 闭环。T14 HPU/ATU 契约统一后移至该闭环之后，按新编号执行，原有交付要求保留；T13/T15 仍依赖 T14。详见 [任务说明书](docs/项目实现任务说明书.md) 和 [当前任务状态](todo.md)。
+
+2026-09-28 已确认的下一阶段架构：Panel/TRSM/GEMM 共用多模式 PE 池，采用 16×16 tile 和任务粒度模拟，保留全 front 扫描及主元冻结语义。详见 [计算架构基线](docs/architecture/多模式PE与16x16分块计算基线.md)。T06 交付硬件设计与可编译接口/时序原型；当前代码尚未迁移。
+
 ## 当前代码目录
 
 ```text

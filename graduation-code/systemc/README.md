@@ -6,6 +6,15 @@
 - `include/dataplane/`、`src/dataplane/`：T04 Command 数据面（ArtifactLoader、
   DeviceMemory/RegionRegistry、MemoryService、DescriptorReader、BufferManager、
   DmaEngine、Trace、DataPlane 编排、selftest）；
+- `include/controlplane/`、`src/controlplane/`：T05 Command 控制面
+  （CommandFetch、TokenScoreboard、双 front 调度、共享单元池、TestStubUnit、
+  DmaArbiter、CompletionWriter、CommandDevice 顶层）；
+- `include/panel_lu/`、`src/panel_lu/`：T06 Panel-LU 硬件架构原型
+  （内部 task/config/response 契约、16×16 多模式 PE、有界 dispatcher/
+  scoreboard、Panel controller、tile store、合成负载 FP32 tile 原语）；
+  原型标记 `architecture_prototype=true`、`numerical_validation=not_performed`，
+  未接入 `CommandDevice`，不是正式数值后端；设计见
+  `docs/architecture/Panel-LU架构设计.md`；
 - `reference/`：独立 FP64 数学参考（`PivotPolicy`/`PivotFailure`、
   `panel_lu_policy` 与通用 `panel_lu` 分离；`tools/fp64_reference_smoke`
   为数值冒烟入口）；
@@ -17,7 +26,17 @@
 - `tests/dataplane_core_tests.cpp`：普通 C++ 数据/校验层测试；
 - `tests/dataplane_systemc_tests.cpp`：SystemC 时序测试（sc_clock 驱动）；
 - `tests/dataplane_artifact_tests.cpp`：真实 artifact 集成测试；
-- `tools/t04_fixture_gen.py`：用当前软件编译器生成 T04 设备运行目录。
+- `tests/controlplane_core_tests.cpp`：控制面核心/负面测试（含独立解释器对照）；
+- `tests/controlplane_systemc_tests.cpp`：sc_clock 驱动的控制面时序测试；
+- `tests/controlplane_artifact_tests.cpp`：真实 artifact 控制流集成测试；
+- `tests/panel_lu_prototype_tests.cpp`：T06 原型核心测试（tile/尾块/非法配置、
+  PE 排他、队列/端口/写回背压、同目标顺序、定向 abort/reset、手算时延、
+  trace 可复现）；
+- `tests/panel_lu_systemc_tests.cpp`：sc_clock 驱动的 T06 时序测试
+  （与纯 C++ tick 模型逐周期对照）；
+- `src/command_device_smoke.cpp`：T05 控制流冒烟入口；
+- `src/panel_lu_prototype_smoke.cpp`：T06 尾块/混合负载 trace 生成入口；
+- `tools/t04_fixture_gen.py`：用当前软件编译器生成设备运行目录。
 
 原先由 `NodeTask/ABI v2` 驱动的 `system_sim`、artifact loader、memory
 container、fixed/global-BFP kernel 和回归脚本已经退役并归档到：
@@ -58,7 +77,13 @@ DYNAMIC_PANEL/256 阶设备运行目录，然后运行：
 - `dataplane_artifact_tests`：真实 artifact 的
   descriptor → DMA → buffer → 消费者拷贝 → DMA 写回闭环；
 - `dataplane_smoke`：可复现冒烟入口，输出 `transactions.csv`、
-  `buffers.csv`、`summary.json`、`final_memory_image.bin`。
+  `buffers.csv`、`summary.json`、`final_memory_image.bin`；
+- `controlplane_core_tests` / `controlplane_systemc_tests` /
+  `controlplane_artifact_tests` / `command_device_smoke`：T05 控制面测试与冒烟
+  （输出 `commands.csv`、`units.csv`、`fronts.csv`、`summary.json`）；
+- `panel_lu_prototype_tests` / `panel_lu_systemc_tests` /
+  `panel_lu_smoke_tail` / `panel_lu_smoke_mixed`：T06 架构原型测试与 trace
+  （合成负载、`numerical_validation=not_performed`；CTest 合计 16 项）。
 
 单独复现加载—搬运—写回：
 
@@ -71,6 +96,29 @@ DYNAMIC_PANEL/256 阶设备运行目录，然后运行：
 设备运行目录只需要 `manifest.json` 与 `memory_image.bin`；golden/reference
 文件不是设备数据来源，缺失不影响加载与数据面运行。
 
-后续 T05 在本目录的 `dataplane` 之上实现 Command Fetch、GCU/token
-scoreboard、资源调度与 completion 写回；数值 kernel（Panel-LU/TRSM/GEMM）
-按后续任务实现。T04 不执行命令、不写 completion、不做数值计算。
+T06 原型 trace（合成负载，非数值 backend）：
+
+```bash
+/tmp/t04-build/panel_lu_prototype_smoke --mode tail --front-dim 23 --pivot-dim 23 \
+  --pe-count 1 --trace-dir /tmp/t06-output/tail_p23_pe1
+/tmp/t04-build/panel_lu_prototype_smoke --mode mixed --front-dim 40 --pivot-dim 40 \
+  --pe-count 2 --trace-dir /tmp/t06-output/mixed_p40_pe2
+```
+
+输出 `panel_tasks.csv`、`panel_commands.csv`、`panel_events.csv`、
+`panel_summary.json`（含 `architecture_prototype=true`、
+`numerical_validation=not_performed`）。诊断用可选参数：
+`--div-latency N`（角除法/倒数延迟，验证 TRSM_RIGHT 敏感性）、
+`--task-id-base N`（uint64 task id 基址，验证跨 UINT32_MAX 不截断）。
+
+T05 在 `dataplane` 之上实现了 Command Fetch、token scoreboard、双 front
+调度与 completion 写回；数值 kernel（Panel-LU/TRSM/GEMM/solve）按后续任务
+实现，当前仅以显式启用的测试执行单元（test stub）验证控制流，结果标记
+`execution_backend=test_stub`、`numerical_validation=not_performed`。
+控制流冒烟：
+
+```bash
+/tmp/t04-build/command_device_smoke \
+  --device-dir /tmp/t04-build/t04_fixtures/multiroot_static/device \
+  --out /tmp/t05-output/smoke
+```

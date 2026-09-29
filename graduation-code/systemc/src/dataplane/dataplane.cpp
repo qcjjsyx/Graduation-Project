@@ -12,8 +12,12 @@ DataPlane::DataPlane(LoadedArtifact artifact, DataPlaneConfig config)
       dma_(config.dma, memory_service_, buffers_, &trace_),
       reader_(memory_service_, artifact_.config, &trace_) {}
 
-std::uint64_t DataPlane::step() {
+std::uint64_t DataPlane::begin_tick() {
     ++cycle_;
+    return cycle_;
+}
+
+void DataPlane::tick_memory_and_route() {
     memory_service_.tick(cycle_);
     MemoryResponse response;
     while (memory_service_.try_pop_response(response)) {
@@ -27,14 +31,54 @@ std::uint64_t DataPlane::step() {
         case MemoryClient::Dma:
             dma_.deliver_memory_response(response);
             break;
+        case MemoryClient::CommandFetch:
+            if (command_fetch_sink_ != nullptr) {
+                command_fetch_sink_->deliver_memory_response(response);
+            }
+            break;
+        case MemoryClient::CompletionWriter:
+            if (completion_writer_sink_ != nullptr) {
+                completion_writer_sink_->deliver_memory_response(response);
+            }
+            break;
+        case MemoryClient::ExecUnit:
+            if (exec_unit_sink_ != nullptr) {
+                exec_unit_sink_->deliver_memory_response(response);
+            }
+            break;
         case MemoryClient::Test:
         case MemoryClient::Other:
             break;
         }
     }
+}
+
+void DataPlane::tick_clients() {
     reader_.tick(cycle_);
     dma_.tick(cycle_);
+}
+
+std::uint64_t DataPlane::step() {
+    begin_tick();
+    tick_memory_and_route();
+    tick_clients();
     return cycle_;
+}
+
+void DataPlane::set_memory_sink(MemoryClient client, MemoryResponseSink* sink) {
+    switch (client) {
+    case MemoryClient::CommandFetch:
+        command_fetch_sink_ = sink;
+        break;
+    case MemoryClient::CompletionWriter:
+        completion_writer_sink_ = sink;
+        break;
+    case MemoryClient::ExecUnit:
+        exec_unit_sink_ = sink;
+        break;
+    default:
+        break;
+    }
 }
 
 bool DataPlane::run_until(
@@ -58,6 +102,9 @@ void DataPlane::reset() {
     buffers_.reset();
     reader_.reset();
     memory_service_.reset();
+    command_fetch_sink_ = nullptr;
+    completion_writer_sink_ = nullptr;
+    exec_unit_sink_ = nullptr;
     trace_.clear();
 }
 

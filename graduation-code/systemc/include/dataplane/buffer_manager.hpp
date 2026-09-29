@@ -58,6 +58,9 @@ struct BufferResult {
     bool ok{false};
     hw::command::StatusCode status{hw::command::StatusCode::Ok};
     std::string reason;
+    // True when the failure is temporary contention (port busy, conflicting
+    // access) and a later retry may succeed without side effects.
+    bool transient{false};
     BufferHandle handle{};
     BufferLease lease{};
 };
@@ -138,6 +141,14 @@ public:
     // Aborts an in-flight load/writeback lease (used on reset or memory
     // failure); the slot returns to its pre-lease state and no data is
     // committed.
+    // Returns a READY/DIRTY slot (without active leases) to RESERVED so the
+    // DMA load path can refill it; generation is kept so the handle stays
+    // valid. Used by the control plane to reuse scratch slots.
+    BufferResult rearm(
+        const BufferHandle& handle,
+        const std::string& owner,
+        std::uint64_t cycle);
+
     // Releases a read-only lease. Write leases must be completed with
     // end_write(); load/writeback leases with finish_load()/finish_writeback().
     hw::command::StatusCode release_lease(

@@ -37,7 +37,9 @@ struct DmaRequest {
     std::uint64_t ddr_offset{0};
     std::uint64_t ddr_row_stride{0};  // 0 => cols * element_bytes
 
-    // Scratchpad side.
+    // Scratchpad side. `owner` must match the buffer slot owner (T04 default
+    // "dma"; the control plane passes the front context owner).
+    std::string owner{"dma"};
     BufferHandle buffer{};
     std::uint64_t buffer_offset{0};
     std::uint64_t buffer_row_stride{0};  // 0 => cols * element_bytes
@@ -52,6 +54,9 @@ struct DmaResponse {
     std::uint64_t request_id{0};
     hw::command::StatusCode status{hw::command::StatusCode::Ok};
     std::string reason;
+    // Set only for failures raised before the first beat (resource
+    // contention); no data has been moved, so a retry is safe.
+    bool retryable{false};
     std::uint64_t bytes{0};
     std::uint64_t read_bytes{0};
     std::uint64_t write_bytes{0};
@@ -125,7 +130,8 @@ private:
     void fail_transfer(
         hw::command::StatusCode status,
         const std::string& reason,
-        std::uint64_t cycle);
+        std::uint64_t cycle,
+        bool retryable = false);
     void finish_transfer(std::uint64_t cycle);
     void start_next_beat(std::uint64_t cycle);
     void complete_beat(std::uint64_t cycle);

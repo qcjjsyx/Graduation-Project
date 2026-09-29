@@ -8,6 +8,9 @@ const char* memory_client_name(MemoryClient client) {
     switch (client) {
     case MemoryClient::DescriptorReader: return "descriptor_reader";
     case MemoryClient::Dma: return "dma";
+    case MemoryClient::CommandFetch: return "command_fetch";
+    case MemoryClient::CompletionWriter: return "completion_writer";
+    case MemoryClient::ExecUnit: return "exec_unit";
     case MemoryClient::Test: return "test";
     case MemoryClient::Other: return "other";
     }

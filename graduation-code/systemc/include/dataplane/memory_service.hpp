@@ -13,6 +13,9 @@ namespace hw::dataplane {
 enum class MemoryClient {
     DescriptorReader,
     Dma,
+    CommandFetch,
+    CompletionWriter,
+    ExecUnit,
     Test,
     Other,
 };
@@ -55,6 +58,15 @@ struct MemoryResponse {
     std::uint64_t epoch{0};  // MemoryService epoch at accept; reset invalidates
     MemoryRequest request;   // echo (address/length/kind/client/labels)
     std::vector<std::uint8_t> read_data;
+};
+
+// Sink for memory responses of clients other than the built-in T04
+// DescriptorReader/Dma paths. Delivery is non-blocking; the receiving module
+// processes the response in its own update phase.
+class MemoryResponseSink {
+public:
+    virtual ~MemoryResponseSink() = default;
+    virtual void deliver_memory_response(const MemoryResponse& response) = 0;
 };
 
 // Shared DDR service. Single port, FIFO, serialized; both DescriptorReader and
