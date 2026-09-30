@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -8,6 +9,7 @@
 #include "command_codec.hpp"
 #include "dataplane/buffer_manager.hpp"
 #include "dataplane/descriptor_reader.hpp"
+#include "dataplane/memory_service.hpp"
 
 namespace hw::controlplane {
 
@@ -26,6 +28,7 @@ enum class UnitKind {
     Trsm,
     Gemm,
     Solve,
+    Factor,  // real packed-LU -> persistent L/U conversion (STORE_FACTOR)
 };
 
 const char* unit_kind_name(UnitKind kind);
@@ -119,8 +122,28 @@ public:
     // Takes exactly one terminal response per accepted transaction.
     virtual bool poll_response(ExecResponse& response) = 0;
     virtual bool busy() const = 0;
+    // Directed cancellation of one accepted transaction (node abort). After it
+    // returns, the unit performs no further buffer access for that transaction;
+    // already-completed writes are not rolled back. Exactly one terminal
+    // response is still produced and consumed by the device.
+    virtual void abort_txn(std::uint64_t txn_id, std::uint64_t cycle) = 0;
     // Drops the active transaction of the given epoch; late responses vanish.
+    // Only for global reset-style semantics; directed aborts use abort_txn.
     virtual void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) = 0;
+    // Memory responses for writes this unit issued (default: not a client).
+    virtual void deliver_memory_response(const hw::dataplane::MemoryResponse& response) {
+        (void)response;
+    }
+    // True while the given memory request id belongs to an in-flight write of
+    // this unit. Used for precise response routing instead of broadcasting.
+    virtual bool handles_request(std::uint64_t request_id) const {
+        (void)request_id;
+        return false;
+    }
+    // Number of in-flight memory requests owned by this unit (diagnostics).
+    virtual std::size_t pending_request_count() const { return 0; }
+    // Command id of the currently active transaction (NONE when idle).
+    virtual std::uint32_t active_command_id() const { return hw::command::NONE; }
     virtual void reset() = 0;
 };
 

@@ -93,8 +93,53 @@ void TileStore::bump_generations() {
     }
 }
 
+std::uint32_t TileStore::version(std::uint64_t key) const {
+    return version(static_cast<std::uint32_t>(key));
+}
+
+bool TileStore::commit(std::uint64_t key, std::uint32_t expected_version) {
+    return commit(static_cast<std::uint32_t>(key), expected_version);
+}
+
 void TileStore::clear() {
     slots_.clear();
+}
+
+bool SyntheticTileAccess::read_operand_segment(
+    const TileOperand& operand,
+    std::uint32_t row,
+    std::uint32_t col_begin,
+    std::uint32_t col_count,
+    float* out_row,
+    std::uint64_t cycle) {
+    (void)cycle;
+    if (!operand.valid || !store_.assigned(operand.handle.slot)) {
+        return false;
+    }
+    const float* base = store_.data(operand.handle.slot) + operand.offset / 4;
+    const std::uint32_t stride_floats = operand.stride_bytes / 4;
+    for (std::uint32_t c = 0; c < col_count; ++c) {
+        out_row[col_begin + c] = base[row * stride_floats + col_begin + c];
+    }
+    return true;
+}
+
+bool SyntheticTileAccess::write_result(
+    const TileTask& task,
+    const float* data,
+    std::uint64_t cycle) {
+    (void)cycle;
+    if (!store_.assigned(task.dst.handle.slot)) {
+        return false;
+    }
+    float* base = store_.data(task.dst.handle.slot) + task.dst.offset / 4;
+    const std::uint32_t stride_floats = task.dst.stride_bytes / 4;
+    for (std::uint32_t r = 0; r < task.dims.m; ++r) {
+        for (std::uint32_t c = 0; c < task.dims.n; ++c) {
+            base[r * stride_floats + c] = data[r * 16 + c];
+        }
+    }
+    return true;
 }
 
 }  // namespace hw::panel_lu

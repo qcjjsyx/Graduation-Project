@@ -7,8 +7,8 @@ namespace hw::panel_lu {
 TileDispatcher::TileDispatcher(
     const PanelLuConfig& config,
     std::vector<MultiModePe>* pes,
-    TileStore* store)
-    : config_(config), pes_(pes), store_(store) {}
+    TileVersionStore* versions)
+    : config_(config), pes_(pes), versions_(versions) {}
 
 bool TileDispatcher::submit(const TileTask& task, std::uint64_t cycle, std::string* reason) {
     if (known_.count(task.task_id) != 0) {
@@ -58,19 +58,19 @@ bool TileDispatcher::dispatchable(const TileTask& task) const {
         return false;
     }
     const auto& operands = {task.dst, task.lhs, task.rhs};
-    const std::uint32_t dst_slot = task.dst.handle.slot;
-    if (store_->version(dst_slot) != task.dst.version) {
+    const std::uint64_t dst_key = task.dst.version_key;
+    if (versions_->version(dst_key) != task.dst.version) {
         return false;
     }
     for (const TileOperand& operand : operands) {
-        if (!operand.valid || operand.handle.slot == dst_slot) {
+        if (!operand.valid || operand.version_key == dst_key) {
             continue;
         }
-        if (store_->version(operand.handle.slot) < operand.version) {
+        if (versions_->version(operand.version_key) < operand.version) {
             return false;
         }
     }
-    const auto writer = uncommitted_writers_.find(dst_slot);
+    const auto writer = uncommitted_writers_.find(dst_key);
     if (writer != uncommitted_writers_.end() && !writer->second.empty()) {
         return false;
     }
@@ -158,14 +158,14 @@ bool TileDispatcher::dispatch_one(Queued& item, std::uint64_t cycle) {
             continue;
         }
         std::string reason;
-        if (!pe.try_accept(item.task, cycle, *store_, &reason)) {
+        if (!pe.try_accept(item.task, cycle, &reason)) {
             continue;
         }
         DispatchRecord& record = records_[item.task.task_id];
         record.dispatch_cycle = cycle;
         record.stall_dependency_cycles = item.stall_dependency_cycles;
         record.stall_resource_cycles = item.stall_resource_cycles;
-        uncommitted_writers_[item.task.dst.handle.slot].insert(item.task.task_id);
+        uncommitted_writers_[item.task.dst.version_key].insert(item.task.task_id);
         known_.erase(item.task.task_id);
         ++dispatched_;
         pe_cursor_ = (pe_index + 1) % pes_->size();
@@ -186,13 +186,13 @@ void TileDispatcher::forget_task(std::uint64_t task_id) {
 bool TileDispatcher::on_task_committed(
     std::uint64_t task_id,
     std::uint32_t command_id,
-    std::uint32_t slot,
+    std::uint64_t version_key,
     std::uint32_t expected_version) {
-    auto writer = uncommitted_writers_.find(slot);
+    auto writer = uncommitted_writers_.find(version_key);
     if (writer != uncommitted_writers_.end()) {
         writer->second.erase(task_id);
     }
-    const bool ok = store_->commit(slot, expected_version);
+    const bool ok = versions_->commit(version_key, expected_version);
     committed_.insert(task_id);
     committed_by_command_[command_id].insert(task_id);
     known_.erase(task_id);

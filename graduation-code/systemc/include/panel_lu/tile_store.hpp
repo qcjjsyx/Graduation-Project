@@ -13,7 +13,45 @@
 
 namespace hw::panel_lu {
 
-class TileStore {
+// Tile version table used by the dispatcher's dependency/order checks and by
+// controllers when they stamp operands. T06 keys per synthetic store slot; the
+// T07 engine keys per (front buffer slot, tile index).
+class TileVersionStore {
+public:
+    virtual ~TileVersionStore() = default;
+    virtual std::uint32_t version(std::uint64_t key) const = 0;
+    // Returns false on a stale expected version (out-of-order commit).
+    virtual bool commit(std::uint64_t key, std::uint32_t expected_version) = 0;
+};
+
+// Functional tile data path used by the multi-mode PEs. Implementations read a
+// committed operand snapshot and commit a finished result; the modeled timing
+// (load/writeback bytes) stays in the PE/dispatcher, so an implementation must
+// not add latency or bandwidth accounting of its own.
+//
+// Layout contract: `out`/`data` are 256-float (16x16, row stride 16) staging
+// tiles. read_operand_segment fills one horizontal segment [col_begin,
+// col_begin+col_count) of one row into out[col_begin..]; the PE loader drives
+// it from the bounded load budget so operand bytes are fetched through the
+// real access path under budget control. write_result extracts the valid
+// [0,m) x [0,n) region of `data`.
+class TileAccess {
+public:
+    virtual ~TileAccess() = default;
+    virtual bool read_operand_segment(
+        const TileOperand& operand,
+        std::uint32_t row,
+        std::uint32_t col_begin,
+        std::uint32_t col_count,
+        float* out_row,
+        std::uint64_t cycle) = 0;
+    virtual bool write_result(
+        const TileTask& task,
+        const float* data,
+        std::uint64_t cycle) = 0;
+};
+
+class TileStore : public TileVersionStore {
 public:
     explicit TileStore(std::uint32_t slot_count = 0);
 
@@ -42,6 +80,10 @@ public:
     // that as a control bug, not as a silent success.
     bool commit(std::uint32_t slot, std::uint32_t expected_version);
 
+    // TileVersionStore (key == slot).
+    std::uint32_t version(std::uint64_t key) const override;
+    bool commit(std::uint64_t key, std::uint32_t expected_version) override;
+
     // Invalidates all handles after a reset.
     void bump_generations();
     void clear();
@@ -61,6 +103,24 @@ private:
     void check_slot(std::uint32_t slot) const;
 
     std::vector<Slot> slots_;
+};
+
+// TileAccess over a synthetic TileStore (T06 prototype and kernel unit tests).
+class SyntheticTileAccess : public TileAccess {
+public:
+    explicit SyntheticTileAccess(TileStore& store) : store_(store) {}
+
+    bool read_operand_segment(
+        const TileOperand& operand,
+        std::uint32_t row,
+        std::uint32_t col_begin,
+        std::uint32_t col_count,
+        float* out_row,
+        std::uint64_t cycle) override;
+    bool write_result(const TileTask& task, const float* data, std::uint64_t cycle) override;
+
+private:
+    TileStore& store_;
 };
 
 // One per-cycle bandwidth budget (bytes). The owner resets it at the start of

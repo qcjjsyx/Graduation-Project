@@ -4,6 +4,16 @@
 
 namespace hw::panel_lu {
 
+const char* panel_numeric_mode_name(PanelNumericMode mode) {
+    switch (mode) {
+        case PanelNumericMode::Fp32Device:
+            return "fp32_device";
+        case PanelNumericMode::Fp64Diagnostic:
+            return "fp64_diagnostic";
+    }
+    return "unknown";
+}
+
 const char* tile_mode_name(TileMode mode) {
     switch (mode) {
         case TileMode::LuDiag:
@@ -64,7 +74,10 @@ ConfigCheck pass() {
     return check;
 }
 
-bool check_operand(const TileOperand& operand, std::string* reason) {
+bool check_operand(
+    const TileOperand& operand,
+    std::uint32_t min_row_bytes,
+    std::string* reason) {
     if (!operand.valid) {
         *reason = "operand handle not set";
         return false;
@@ -73,8 +86,8 @@ bool check_operand(const TileOperand& operand, std::string* reason) {
         *reason = "operand offset is not 4B aligned";
         return false;
     }
-    if (operand.stride_bytes % 4 != 0 || operand.stride_bytes < 64) {
-        *reason = "operand stride must be a 4B multiple and >= 64B (16 FP32)";
+    if (operand.stride_bytes % 4 != 0 || operand.stride_bytes < min_row_bytes) {
+        *reason = "operand stride must be a 4B multiple and cover the valid row width";
         return false;
     }
     return true;
@@ -175,14 +188,18 @@ ConfigCheck validate_tile_task(const TileTask& task, const PanelLuConfig& config
         case TileMode::GemmUpdate:
             break;
     }
-    if (!check_operand(task.dst, &reason)) {
+    if (!check_operand(task.dst, task.dims.n * 4, &reason)) {
         return fail(StatusCode::BadDescriptor, "dst: " + reason);
     }
     if (task.mode != TileMode::LuDiag) {
-        if (!check_operand(task.lhs, &reason)) {
+        // lhs columns: k for every mode; rhs columns: n for TRSM_LEFT/GEMM,
+        // k for TRSM_RIGHT.
+        const std::uint32_t rhs_cols =
+            task.mode == TileMode::TrsmRight ? task.dims.k : task.dims.n;
+        if (!check_operand(task.lhs, task.dims.k * 4, &reason)) {
             return fail(StatusCode::BadDescriptor, "lhs: " + reason);
         }
-        if (!check_operand(task.rhs, &reason)) {
+        if (!check_operand(task.rhs, rhs_cols * 4, &reason)) {
             return fail(StatusCode::BadDescriptor, "rhs: " + reason);
         }
     }

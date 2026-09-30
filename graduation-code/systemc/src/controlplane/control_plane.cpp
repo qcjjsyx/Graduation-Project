@@ -1,5 +1,7 @@
 #include "controlplane/control_plane.hpp"
 
+#include "controlplane/panel_exec_unit.hpp"
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -86,6 +88,26 @@ dp::ReadKind view_kind_for(cmd::Opcode opcode) {
     return dp::ReadKind::Region;
 }
 
+// Unit kind required by an opcode, if it needs an execution unit at all.
+std::optional<UnitKind> required_kind_for(hw::command::Opcode opcode) {
+    switch (opcode) {
+    case hw::command::Opcode::AssembleExtendAdd:
+        return UnitKind::Assemble;
+    case hw::command::Opcode::PanelLu:
+        return UnitKind::Panel;
+    case hw::command::Opcode::TrsmLeft:
+    case hw::command::Opcode::TrsmRight:
+        return UnitKind::Trsm;
+    case hw::command::Opcode::GemmSchur:
+        return UnitKind::Gemm;
+    case hw::command::Opcode::SolveForward:
+    case hw::command::Opcode::SolveBackward:
+        return UnitKind::Solve;
+    default:
+        return std::nullopt;
+    }
+}
+
 std::vector<std::uint8_t> identity_pvector(std::uint32_t dim) {
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(dim) * 4);
     for (std::uint32_t index = 0; index < dim; ++index) {
@@ -132,36 +154,64 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
     plane_.set_memory_sink(dp::MemoryClient::CompletionWriter, &completion_writer_);
     plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
 
-    auto make_units = [this](UnitKind kind, std::uint32_t count) {
-        for (std::uint32_t index = 0; index < count; ++index) {
-            units_.push_back(std::make_unique<TestStubUnit>(
-                kind, index, config_.stub, &plane_.buffers()));
+    if (config_.enable_real_panel) {
+        panel_engine_ = std::make_unique<hw::panel_lu::PanelEngine>(config_.panel);
+        panel_engine_->set_buffers(&plane_.buffers());
+        for (std::uint32_t index = 0; index < config_.panel_unit_count; ++index) {
+            units_.push_back(
+                std::make_unique<PanelExecutionUnit>(index, panel_engine_.get()));
         }
-    };
-    make_units(UnitKind::Assemble, config_.assemble_unit_count);
-    make_units(UnitKind::Panel, config_.panel_unit_count);
-    make_units(UnitKind::Trsm, config_.trsm_unit_count);
-    make_units(UnitKind::Gemm, config_.gemm_unit_count);
-    make_units(UnitKind::Solve, config_.solve_unit_count);
+        for (std::uint32_t index = 0; index < config_.factor_unit_count; ++index) {
+            units_.push_back(std::make_unique<FactorStoreUnit>(
+                index, &plane_.buffers(), &plane_.memory_service()));
+        }
+    }
+    if (config_.enable_test_stub) {
+        auto make_units = [this](UnitKind kind, std::uint32_t count) {
+            for (std::uint32_t index = 0; index < count; ++index) {
+                units_.push_back(std::make_unique<TestStubUnit>(
+                    kind, index, config_.stub, &plane_.buffers()));
+            }
+        };
+        make_units(UnitKind::Assemble, config_.assemble_unit_count);
+        make_units(UnitKind::Panel, config_.panel_unit_count);
+        make_units(UnitKind::Trsm, config_.trsm_unit_count);
+        make_units(UnitKind::Gemm, config_.gemm_unit_count);
+        make_units(UnitKind::Solve, config_.solve_unit_count);
+    }
 
     front_slots_.resize(config_.max_resident_fronts);
     scoreboard_.init(plane_.boot().token_count);
 }
 
+CommandDevice::~CommandDevice() = default;
+
 bool CommandDevice::start(std::string* error) {
-    if (config_.backend == ExecBackend::RequireRealKernels) {
+    if (config_.backend == ExecBackend::RequireRealKernels &&
+        !config_.enable_real_panel) {
         if (error != nullptr) {
             *error =
-                "no real Panel-LU/TRSM/GEMM/solve kernels are implemented; "
-                "refusing to run instead of silently using a test stub";
+                "RequestRealKernels was requested but no real kernel backend is "
+                "enabled; refusing to run instead of silently using a test stub";
         }
         return false;
     }
-    if (!config_.enable_test_stub) {
+    if (!config_.enable_test_stub && !config_.enable_real_panel) {
         if (error != nullptr) {
-            *error = "the test execution backend must be explicitly enabled";
+            *error =
+                "an execution backend must be explicitly enabled "
+                "(enable_test_stub and/or enable_real_panel)";
         }
         return false;
+    }
+    if (config_.enable_real_panel) {
+        const hw::panel_lu::ConfigCheck panel_check = panel_engine_->configure();
+        if (!panel_check.ok) {
+            if (error != nullptr) {
+                *error = "panel engine configuration rejected: " + panel_check.reason;
+            }
+            return false;
+        }
     }
     // Resource configurations that can never make progress are refused up
     // front instead of deadlocking at runtime.
@@ -202,10 +252,17 @@ bool CommandDevice::start(std::string* error) {
             "buffer_slot_count must be at least 2*max_resident_fronts+1 "
             "(front+temp per resident front and one solve scratch slot)");
     }
-    if (config_.panel_unit_count < 1 || config_.trsm_unit_count < 1 ||
-        config_.gemm_unit_count < 1 || config_.solve_unit_count < 1 ||
-        config_.assemble_unit_count < 1) {
-        return reject("every execution unit pool needs at least one unit");
+    if (config_.enable_real_panel && config_.panel_unit_count < 1) {
+        return reject("the real panel backend needs at least one panel unit slot");
+    }
+    if (config_.enable_real_panel && config_.factor_unit_count < 1) {
+        return reject("the real panel backend needs at least one factor unit");
+    }
+    if (config_.enable_test_stub &&
+        (config_.panel_unit_count < 1 || config_.trsm_unit_count < 1 ||
+         config_.gemm_unit_count < 1 || config_.solve_unit_count < 1 ||
+         config_.assemble_unit_count < 1)) {
+        return reject("every test stub execution unit pool needs at least one unit");
     }
     state_ = BatchState::Running;
     return true;
@@ -243,7 +300,18 @@ void CommandDevice::tick() {
         for (const auto& tracker : trackers_) {
             quiescent = quiescent && tracker->phase == Tracker::Phase::Done;
         }
-        if (quiescent && dma_arbiter_.idle() && exec_inbox_.empty()) {
+        // Shared engine / unit-owned memory transactions must be quiescent:
+        // an aborted panel can still be draining its PE tasks, and a factor
+        // unit can still have accepted DDR writes in flight.
+        bool units_quiescent = true;
+        for (const auto& unit : units_) {
+            if (unit->busy()) {
+                units_quiescent = false;
+                break;
+            }
+        }
+        if (quiescent && units_quiescent && dma_arbiter_.idle() &&
+            exec_inbox_.empty()) {
             state_ = BatchState::Completed;
         }
     }
@@ -281,6 +349,36 @@ CommandDevice::Tracker* CommandDevice::find_tracker_by_job(std::uint64_t job_id)
 CommandDevice::Tracker* CommandDevice::find_tracker_by_pvector(std::uint64_t request_id) {
     const auto found = pvector_map_.find(request_id);
     return found == pvector_map_.end() ? nullptr : find_tracker(found->second);
+}
+
+dp::BufferHandle CommandDevice::front_slot(std::uint32_t node_id) const {
+    const auto index = context_for_node(node_id);
+    if (!index.has_value() || !front_slots_[*index].active) {
+        return dp::BufferHandle{cmd::NONE, 0};
+    }
+    return front_slots_[*index].front;
+}
+
+std::size_t CommandDevice::unit_pending_request_count(
+    UnitKind kind,
+    std::uint32_t unit_id) const {
+    for (const auto& unit : units_) {
+        if (unit->kind() == kind && unit->unit_id() == unit_id) {
+            return unit->pending_request_count();
+        }
+    }
+    return 0;
+}
+
+std::uint32_t CommandDevice::unit_active_command_id(
+    UnitKind kind,
+    std::uint32_t unit_id) const {
+    for (const auto& unit : units_) {
+        if (unit->kind() == kind && unit->unit_id() == unit_id) {
+            return unit->active_command_id();
+        }
+    }
+    return cmd::NONE;
 }
 
 std::optional<std::uint32_t> CommandDevice::context_for_node(std::uint32_t node_id) const {
@@ -322,6 +420,11 @@ void CommandDevice::update_phase(std::uint64_t cycle) {
         }
     }
 
+    if (panel_engine_ != nullptr) {
+        // The shared compute subsystem is ticked exactly once per cycle, no
+        // matter how many panel adapter slots exist.
+        panel_engine_->tick(cycle);
+    }
     for (auto& unit : units_) {
         unit->tick(cycle);
         ExecResponse response;
@@ -584,6 +687,24 @@ void CommandDevice::issue_phase(std::uint64_t cycle) {
 // ---------------------------------------------------------------------------
 // Execution attempts (atomic resource acquisition with rollback).
 // ---------------------------------------------------------------------------
+bool CommandDevice::unit_bound(UnitKind kind) const {
+    for (const auto& candidate : units_) {
+        if (candidate->kind() == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
+IExecutionUnit* CommandDevice::find_free_unit(UnitKind kind) {
+    for (auto& candidate : units_) {
+        if (candidate->kind() == kind && !candidate->busy()) {
+            return candidate.get();
+        }
+    }
+    return nullptr;
+}
+
 bool CommandDevice::acquire_exec_resources(
     Tracker& tracker,
     UnitKind kind,
@@ -634,15 +755,26 @@ bool CommandDevice::acquire_exec_resources(
         tracker.has_temp_lease = true;
     }
 
-    TestStubUnit* unit = nullptr;
-    for (auto& candidate : units_) {
-        if (candidate->kind() == kind && !candidate->busy()) {
-            unit = candidate.get();
-            break;
-        }
-    }
+    IExecutionUnit* unit = find_free_unit(kind);
     if (unit == nullptr) {
+        bool kind_present = false;
+        for (const auto& candidate : units_) {
+            if (candidate->kind() == kind) {
+                kind_present = true;
+                break;
+            }
+        }
         release_command_resources(tracker, cycle);
+        if (!kind_present) {
+            // No unit of this kind is bound: the backend must refuse instead
+            // of stalling forever or silently substituting the test stub.
+            finish_command(
+                tracker, cmd::StatusCode::PolicyNotSupported,
+                std::string(unit_kind_name(kind)) +
+                    " kernel is not implemented/bound in this backend",
+                cycle);
+            return false;
+        }
         ++tracker.stall_resource;
         return false;
     }
@@ -868,13 +1000,7 @@ void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
         }
         tracker.temp_lease = lease.lease;
         tracker.has_temp_lease = true;
-        TestStubUnit* unit = nullptr;
-        for (auto& candidate : units_) {
-            if (candidate->kind() == UnitKind::Solve && !candidate->busy()) {
-                unit = candidate.get();
-                break;
-            }
-        }
+        IExecutionUnit* unit = find_free_unit(UnitKind::Solve);
         if (unit == nullptr) {
             release_command_resources(tracker, cycle);
             ++tracker.stall_resource;
@@ -919,6 +1045,17 @@ void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
     if (aborted_nodes_.count(tracker.command.node_id) != 0 &&
         opcode != cmd::Opcode::AbortNode) {
         finish_command(tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+        return;
+    }
+    if (const auto required = required_kind_for(opcode); required.has_value() &&
+        !unit_bound(*required)) {
+        // Capability refusal: a real backend must never silently fall back to
+        // a stub or stall forever for an unimplemented unit kind.
+        finish_command(
+            tracker, cmd::StatusCode::PolicyNotSupported,
+            std::string(unit_kind_name(*required)) +
+                " kernel is not implemented/bound in this backend",
+            cycle);
         return;
     }
     if (opcode_touches_front(opcode) && opcode != cmd::Opcode::NodeBegin) {
@@ -1103,6 +1240,68 @@ void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
         const auto& factor = tracker.factor_view;
         const std::uint32_t total = factor.total_dim;
         const std::uint32_t pivot = factor.pivot_dim;
+
+        // Real T07 path: chunked packed-LU -> L/U conversion through the front
+        // read lease and MemoryService writes. Used whenever a Factor unit is
+        // explicitly bound; when it is bound but busy the command WAITS -- the
+        // legacy rectangular DMA copy below is only for the explicit test-stub
+        // backend (no factor unit bound) and must never run as a busy fallback.
+        if (unit_bound(UnitKind::Factor)) {
+            IExecutionUnit* factor_unit = find_free_unit(UnitKind::Factor);
+            if (factor_unit == nullptr) {
+                ++tracker.stall_resource;
+                return;
+            }
+            const std::uint64_t front_bytes =
+                static_cast<std::uint64_t>(total) * total * 4;
+            const auto lease =
+                plane_.buffers().begin_read(slot.front, slot.owner, 0, front_bytes, cycle);
+            if (!lease.ok) {
+                ++tracker.stall_resource;
+                return;
+            }
+            ExecRequest request;
+            request.txn_id = next_txn_id_++;
+            request.epoch = epoch_;
+            request.command_id = tracker.command.command_id;
+            request.node_id = tracker.command.node_id;
+            request.opcode = opcode;
+            request.unit_id = factor_unit->unit_id();
+            request.front = tracker.front_view;
+            request.factor = factor;
+            request.front_slot = slot.front;
+            request.front_lease = lease.lease;
+            request.has_front_lease = true;
+            request.total_dim = total;
+            request.range_bytes = front_bytes;
+            if (!factor_unit->submit(request, cycle)) {
+                plane_.buffers().release_lease(lease.lease.lease_id, cycle);
+                ++tracker.stall_resource;
+                return;
+            }
+            tracker.front_lease = lease.lease;
+            tracker.has_front_lease = true;
+            tracker.front_write_lease = false;
+            tracker.unit_kind = UnitKind::Factor;
+            tracker.unit_id = factor_unit->unit_id();
+            tracker.unit_active = true;
+            tracker.txn_id = request.txn_id;
+            txn_map_[request.txn_id] = tracker.command.command_id;
+            UnitBusyRecord busy;
+            busy.kind = unit_kind_name(UnitKind::Factor);
+            busy.unit_id = factor_unit->unit_id();
+            busy.command_id = tracker.command.command_id;
+            busy.node_id = tracker.command.node_id;
+            busy.start = cycle;
+            open_unit_records_[request.txn_id] = busy;
+            tracker.front_slot_index = *context;
+            front_slots_[*context].busy = true;
+            if (tracker.start_cycle == 0) {
+                tracker.start_cycle = cycle;
+            }
+            tracker.phase = Tracker::Phase::Running;
+            return;
+        }
 
         dp::DmaRequest l_request;
         l_request.request_id = plane_.memory_service().next_request_id();
@@ -1352,7 +1551,25 @@ void CommandDevice::handle_exec_response(
     Tracker& tracker,
     const ExecResponse& response,
     std::uint64_t cycle) {
+    if (tracker.phase == Tracker::Phase::Done ||
+        tracker.phase == Tracker::Phase::Completing || tracker.finish_cycle != 0) {
+        // Late response after a directed abort or an earlier terminal state:
+        // consume it without touching stats or outputs.
+        tracker.unit_active = false;
+        return;
+    }
     tracker.unit_active = false;
+    if (tracker.aborted) {
+        if (tracker.dma_jobs_done + tracker.dma_jobs_cancelled <
+            tracker.dma_jobs_total) {
+            // In-flight DMA writes still settle first; the job-completion path
+            // releases resources and finishes the command.
+            return;
+        }
+        release_command_resources(tracker, cycle);
+        finish_command(tracker, cmd::StatusCode::Aborted, "node was aborted", cycle);
+        return;
+    }
     tracker.pivot_count = response.pivot_count;
     tracker.overflow_count = response.overflow_count;
     tracker.bytes_read += response.bytes_read;
@@ -1617,20 +1834,26 @@ void CommandDevice::abort_node(std::uint32_t node_id) {
         tracker->stage2_pending = false;
         tracker->job_retries.clear();
         if (tracker->unit_active) {
+            bool abort_delivered = false;
             for (auto& unit : units_) {
                 if (unit->unit_id() == tracker->unit_id &&
                     unit->kind() == tracker->unit_kind) {
-                    unit->abort_epoch(epoch_, cycle);
+                    // Directed cancellation: the unit stops issuing new work
+                    // and still produces exactly one terminal ABORTED response
+                    // after its in-flight accesses have settled. The tracker
+                    // (and its leases) must survive until then: "cancel
+                    // requested" is not "drained".
+                    unit->abort_txn(tracker->txn_id, cycle);
+                    abort_delivered = true;
                 }
             }
-            tracker->unit_active = false;
-            const auto record = open_unit_records_.find(tracker->txn_id);
-            if (record != open_unit_records_.end()) {
-                UnitBusyRecord busy = record->second;
-                busy.finish = cycle;
-                unit_records_.push_back(busy);
-                open_unit_records_.erase(record);
+            if (abort_delivered) {
+                // No release/finish here; the terminal response path
+                // (handle_exec_response) releases resources and finishes.
+                continue;
             }
+            // The bound unit disappeared (reset race): finish defensively.
+            tracker->unit_active = false;
             release_command_resources(*tracker, cycle);
         }
         if (tracker->dma_jobs_done + tracker->dma_jobs_cancelled <
@@ -1654,6 +1877,9 @@ void CommandDevice::reset() {
     plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
     for (auto& unit : units_) {
         unit->reset();
+    }
+    if (panel_engine_ != nullptr) {
+        panel_engine_->reset();
     }
     scoreboard_ = TokenScoreboard();
     scoreboard_.init(plane_.boot().token_count);
@@ -1679,11 +1905,31 @@ void CommandDevice::reset() {
 
 void CommandDevice::inject_failure(std::uint32_t command_id, ExecFailure failure) {
     for (auto& unit : units_) {
-        unit->inject_failure(command_id, failure);
+        if (unit->kind() == UnitKind::Panel || unit->kind() == UnitKind::Trsm ||
+            unit->kind() == UnitKind::Gemm || unit->kind() == UnitKind::Solve ||
+            unit->kind() == UnitKind::Assemble) {
+            // Error injection is a test-stub capability; real units ignore it.
+            TestStubUnit* stub = dynamic_cast<TestStubUnit*>(unit.get());
+            if (stub != nullptr) {
+                stub->inject_failure(command_id, failure);
+            }
+        }
     }
 }
 
 void CommandDevice::deliver_memory_response(const dp::MemoryResponse& response) {
+    if (pvector_map_.count(response.request_id) == 0) {
+        // Not a P-vector write: route by request id to exactly one unit that
+        // owns the in-flight write. Broadcasting would let multiple factor
+        // instances decrement each other's pending counters.
+        for (auto& unit : units_) {
+            if (unit->handles_request(response.request_id)) {
+                unit->deliver_memory_response(response);
+                return;
+            }
+        }
+        return;  // no owner: late/foreign response, dropped
+    }
     exec_inbox_[response.request_id] = response;
 }
 
@@ -1823,20 +2069,49 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
         }
     }
     {
+        const bool real_panel = panel_engine_ != nullptr;
+        const bool mixed = real_panel && config_.enable_test_stub;
+        std::string execution_backend =
+            real_panel ? "real_panel_fp32" : "test_stub";
+        if (mixed) {
+            execution_backend = "real_panel_fp32_plus_test_stub";
+        }
         std::ofstream out(output_dir + "/summary.json");
         out << "{\n"
             << "  \"tool\": \"t05_command_control_plane\",\n"
-            << "  \"execution_backend\": \"" << exec_backend_name(config_.backend)
-            << "\",\n"
+            << "  \"execution_backend\": \"" << execution_backend << "\",\n"
+            << "  \"panel_backend_real_fp32\": "
+            << (real_panel ? "true" : "false") << ",\n"
+            << "  \"mixed_backend_explicit\": " << (mixed ? "true" : "false") << ",\n"
             << "  \"control_flow_pass\": "
             << (state_ == BatchState::Completed ? "true" : "false") << ",\n"
             << "  \"numerical_validation\": \"not_performed\",\n"
+            << "  \"numerical_scope\": \""
+            << (real_panel ? "panel_fp32_external_reference_only"
+                           : "control_flow_only")
+            << "\",\n"
             << "  \"batch_state\": \"" << batch_state_name(state_) << "\",\n"
             << "  \"fault_reason\": \"" << fault_reason_ << "\",\n"
             << "  \"cycles\": " << plane_.cycle() << ",\n"
             << "  \"commands\": " << command_stats_.size() << ",\n"
             << "  \"completions_written\": " << completion_writer_.written_count()
             << ",\n"
+            << "  \"panel_numeric_mode\": \""
+            << hw::panel_lu::panel_numeric_mode_name(config_.panel.numeric_mode)
+            << "\",\n"
+            << "  \"panel_engine\": {\n"
+            << "    \"pe_count\": " << config_.panel.pe_count << ",\n"
+            << "    \"task_slots_per_pe\": " << config_.panel.task_slots_per_pe
+            << ",\n"
+            << "    \"tile_dim\": " << config_.panel.tile_dim << ",\n"
+            << "    \"task_records\": "
+            << (real_panel ? std::to_string(panel_engine_->task_records().size())
+                           : std::string("0"))
+            << ",\n"
+            << "    \"control_fault\": "
+            << (real_panel && panel_engine_->control_fault() ? "true" : "false")
+            << "\n"
+            << "  },\n"
             << "  \"config\": {\n"
             << "    \"max_resident_fronts\": " << config_.max_resident_fronts
             << ",\n"
@@ -1846,6 +2121,7 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
             << "    \"solve_unit_count\": " << config_.solve_unit_count << ",\n"
             << "    \"assemble_unit_count\": " << config_.assemble_unit_count
             << ",\n"
+            << "    \"factor_unit_count\": " << config_.factor_unit_count << ",\n"
             << "    \"buffer_slot_count\": " << config_.buffer_slot_count << ",\n"
             << "    \"buffer_capacity_bytes\": " << config_.buffer_capacity_bytes
             << ",\n"
@@ -1853,6 +2129,28 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
             << "\n"
             << "  }\n"
             << "}\n";
+    }
+    if (panel_engine_ != nullptr) {
+        std::ofstream out(output_dir + "/panel_tasks.csv");
+        out << "task_id,command_id,node_id,step,tile_row,tile_col,mode,eff_m,eff_n,"
+               "eff_k,pivot_base,pe_id,status,committed,cancelled,failed_column,"
+               "enqueue_cycle,dispatch_cycle,exec_start_cycle,exec_done_cycle,"
+               "writeback_done_cycle,bytes_read,bytes_written,reason\n";
+        for (const auto& record : panel_engine_->task_records()) {
+            out << record.task.task_id << ',' << record.task.command_id << ','
+                << record.task.node_id << ',' << record.task.step << ','
+                << record.task.tile_row << ',' << record.task.tile_col << ','
+                << hw::panel_lu::tile_mode_name(record.task.mode) << ','
+                << record.task.dims.m << ',' << record.task.dims.n << ','
+                << record.task.dims.k << ',' << record.task.pivot_base << ','
+                << record.pe_id << ',' << hw::dataplane::status_name(record.status)
+                << ',' << (record.committed ? 1 : 0) << ','
+                << (record.cancelled ? 1 : 0) << ',' << record.failed_column << ','
+                << record.enqueue_cycle << ',' << record.dispatch_cycle << ','
+                << record.exec_start_cycle << ',' << record.exec_done_cycle << ','
+                << record.writeback_done_cycle << ',' << record.bytes_read << ','
+                << record.bytes_written << ',' << record.reason << '\n';
+        }
     }
 }
 

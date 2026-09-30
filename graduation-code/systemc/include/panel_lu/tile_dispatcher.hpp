@@ -36,7 +36,7 @@ public:
     TileDispatcher(
         const PanelLuConfig& config,
         std::vector<MultiModePe>* pes,
-        TileStore* store);
+        TileVersionStore* versions);
 
     // Returns false when the bounded queue is full (stall) or the task is
     // invalid/duplicated (permanent error, explicit reason).
@@ -51,7 +51,7 @@ public:
     bool on_task_committed(
         std::uint64_t task_id,
         std::uint32_t command_id,
-        std::uint32_t slot,
+        std::uint64_t version_key,
         std::uint32_t expected_version);
 
     // Terminal callback for failed/aborted tasks: releases writers, no commit.
@@ -97,12 +97,12 @@ private:
 
     PanelLuConfig config_;
     std::vector<MultiModePe>* pes_{nullptr};
-    TileStore* store_{nullptr};
+    TileVersionStore* versions_{nullptr};
 
     std::deque<Queued> queue_;
     std::set<std::uint64_t> committed_;
     std::set<std::uint64_t> known_;
-    std::map<std::uint32_t, std::set<std::uint64_t>> uncommitted_writers_;
+    std::map<std::uint64_t, std::set<std::uint64_t>> uncommitted_writers_;
     std::unordered_map<std::uint64_t, DispatchRecord> records_;
     // Committed task ids per command; released when the command terminates.
     std::map<std::uint32_t, std::set<std::uint64_t>> committed_by_command_;

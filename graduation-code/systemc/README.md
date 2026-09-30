@@ -9,12 +9,13 @@
 - `include/controlplane/`、`src/controlplane/`：T05 Command 控制面
   （CommandFetch、TokenScoreboard、双 front 调度、共享单元池、TestStubUnit、
   DmaArbiter、CompletionWriter、CommandDevice 顶层）；
-- `include/panel_lu/`、`src/panel_lu/`：T06 Panel-LU 硬件架构原型
-  （内部 task/config/response 契约、16×16 多模式 PE、有界 dispatcher/
-  scoreboard、Panel controller、tile store、合成负载 FP32 tile 原语）；
-  原型标记 `architecture_prototype=true`、`numerical_validation=not_performed`，
-  未接入 `CommandDevice`，不是正式数值后端；设计见
-  `docs/architecture/Panel-LU架构设计.md`；
+- `include/panel_lu/`、`src/panel_lu/`：Panel-LU 子系统。
+  T06 部分为合成架构原型（`panel_lu_prototype`，标记
+  `architecture_prototype=true`、`numerical_validation=not_performed`）；
+  T07 部分为正式 FP32 STATIC 引擎（`panel_engine`、`kernels` 原语、
+  `TileDispatcher`/`MultiModePe` 复用），通过
+  `controlplane/panel_exec_unit` 接入 `CommandDevice` 真实 front lease，
+  设计见 `docs/systemc/T07_Panel_LU数值引擎设计.md`；
 - `reference/`：独立 FP64 数学参考（`PivotPolicy`/`PivotFailure`、
   `panel_lu_policy` 与通用 `panel_lu` 分离；`tools/fp64_reference_smoke`
   为数值冒烟入口）；
@@ -34,6 +35,9 @@
   trace 可复现）；
 - `tests/panel_lu_systemc_tests.cpp`：sc_clock 驱动的 T06 时序测试
   （与纯 C++ tick 模型逐周期对照）；
+- `tests/panel_lu_real_tests.cpp`：T07 正式 Panel 引擎集成测试（真实
+  lease 数据路径、FP64 STATIC 参考对照、失败/abort/reset/背压）；
+- `tests/panel_lu_real_systemc_tests.cpp`：T07 的 sc_clock 集成测试；
 - `src/command_device_smoke.cpp`：T05 控制流冒烟入口；
 - `src/panel_lu_prototype_smoke.cpp`：T06 尾块/混合负载 trace 生成入口；
 - `tools/t04_fixture_gen.py`：用当前软件编译器生成设备运行目录。
@@ -83,7 +87,10 @@ DYNAMIC_PANEL/256 阶设备运行目录，然后运行：
   （输出 `commands.csv`、`units.csv`、`fronts.csv`、`summary.json`）；
 - `panel_lu_prototype_tests` / `panel_lu_systemc_tests` /
   `panel_lu_smoke_tail` / `panel_lu_smoke_mixed`：T06 架构原型测试与 trace
-  （合成负载、`numerical_validation=not_performed`；CTest 合计 16 项）。
+  （合成负载、`numerical_validation=not_performed`）；
+- `panel_lu_real_tests` / `panel_lu_real_systemc_tests`：T07 正式 FP32
+  Panel 数值/资源/异常测试（CTest 合计 18 项）；含显式 FP64 模块诊断模式
+  （`panel.numeric_mode=fp64_diagnostic`，默认 FP32，summary 标记）。
 
 单独复现加载—搬运—写回：
 

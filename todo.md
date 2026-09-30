@@ -1,10 +1,12 @@
 # 毕业设计当前任务状态
 
-状态：**T00–T06 已完成（含主元策略、schema v2、SystemC 数据面与控制面、Panel-LU 硬件架构与多模式 PE 接口/时序原型）；下一步为 T07 STATIC Panel-LU 数值引擎（协调 T08）；T14 后移至 STATIC 数值闭环之后。**
+状态：**T00–T07 已完成（含主元策略、schema v2、SystemC 数据面与控制面、Panel-LU 硬件架构/多模式 PE 原型、正式 FP32 STATIC Panel 数值引擎与 T05 接入）；下一步为 T09/T10 顶层 TRSM/GEMM 数值核并复用共享 PE 池；T14 后移至 STATIC 数值闭环之后。**
 
 > 本文档只记录当前主线已经完成的工作、验证证据和后续边界，不再按月份或周数安排进度。
-> T06 完成的是硬件设计、可编译内部契约与可执行时序/资源原型，**不是**正式数值
-> 后端，也不能据此宣称 FP32 数值闭环或加速比。
+> T06 完成的是硬件设计、可编译内部契约与可执行时序/资源原型；T07 完成的是
+> Panel（A11）子系统的正式 FP32 STATIC 数值执行与 T05 接入，**尚未**包含顶层
+> TRSM/GEMM/solve 与完整分解/求解闭环，也不能据此宣称 FP32 全链路数值通过、
+> 芯片周期或加速比。
 
 ## 1. 当前主线
 
@@ -340,6 +342,10 @@
 | T06 原型测试规模 | prototype 871 checks、SystemC 48 checks |
 | T06 尾块/混合 trace | p=23 pe=1 尾块 5 任务；p=40 双 front 双 PE 混合模式全部提交 |
 | T06 手算周期证据 | p=16 LU_DIAG exec 136、wb_done 199；TRSM_RIGHT 57 拍（div 敏感）；p=32 GEMM 16³ exec 34、wb_done 496；失败列 1/1/0 分别 10/10/1 拍 |
+| T07 主线 CTest | 18/18 passed（16 既有 + panel_lu_real_tests / panel_lu_real_systemc_tests） |
+| T07 测试规模 | real 206 checks、real SystemC 10 checks |
+| T07 数值证据 | n=p ∈ {4,15,16,17,23} L/U 对 FP64 STATIC 参考 max diff < 5e-3（实测 ~1e-7），L·U 重构 A11，P-vector identity |
+| T07 边界证据 | n=17,p=16：A11 与参考一致、A12/A21/A22 字节不变、顶层 TRSM/GEMM/solve `POLICY_NOT_SUPPORTED`（无 stub 回退） |
 
 说明：
 
@@ -359,6 +365,41 @@
 - [ ] 性能、带宽和面积证据。
 
 ## 5. 下一阶段
+
+### T07：Panel-LU 数值引擎（STATIC FP32 + T05 接入）[x]
+
+- [x] 正式 FP32 tile 原语（`panel_lu/tile_kernels.hpp`，命名空间
+  `hw::panel_lu::kernels`）：STATIC packed LU_DIAG（消元后实际主元检查、
+  倒数溢出列报告）、单位下三角 TRSM_LEFT、非单位上三角 TRSM_RIGHT
+  （倒数预计算+前向代入）、FMA GEMM_UPDATE；供 T09/T10 复用。
+- [x] 全 front 扫描（n×n 含 A12/A21/A22，精确 FP32 maxabs + 有限值检查，
+  共享读预算轮转仲裁）与 binary64 阈值乘积。
+- [x] 共享多模式 PE 池上的 A11 16×16 步屏障 PanelController（LU_DIAG /
+  左右 TRSM / GEMM_UPDATE、尾块有效维度与 mask），真实 front 经
+  BufferManager lease 读写（`PanelEngine`；T06 的队列/task slot/FIFO/
+  累加器/写回背压全部保留）。
+- [x] T05 接入：`PanelExecutionUnit`（共享引擎、每拍只 tick 一次）、
+  `FactorStoreUnit`（STORE_FACTOR 真实 L 单位对角/U mask 分块转换）、
+  `IExecutionUnit::abort_txn` 定向取消、`enable_real_panel` 能力显式声明、
+  未绑定 kind 返回 `POLICY_NOT_SUPPORTED` 不落 stub；P-vector 仍走 PostExec。
+- [x] 测试：`panel_lu_real_tests` 206 checks（n=p ∈ {4,15,16,17,23}
+  与 FP64 STATIC 参考对照、n>p 外围块字节不变、零/消元零/阈值/NaN 失败、
+  双 front 排他与定向 abort、扫描期 abort、reset、共享读带宽与队列/写回
+  背压）、`panel_lu_real_systemc_tests` 10 checks；CTest 18/18
+  （Release 与 ASan+UBSan），既有 T04/T05/T06 回归无回退。
+- [ ] 顶层 TRSM_LEFT/TRSM_RIGHT/GEMM_SCHUR 数值执行（T09/T10，复用
+  `kernels` 与同一 dispatcher/PE 池；当前显式拒绝）。
+- [ ] 完整分解/求解闭环、L21/U12 持久化、DYNAMIC_PANEL、INT32、RTL。
+
+主要产物：
+
+- graduation-code/systemc/include/panel_lu/panel_engine.hpp
+- graduation-code/systemc/src/panel_lu/panel_engine.cpp
+- graduation-code/systemc/include/controlplane/panel_exec_unit.hpp
+- graduation-code/systemc/src/controlplane/panel_exec_unit.cpp
+- graduation-code/systemc/tests/panel_lu_real_tests.cpp
+- graduation-code/systemc/tests/panel_lu_real_systemc_tests.cpp
+- docs/systemc/T07_Panel_LU数值引擎设计.md
 
 ### T06/T08：硬件设计与共享 PE 接口/时序原型 [x/T06 完成]
 

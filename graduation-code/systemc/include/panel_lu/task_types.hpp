@@ -67,13 +67,17 @@ struct TileMask {
     std::uint32_t cols{0};
 };
 
-// One operand of a tile task: a buffer handle, element offset/stride and the
-// committed version that must be visible before the task may run.
+// One operand of a tile task: a buffer handle, element offset/stride, the
+// committed version that must be visible before the task may run, and a
+// version-table key. T06's synthetic prototype uses one store slot per tile
+// (key = slot); the T07 real engine uses one front buffer slot per front with
+// strided tile views (key = slot/index composite).
 struct TileOperand {
     hw::dataplane::BufferHandle handle{};
     std::uint64_t offset{0};         // byte offset inside the slot
     std::uint32_t stride_bytes{0};   // row stride in bytes
     std::uint32_t version{0};        // required committed version
+    std::uint64_t version_key{0};    // key into the tile version table
     bool valid{false};
 };
 
@@ -163,6 +167,18 @@ struct PeTimingConfig {
     std::uint32_t tsolve_fill_cycles{2};
 };
 
+// Numeric execution mode of the panel engine. Fp32Device is the production
+// device path; Fp64Diagnostic is an EXPLICIT module diagnostic mode that runs
+// the same algorithms with binary64 accumulators and rounds results back to
+// binary32 storage. It is never selected automatically (no fallback), never
+// changes command/token semantics, and must be declared in run reports.
+enum class PanelNumericMode : std::uint8_t {
+    Fp32Device = 0,
+    Fp64Diagnostic = 1,
+};
+
+const char* panel_numeric_mode_name(PanelNumericMode mode);
+
 // Prototype resource configuration. pe_count is the physical number of
 // homogeneous PEs; Panel/TRSM/GEMM tasks compete for the same pool.
 struct PanelLuConfig {
@@ -187,6 +203,9 @@ struct PanelLuConfig {
     // Response visibility hold (response backpressure model).
     std::uint32_t response_hold_cycles{0};
     PeTimingConfig timing;
+    // Numeric mode: Fp32Device (default production path) or the explicit
+    // Fp64Diagnostic module mode. Never auto-selected.
+    PanelNumericMode numeric_mode{PanelNumericMode::Fp32Device};
 };
 
 // Capability check result for configs / tasks / front descriptors.

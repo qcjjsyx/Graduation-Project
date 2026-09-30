@@ -1,15 +1,20 @@
 #pragma once
 
-// T06 Panel controller (per command). One controller owns exactly one
-// PANEL_LU command: it runs the post-assembly full-front scan (finite check +
-// exact maxabs reduction), generates the internal LU_DIAG / TRSM_LEFT /
-// TRSM_RIGHT / GEMM_UPDATE tile tasks for A11 with a per-step barrier, tracks
-// dependencies and outstanding tasks, drives the fixed-scale actual-pivot
-// checks reported by LU_DIAG, and publishes one command response.
+// Panel controller (per command). One controller owns exactly one PANEL_LU
+// command: it runs the post-assembly full-front scan (finite check + exact
+// maxabs reduction), generates the internal LU_DIAG / TRSM_LEFT / TRSM_RIGHT /
+// GEMM_UPDATE tile tasks for A11 with a per-step barrier, tracks dependencies
+// and outstanding tasks, drives the fixed-scale actual-pivot checks reported
+// by LU_DIAG, and publishes one command response.
 //
-// The controller never advances time itself; the prototype calls tick() once
-// per cycle. It does not repeat top-level TRSM/GEMM work (A12/A21/A22 stay
-// with the top-level commands) and it does not read any golden object.
+// The controller is data-path agnostic: the front buffer is described by a
+// PanelFrontLayout (per-tile synthetic slots or one strided real buffer), tile
+// bytes are read through a FrontReader (scan) and TileAccess (PE operands),
+// and committed versions live in a TileVersionStore shared with the
+// dispatcher. The controller never advances time itself; its owner calls
+// tick() once per cycle. It does not repeat top-level TRSM/GEMM work
+// (A12/A21/A22 stay with the top-level commands) and it never reads a golden
+// object.
 
 #include <cstdint>
 #include <deque>
@@ -59,6 +64,38 @@ struct PanelCommandRequest {
     std::string label;
 };
 
+// Physical placement of one command's front buffer.
+struct PanelFrontLayout {
+    enum class Kind : std::uint8_t {
+        // Synthetic T06 layout: one TileStore slot per 16x16 tile, row stride
+        // 64B, version key == slot index.
+        PerTileSlots,
+        // Real T07 layout: one strided buffer slot holds the whole n x n front.
+        SingleBufferStrided,
+    };
+    Kind kind{Kind::SingleBufferStrided};
+    hw::dataplane::BufferHandle handle{};
+    std::uint32_t generation{0};
+    std::uint64_t base_offset{0};
+    std::uint32_t row_stride_bytes{0};
+    std::uint32_t global_grid{0};
+    std::uint32_t total_dim{0};  // front n (scan/reader extent)
+};
+
+// Byte source for the full-front scan. Implementations copy an assembled span
+// of the front; returning false means "not this cycle" (backpressure), never a
+// data error. Reads must not add timing of their own: the scan budget stays
+// with the controller.
+class FrontReader {
+public:
+    virtual ~FrontReader() = default;
+    virtual bool read_front(
+        std::uint64_t byte_offset,
+        std::uint32_t length_bytes,
+        std::uint8_t* out,
+        std::uint64_t cycle) = 0;
+};
+
 struct PanelCommandResponse {
     std::uint32_t command_id{hw::command::NONE};
     std::uint32_t node_id{hw::command::NONE};
@@ -102,14 +139,14 @@ public:
     PanelController(
         const PanelLuConfig& config,
         TileDispatcher* dispatcher,
-        TileStore* store,
-        std::uint32_t global_grid);
+        TileVersionStore* versions,
+        FrontReader* reader);
 
     ConfigCheck start(
         const PanelCommandRequest& request,
         std::uint64_t cycle,
         std::uint64_t epoch,
-        std::uint32_t slot_base,
+        const PanelFrontLayout& layout,
         std::uint64_t first_task_id);
 
     void tick(std::uint64_t cycle, PortBudget& scan_budget, PortBudget& write_budget);
@@ -149,8 +186,9 @@ private:
 
     std::uint32_t grid_extent(std::uint32_t dimension) const;
     std::uint32_t tile_width(std::uint32_t tile) const;
-    std::uint32_t tile_slot(TileCoord coord) const;
-    TileOperand operand(std::uint32_t slot, std::uint32_t version) const;
+    std::uint64_t version_key(TileCoord coord) const;
+    std::uint32_t operand_version(TileCoord coord) const;
+    TileOperand operand_for(TileCoord coord, std::uint32_t version) const;
     bool submit_task(const TileTask& task, std::uint64_t cycle, std::string* reason);
     TileTask make_task(
         TileMode mode,
@@ -177,13 +215,14 @@ private:
 
     PanelLuConfig config_;
     TileDispatcher* dispatcher_{nullptr};
-    TileStore* store_{nullptr};
+    TileVersionStore* versions_{nullptr};
+    FrontReader* reader_{nullptr};
+    PanelFrontLayout layout_{};
     std::uint32_t global_grid_{16};
 
     PanelCommandRequest request_;
     Phase phase_{Phase::Idle};
     std::uint64_t epoch_{0};
-    std::uint32_t slot_base_{0};
     std::uint32_t local_grid_{0};
     std::uint32_t num_steps_{0};
     std::uint32_t step_{0};

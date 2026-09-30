@@ -17,6 +17,7 @@
 #include "controlplane/test_stub_unit.hpp"
 #include "controlplane/token_scoreboard.hpp"
 #include "dataplane/dataplane.hpp"
+#include "panel_lu/panel_engine.hpp"
 
 namespace hw::controlplane {
 
@@ -29,6 +30,7 @@ struct ControlPlaneConfig {
     std::uint32_t gemm_unit_count{1};
     std::uint32_t solve_unit_count{1};
     std::uint32_t assemble_unit_count{1};
+    std::uint32_t factor_unit_count{1};
     // Scratchpad: slot count / per-slot capacity / ports (T04 checks apply).
     // Default slot count matches the residency requirement
     // (2 * max_resident_fronts + 1 = 5).
@@ -42,6 +44,10 @@ struct ControlPlaneConfig {
     ExecBackend backend{ExecBackend::TestStub};
     bool enable_test_stub{false};
     StubConfig stub;
+    // T07 real backend: binds the shared PanelEngine to Panel slots and the
+    // FactorStoreUnit to STORE_FACTOR. Explicitly selected, never implicit.
+    bool enable_real_panel{false};
+    hw::panel_lu::PanelLuConfig panel;
     hw::dataplane::MemoryServiceConfig memory;
     hw::dataplane::DmaConfig dma;
 };
@@ -96,6 +102,22 @@ struct FrontBusyRecord {
 class CommandDevice : public hw::dataplane::MemoryResponseSink {
 public:
     CommandDevice(hw::dataplane::LoadedArtifact artifact, ControlPlaneConfig config);
+    ~CommandDevice();
+
+    // Shared panel compute subsystem (nullptr when the real backend is off).
+    hw::panel_lu::PanelEngine* panel_engine() { return panel_engine_.get(); }
+    const hw::panel_lu::PanelEngine* panel_engine() const { return panel_engine_.get(); }
+    bool real_panel_enabled() const { return panel_engine_ != nullptr; }
+
+    // Test/diagnostic: active scratch front buffer of a node (slot == NONE
+    // after the node's context is released).
+    hw::dataplane::BufferHandle front_slot(std::uint32_t node_id) const;
+
+    // Test/diagnostic: in-flight memory request count and active command of a
+    // unit.
+    std::size_t unit_pending_request_count(UnitKind kind, std::uint32_t unit_id) const;
+    std::uint32_t unit_active_command_id(UnitKind kind, std::uint32_t unit_id) const;
+
 
     // Explicit backend gating: without real kernels the device refuses to run
     // instead of silently succeeding on the test stub.
@@ -263,6 +285,8 @@ private:
     Tracker* find_tracker_by_pvector(std::uint64_t request_id);
 
     void try_execute(Tracker& tracker, std::uint64_t cycle);
+    IExecutionUnit* find_free_unit(UnitKind kind);
+    bool unit_bound(UnitKind kind) const;
     bool issue_solve_store(Tracker& tracker, std::uint64_t cycle);
     bool submit_pvector_write(Tracker& tracker, std::uint64_t cycle);
     std::uint64_t enqueue_dma_job(
@@ -305,7 +329,8 @@ private:
     CompletionWriter completion_writer_;
     DmaArbiter dma_arbiter_;
     TokenScoreboard scoreboard_;
-    std::vector<std::unique_ptr<TestStubUnit>> units_;
+    std::unique_ptr<hw::panel_lu::PanelEngine> panel_engine_;
+    std::vector<std::unique_ptr<IExecutionUnit>> units_;
     std::map<std::uint64_t, hw::dataplane::MemoryResponse> exec_inbox_;
 
     std::vector<FrontSlot> front_slots_;

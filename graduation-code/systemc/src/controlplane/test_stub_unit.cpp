@@ -23,6 +23,7 @@ const char* unit_kind_name(UnitKind kind) {
     case UnitKind::Trsm: return "trsm";
     case UnitKind::Gemm: return "gemm";
     case UnitKind::Solve: return "solve";
+    case UnitKind::Factor: return "factor";
     }
     return "unknown";
 }
@@ -178,6 +179,32 @@ bool TestStubUnit::poll_response(ExecResponse& response) {
     response_.reset();
     response_visible_ = false;
     return true;
+}
+
+void TestStubUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
+    // Contract: exactly one terminal response per accepted transaction. A
+    // dropped success response is replaced by an explicit ABORTED terminal.
+    if (response_.has_value() && response_->txn_id == txn_id) {
+        response_.reset();
+        response_visible_ = false;
+    }
+    if (!active_.has_value() || active_->txn_id != txn_id) {
+        return;
+    }
+    ExecResponse response;
+    response.txn_id = active_->txn_id;
+    response.epoch = active_->epoch;
+    response.command_id = active_->command_id;
+    response.node_id = active_->node_id;
+    response.unit_id = unit_id_;
+    response.status = cmd::StatusCode::Aborted;
+    response.reason = "node was aborted";
+    response.start_cycle = busy_start_;
+    response.finish_cycle = cycle;
+    active_.reset();
+    response_ = response;
+    response_ready_cycle_ = cycle;
+    response_visible_ = true;
 }
 
 void TestStubUnit::abort_epoch(std::uint64_t epoch, std::uint64_t cycle) {

@@ -1,9 +1,13 @@
 # Panel-LU 硬件架构与多模式 PE 接口/时序原型（T06）
 
-状态：**T06 架构设计 + 可执行原型已交付**。本文是 Panel-LU 子系统与共享多模式 PE
-池的设计权威文档，配套可编译接口（`graduation-code/systemc/include/panel_lu/`）、
-可执行时序/资源原型（`src/panel_lu/`）与测试
-（`tests/panel_lu_prototype_tests.cpp`、`tests/panel_lu_systemc_tests.cpp`）。
+状态：**T06 架构设计 + 可执行原型已交付；T07 正式 FP32 STATIC Panel 引擎已接入
+T05 真实数据面/控制面并完成数值验证**（详见
+[T07_Panel_LU数值引擎设计](../systemc/T07_Panel_LU数值引擎设计.md)）。本文是
+Panel-LU 子系统与共享多模式 PE 池的设计权威文档；T06 合成原型配套可编译接口
+（`graduation-code/systemc/include/panel_lu/`）、可执行时序/资源原型
+（`src/panel_lu/`）与测试（`tests/panel_lu_prototype_tests.cpp`、
+`tests/panel_lu_systemc_tests.cpp`），T07 正式引擎与测试见
+`src/panel_lu/panel_engine.cpp`、`tests/panel_lu_real_tests.cpp`。
 
 边界声明（必须随结果一起引用）：
 
@@ -69,7 +73,7 @@
 ## 1.2 command 生命周期（首版 step barrier）
 
 ```text
-SCAN         全 front（n×n）扫描：有限值检查 + 精确 maxabs 归约（独立读通路）
+SCAN         全 front（n×n）扫描：有限值检查 + 精确 maxabs 归约（共享读预算，轮转仲裁）
 SCAN_REDUCE  归约延迟结束后锁存 front_pre_elimination_max_abs 与阈值乘积
 DIAG(s)      生成 LU_DIAG(s,s)                     deps: 无（版本由 store 保证）
 TRSM(s)      生成 TRSM_LEFT(s,j>s) 与 TRSM_RIGHT(i>s,s)   deps: 本次 diag
@@ -166,7 +170,7 @@ PE = 16×16 output-stationary FMAC 阵列（256 FMAC，T=16 为已确认尺寸�
 | 装载队列 | 8 | 在途装载任务上界 |
 | 写回队列/reservation | 8 | 在途写回任务上界；满则 ExecDone 停等 |
 | dispatcher 队列 | 32（有界） | 满时 controller 计 `stall_dispatcher_full` 并下拍重试 |
-| 扫描 | 64 B/cycle + 8 周期归约 | 独立读通路，不占 PE；字节/周期/端口争用单独记账 |
+| 扫描 | 共享读预算 + 8 周期归约 | 与 PE 装载共用 `load_bytes_per_cycle`（有界轮转仲裁）；不占 PE；T06 原型的独立扫描预算仅作历史近似 |
 | 响应 hold | 0 | 响应背压可配 |
 
 - 首版不做显式 bank 冲突模型：tile store 是每 tile 一个 slot 的抽象，带宽由
@@ -252,8 +256,9 @@ deps ≤ 8。非法任务显式拒绝（`BAD_DESCRIPTOR`）。
   front_pre_elimination_max_abs` 在 binary64 中精确计算（两个 binary32 的乘积
   在 binary64 可精确表示，避免二次舍入）。任务携带该值，LU_DIAG 逐消元列检查
   **实际消元后**的主元。
-- 扫描必须完成且尺度有效后才申请计算 PE；扫描使用独立读通路，可与其他
-  front 的 PE 计算重叠，但与本 front 的 Panel 计算是前置依赖。
+- 扫描必须完成且尺度有效后才申请计算 PE；扫描与 PE 装载共享同一读预算
+  （有界轮转仲裁，见 §2.3），可与其他 front 的 PE 计算重叠，但与本 front 的
+  Panel 计算是前置依赖。
 - 扫描不融合装配、不做历史最大值估计、不从 Host 注入尺度（与计算基线一致）。
 
 ---

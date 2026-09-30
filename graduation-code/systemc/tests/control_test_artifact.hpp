@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,23 @@ struct TestNode {
     std::uint32_t pivot_dim{1};
     // child node id -> col_map (length == child's update_dim).
     std::map<std::uint32_t, std::vector<std::uint32_t>> contributions;
+    // Optional explicit row-major FP32 front values (total_dim * total_dim).
+    // When set, the front region uses these values instead of the byte
+    // pattern; used by real-numeric T07 tests.
+    std::vector<float> front_values;
+
+    TestNode() = default;
+    TestNode(
+        std::uint32_t id,
+        std::int32_t parent,
+        std::uint32_t total,
+        std::uint32_t pivot,
+        std::map<std::uint32_t, std::vector<std::uint32_t>> child_maps)
+        : node_id(id),
+          parent_id(parent),
+          total_dim(total),
+          pivot_dim(pivot),
+          contributions(std::move(child_maps)) {}
 };
 
 struct TestArtifactOptions {
@@ -35,6 +53,9 @@ struct TestArtifactOptions {
     std::uint32_t threshold_bits{0};
     std::uint32_t matrix_dim{8};
     std::uint32_t tile_size{16};
+    // Trailing SOLVE commands are skipped when false (real-backend numeric
+    // tests of one panel chain do not need solve units).
+    bool include_solve{true};
 };
 
 struct TestArtifact {
@@ -287,11 +308,17 @@ inline TestArtifact build_test_artifact(
         const std::uint32_t update = total - pivot;
         const std::string prefix = "node." + std::to_string(node.node_id);
         RegionSpec front{prefix + ".front", total, total, cmd::DataFormat::Fp32, {}};
-        for (std::uint32_t row = 0; row < total; ++row) {
-            for (std::uint32_t col = 0; col < total; ++col) {
-                for (unsigned b = 0; b < 4; ++b) {
-                    front.data.push_back(
-                        b == 0 ? detail::front_byte(node.node_id, row, col) : 0);
+        if (node.front_values.size() == static_cast<std::size_t>(total) * total) {
+            front.data.resize(static_cast<std::size_t>(total) * total * 4);
+            std::memcpy(
+                front.data.data(), node.front_values.data(), front.data.size());
+        } else {
+            for (std::uint32_t row = 0; row < total; ++row) {
+                for (std::uint32_t col = 0; col < total; ++col) {
+                    for (unsigned b = 0; b < 4; ++b) {
+                        front.data.push_back(
+                            b == 0 ? detail::front_byte(node.node_id, row, col) : 0);
+                    }
                 }
             }
         }
@@ -439,6 +466,7 @@ inline TestArtifact build_test_artifact(
 
     // Solve phase (trailing chain).
     std::optional<std::pair<std::uint32_t, std::string>> previous;
+    if (options.include_solve) {
     for (const auto& node : nodes) {
         CommandSpec spec{cmd::Opcode::SolveForward, node.node_id,
                          "node." + std::to_string(node.node_id) + ".solve_forward",
@@ -459,6 +487,7 @@ inline TestArtifact build_test_artifact(
         }
         emit(spec);
         previous = std::make_pair(node.node_id, std::string("solve_backward"));
+    }
     }
 
     // ---- descriptor specs -----------------------------------------------
@@ -766,11 +795,16 @@ inline TestArtifact build_test_artifact(
         "    \"max_front_size\": 256,\n"
         "    \"max_wait_tokens\": 256\n"
         "  },\n";
+    float threshold_ratio = 0.0f;
+    std::memcpy(&threshold_ratio, &options.threshold_bits, sizeof(threshold_ratio));
+    std::ostringstream threshold_text;
+    threshold_text.precision(9);
+    threshold_text << std::fixed << threshold_ratio;
     manifest += std::string("  \"pivot\": {\n    \"policy\": \"") +
                 (options.policy == cmd::PivotPolicy::Static ? "STATIC" : "DYNAMIC_PANEL") +
                 "\",\n"
                 "    \"scope\": \"batch_level_uniform\",\n"
-                "    \"threshold_ratio\": 0.0,\n"
+                "    \"threshold_ratio\": " + threshold_text.str() + ",\n"
                 "    \"threshold_bits_fp32\": " +
                 std::to_string(options.threshold_bits) +
                 ",\n"

@@ -1,8 +1,11 @@
 #include "panel_lu/panel_lu_prototype.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace hw::panel_lu {
@@ -52,7 +55,35 @@ PanelLuPrototype::PanelLuPrototype(PanelLuConfig config)
     : config_(config),
       global_grid_(ceil_div16(config.max_front_dim)),
       max_tiles_(global_grid_ * global_grid_),
+      synthetic_access_(store_),
       dispatcher_(config_, &pes_, &store_) {}
+
+bool SyntheticFrontReader::read_front(
+    std::uint64_t byte_offset,
+    std::uint32_t length_bytes,
+    std::uint8_t* out,
+    std::uint64_t cycle) {
+    (void)cycle;
+    if (layout_.kind != PanelFrontLayout::Kind::PerTileSlots ||
+        layout_.total_dim == 0 || byte_offset % 4 != 0 || length_bytes % 4 != 0) {
+        return false;
+    }
+    const std::uint64_t first_element = byte_offset / 4;
+    const std::uint32_t elements = length_bytes / 4;
+    for (std::uint32_t e = 0; e < elements; ++e) {
+        const std::uint64_t index = first_element + e;
+        const std::uint32_t row = static_cast<std::uint32_t>(index / layout_.total_dim);
+        const std::uint32_t col = static_cast<std::uint32_t>(index % layout_.total_dim);
+        const std::uint32_t slot = layout_.handle.slot + row / 16 * layout_.global_grid +
+                                   col / 16;
+        if (!store_.assigned(slot)) {
+            return false;
+        }
+        const float value = store_.data(slot)[(row % 16) * 16 + (col % 16)];
+        std::memcpy(out + static_cast<std::size_t>(e) * 4, &value, 4);
+    }
+    return true;
+}
 
 ConfigCheck PanelLuPrototype::configure() {
     const ConfigCheck check = validate_panel_config(config_);
@@ -76,8 +107,9 @@ ConfigCheck PanelLuPrototype::configure() {
     controller_slots_.reserve(config_.max_resident_commands);
     for (std::uint32_t i = 0; i < config_.max_resident_commands; ++i) {
         ControllerSlot slot;
+        slot.reader = std::make_unique<SyntheticFrontReader>(store_);
         slot.controller = std::make_unique<PanelController>(
-            config_, &dispatcher_, &store_, global_grid_);
+            config_, &dispatcher_, &store_, slot.reader.get());
         controller_slots_.push_back(std::move(slot));
     }
     configured_ = true;
@@ -145,8 +177,113 @@ ConfigCheck PanelLuPrototype::submit_command(
     const std::uint32_t slot_base = slot_index * max_tiles_;
     const std::uint64_t first_task_id =
         first_task_id_override != 0 ? first_task_id_override : next_task_id_base_;
+
+    // Validate the request before touching the synthetic front: an oversized
+    // front must be rejected without materializing (or indexing) any tile.
+    const ConfigCheck capability =
+        check_front_capability(
+            request.front_dim,
+            request.pivot_dim,
+            request.tile_size,
+            request.policy,
+            config_);
+    if (!capability.ok) {
+        return capability;
+    }
+
+    // Materialize the synthetic front (n x n) into the per-tile store slots.
+    // The scan reads the whole front; the panel tasks only touch A11 (p x p).
+    const std::uint32_t front_grid = ceil_div16(request.front_dim);
+    for (std::uint32_t tr = 0; tr < front_grid; ++tr) {
+        for (std::uint32_t tc = 0; tc < front_grid; ++tc) {
+            std::vector<float> values(TileStore::kTileFloats, 0.0f);
+            for (std::uint32_t i = 0; i < 16; ++i) {
+                for (std::uint32_t j = 0; j < 16; ++j) {
+                    const std::uint32_t gi = tr * 16 + i;
+                    const std::uint32_t gj = tc * 16 + j;
+                    if (gi >= request.front_dim || gj >= request.front_dim) {
+                        continue;
+                    }
+                    float value = 0.0f;
+                    if (gi == gj) {
+                        value = request.synthetic.diagonal +
+                                0.001f * static_cast<float>(
+                                             (gi * 7 + request.synthetic.seed) % 5);
+                    } else {
+                        const int pattern = static_cast<int>(
+                                                (gi * 3 + gj * 5 + request.synthetic.seed) % 7) -
+                                            3;
+                        value = request.synthetic.off_diagonal * static_cast<float>(pattern);
+                    }
+                    values[i * 16 + j] = value;
+                }
+            }
+            store_.assign(
+                slot_base + tr * global_grid_ + tc,
+                "cmd" + std::to_string(request.command_id),
+                static_cast<std::uint32_t>(epoch_),
+                values);
+        }
+    }
+    for (const SyntheticInject& inject : request.synthetic.injects) {
+        if (inject.row >= request.front_dim || inject.col >= request.front_dim) {
+            continue;
+        }
+        auto set_value = [&](std::uint32_t row, std::uint32_t col, float value) {
+            const std::uint32_t slot = slot_base + row / 16 * global_grid_ + col / 16;
+            float* data = store_.data(slot);
+            data[(row % 16) * 16 + (col % 16)] = value;
+        };
+        switch (inject.kind) {
+            case SyntheticInject::Kind::ZeroDiagonal:
+                set_value(inject.row, inject.col, 0.0f);
+                break;
+            case SyntheticInject::Kind::TinyDiagonal:
+                set_value(
+                    inject.row,
+                    inject.col,
+                    inject.value != 0.0f ? inject.value : 1.0e-12f);
+                break;
+            case SyntheticInject::Kind::SingularPair: {
+                if (inject.row + 1 >= request.front_dim) {
+                    break;
+                }
+                const std::uint32_t row0 = inject.row;
+                const std::uint32_t row1 = inject.row + 1;
+                for (std::uint32_t col = inject.col; col < request.front_dim; ++col) {
+                    float* src =
+                        store_.data(slot_base + row0 / 16 * global_grid_ + col / 16);
+                    float* dst =
+                        store_.data(slot_base + row1 / 16 * global_grid_ + col / 16);
+                    dst[(row1 % 16) * 16 + (col % 16)] =
+                        src[(row0 % 16) * 16 + (col % 16)];
+                }
+                break;
+            }
+            case SyntheticInject::Kind::NanEntry:
+                set_value(inject.row, inject.col, std::nanf(""));
+                break;
+            case SyntheticInject::Kind::InfEntry:
+                set_value(
+                    inject.row, inject.col, std::numeric_limits<float>::infinity());
+                break;
+            case SyntheticInject::Kind::None:
+                break;
+        }
+    }
+
+    PanelFrontLayout layout;
+    layout.kind = PanelFrontLayout::Kind::PerTileSlots;
+    layout.handle.slot = slot_base;
+    layout.handle.generation = static_cast<std::uint32_t>(epoch_);
+    layout.generation = static_cast<std::uint32_t>(epoch_);
+    layout.base_offset = 0;
+    layout.row_stride_bytes = 64;
+    layout.global_grid = global_grid_;
+    layout.total_dim = request.front_dim;
+    free_slot->reader->configure(layout);
     const ConfigCheck started = free_slot->controller->start(
-        request, cycle_, epoch_, slot_base, first_task_id);
+        request, cycle_, epoch_, layout, first_task_id);
     if (!started.ok) {
         return started;
     }
@@ -197,7 +334,12 @@ void PanelLuPrototype::tick() {
 
     // Phase 1: PE progress. Shared load/writeback budgets are consumed here.
     for (MultiModePe& pe : pes_) {
-        pe.tick(cycle_, load_budget_, store_write_budget_, writeback_reservation_, store_);
+        pe.tick(
+            cycle_,
+            load_budget_,
+            store_write_budget_,
+            writeback_reservation_,
+            synthetic_access_);
     }
     // Phase 2: route terminal task responses (commit visible results).
     route_pe_responses();
@@ -258,7 +400,7 @@ void PanelLuPrototype::route_pe_responses() {
                 committed = dispatcher_.on_task_committed(
                     response.task_id,
                     response.command_id,
-                    task_view->dst.handle.slot,
+                    task_view->dst.version_key,
                     task_view->dst.version);
                 if (!committed) {
                     control_fault_ = true;

@@ -18,12 +18,12 @@ std::uint32_t ceil_div16(std::uint32_t value) {
 PanelController::PanelController(
     const PanelLuConfig& config,
     TileDispatcher* dispatcher,
-    TileStore* store,
-    std::uint32_t global_grid)
+    TileVersionStore* versions,
+    FrontReader* reader)
     : config_(config),
       dispatcher_(dispatcher),
-      store_(store),
-      global_grid_(global_grid) {}
+      versions_(versions),
+      reader_(reader) {}
 
 StatusCode PanelController::decode_threshold_bits(std::uint32_t bits, float* out) {
     float value = 0.0f;
@@ -41,7 +41,7 @@ ConfigCheck PanelController::start(
     const PanelCommandRequest& request,
     std::uint64_t cycle,
     std::uint64_t epoch,
-    std::uint32_t slot_base,
+    const PanelFrontLayout& layout,
     std::uint64_t first_task_id) {
     const ConfigCheck capability = check_front_capability(
         request.front_dim,
@@ -77,7 +77,8 @@ ConfigCheck PanelController::start(
 
     request_ = request;
     epoch_ = epoch;
-    slot_base_ = slot_base;
+    layout_ = layout;
+    global_grid_ = layout.global_grid != 0 ? layout.global_grid : 1;
     local_grid_ = ceil_div16(request.pivot_dim);
     num_steps_ = local_grid_;
     step_ = 0;
@@ -116,94 +117,7 @@ ConfigCheck PanelController::start(
     diag_task_ids_.assign(local_grid_, 0);
     left_task_ids_.assign(local_grid_, std::vector<std::uint64_t>(local_grid_, 0));
     right_task_ids_.assign(local_grid_, std::vector<std::uint64_t>(local_grid_, 0));
-
-    // Materialize the synthetic front (n x n) into the tile store. The scan
-    // reads the whole front; the panel tasks only touch A11 (p x p).
-    const std::uint32_t front_grid = ceil_div16(request.front_dim);
-    for (std::uint32_t tr = 0; tr < front_grid; ++tr) {
-        for (std::uint32_t tc = 0; tc < front_grid; ++tc) {
-            std::vector<float> values(TileStore::kTileFloats, 0.0f);
-            for (std::uint32_t i = 0; i < 16; ++i) {
-                for (std::uint32_t j = 0; j < 16; ++j) {
-                    const std::uint32_t gi = tr * 16 + i;
-                    const std::uint32_t gj = tc * 16 + j;
-                    if (gi >= request.front_dim || gj >= request.front_dim) {
-                        continue;
-                    }
-                    float value = 0.0f;
-                    if (gi == gj) {
-                        value = request.synthetic.diagonal +
-                                0.001f * static_cast<float>(
-                                             (gi * 7 + request.synthetic.seed) % 5);
-                    } else {
-                        const int pattern =
-                            static_cast<int>((gi * 3 + gj * 5 + request.synthetic.seed) % 7) - 3;
-                        value = request.synthetic.off_diagonal * static_cast<float>(pattern);
-                    }
-                    values[i * 16 + j] = value;
-                }
-            }
-            store_->assign(
-                tile_slot(TileCoord{tr, tc}),
-                "cmd" + std::to_string(request.command_id),
-                static_cast<std::uint32_t>(epoch_),
-                values);
-        }
-    }
-
-    // Apply synthetic injections (prototype-only data-dependent scenarios).
-    for (const SyntheticInject& inject : request.synthetic.injects) {
-        if (inject.row >= request.front_dim || inject.col >= request.front_dim) {
-            continue;
-        }
-        auto set_value = [&](std::uint32_t row, std::uint32_t col, float value) {
-            const std::uint32_t slot =
-                tile_slot(TileCoord{row / 16, col / 16});
-            float* data = store_->data(slot);
-            data[(row % 16) * 16 + (col % 16)] = value;
-        };
-        switch (inject.kind) {
-            case SyntheticInject::Kind::ZeroDiagonal:
-                set_value(inject.row, inject.col, 0.0f);
-                break;
-            case SyntheticInject::Kind::TinyDiagonal:
-                set_value(
-                    inject.row,
-                    inject.col,
-                    inject.value != 0.0f ? inject.value : 1.0e-12f);
-                break;
-            case SyntheticInject::Kind::SingularPair: {
-                // Make row+1 equal to row from column col onwards: after
-                // eliminating column row, the next pivot becomes exactly zero
-                // even though the input diagonal was non-zero.
-                if (inject.row + 1 >= request.front_dim) {
-                    break;
-                }
-                const std::uint32_t row0 = inject.row;
-                const std::uint32_t row1 = inject.row + 1;
-                for (std::uint32_t col = inject.col; col < request.front_dim; ++col) {
-                    const std::uint32_t slot_src = tile_slot(TileCoord{row0 / 16, col / 16});
-                    const std::uint32_t slot_dst = tile_slot(TileCoord{row1 / 16, col / 16});
-                    float* src = store_->data(slot_src);
-                    float* dst = store_->data(slot_dst);
-                    const std::uint32_t i0 = row0 % 16;
-                    const std::uint32_t i1 = row1 % 16;
-                    const std::uint32_t j = col % 16;
-                    dst[i1 * 16 + j] = src[i0 * 16 + j];
-                }
-                break;
-            }
-            case SyntheticInject::Kind::NanEntry:
-                set_value(inject.row, inject.col, std::nanf(""));
-                break;
-            case SyntheticInject::Kind::InfEntry:
-                set_value(inject.row, inject.col, std::numeric_limits<float>::infinity());
-                break;
-            case SyntheticInject::Kind::None:
-                break;
-        }
-    }
-    (void)threshold_ratio;
+    gemm_done_.clear();
 
     ConfigCheck check;
     check.ok = true;
@@ -222,18 +136,37 @@ std::uint32_t PanelController::tile_width(std::uint32_t tile) const {
     return std::min<std::uint32_t>(16, request_.pivot_dim - base);
 }
 
-std::uint32_t PanelController::tile_slot(TileCoord coord) const {
-    return slot_base_ + coord.row * global_grid_ + coord.col;
+std::uint64_t PanelController::version_key(TileCoord coord) const {
+    if (layout_.kind == PanelFrontLayout::Kind::PerTileSlots) {
+        return layout_.handle.slot + coord.row * global_grid_ + coord.col;
+    }
+    const std::uint64_t tile_index =
+        static_cast<std::uint64_t>(coord.row) * global_grid_ + coord.col;
+    return (static_cast<std::uint64_t>(layout_.handle.slot) << 32) | (tile_index + 1);
 }
 
-TileOperand PanelController::operand(std::uint32_t slot, std::uint32_t version) const {
+std::uint32_t PanelController::operand_version(TileCoord coord) const {
+    return versions_->version(version_key(coord));
+}
+
+TileOperand PanelController::operand_for(TileCoord coord, std::uint32_t version) const {
     TileOperand result;
-    result.handle.slot = slot;
-    result.handle.generation = store_->generation(slot);
-    result.offset = 0;
-    result.stride_bytes = 64;
     result.version = version;
+    result.version_key = version_key(coord);
     result.valid = true;
+    if (layout_.kind == PanelFrontLayout::Kind::PerTileSlots) {
+        result.handle.slot = layout_.handle.slot + coord.row * global_grid_ + coord.col;
+        result.handle.generation = layout_.generation;
+        result.offset = 0;
+        result.stride_bytes = 64;
+    } else {
+        result.handle = layout_.handle;
+        result.handle.generation = layout_.generation;
+        result.offset = layout_.base_offset +
+                        static_cast<std::uint64_t>(coord.row) * 16 * layout_.row_stride_bytes +
+                        static_cast<std::uint64_t>(coord.col) * 16 * 4;
+        result.stride_bytes = layout_.row_stride_bytes;
+    }
     return result;
 }
 
@@ -262,39 +195,39 @@ TileTask PanelController::make_task(
     task.front_pre_elimination_max_abs = front_max_abs_;
     task.threshold_product = threshold_product_;
 
-    const std::uint32_t diag_slot = tile_slot(TileCoord{step, step});
-    const std::uint32_t target_slot = tile_slot(coord);
-    const std::uint32_t target_version = store_->version(target_slot);
-    const std::uint32_t diag_version = store_->version(diag_slot);
+    const TileCoord diag_coord{step, step};
+    const std::uint32_t target_version = operand_version(coord);
+    const std::uint32_t diag_version = operand_version(diag_coord);
 
     switch (mode) {
         case TileMode::LuDiag:
-            task.dst = operand(diag_slot, diag_version);
+            task.dst = operand_for(diag_coord, diag_version);
             task.output_version = diag_version + 1;
             task.pivot_base = step * 16;
             break;
         case TileMode::TrsmLeft:
             // lhs = packed L diag tile, rhs/dst = A(s,j) which becomes U(s,j).
-            task.lhs = operand(diag_slot, diag_version);
-            task.rhs = operand(target_slot, target_version);
-            task.dst = operand(target_slot, target_version);
+            task.lhs = operand_for(diag_coord, diag_version);
+            task.rhs = operand_for(coord, target_version);
+            task.dst = operand_for(coord, target_version);
             task.output_version = target_version + 1;
             break;
         case TileMode::TrsmRight:
             // lhs/dst = A(i,s) which becomes L(i,s), rhs = packed U diag tile.
-            task.lhs = operand(target_slot, target_version);
-            task.rhs = operand(diag_slot, diag_version);
-            task.dst = operand(target_slot, target_version);
+            task.lhs = operand_for(coord, target_version);
+            task.rhs = operand_for(diag_coord, diag_version);
+            task.dst = operand_for(coord, target_version);
             task.output_version = target_version + 1;
             break;
-        case TileMode::GemmUpdate:
-            task.lhs = operand(tile_slot(TileCoord{coord.row, step}),
-                               store_->version(tile_slot(TileCoord{coord.row, step})));
-            task.rhs = operand(tile_slot(TileCoord{step, coord.col}),
-                               store_->version(tile_slot(TileCoord{step, coord.col})));
-            task.dst = operand(target_slot, target_version);
+        case TileMode::GemmUpdate: {
+            const TileCoord lhs_coord{coord.row, step};
+            const TileCoord rhs_coord{step, coord.col};
+            task.lhs = operand_for(lhs_coord, operand_version(lhs_coord));
+            task.rhs = operand_for(rhs_coord, operand_version(rhs_coord));
+            task.dst = operand_for(coord, target_version);
             task.output_version = target_version + 1;
             break;
+        }
     }
     return task;
 }
@@ -518,21 +451,28 @@ void PanelController::tick(
             if (scan_bytes_remaining_ > 0) {
                 std::uint64_t chunk = std::min(scan_bytes_remaining_, scan_budget.remaining());
                 chunk -= chunk % 4;
-                if (chunk == 0 || !scan_budget.request(chunk)) {
+                if (chunk == 0) {
+                    ++stall_scan_port_;
+                    break;
+                }
+                const std::uint64_t byte_offset = scan_bytes_total_ - scan_bytes_remaining_;
+                std::vector<std::uint8_t> bytes(static_cast<std::size_t>(chunk));
+                if (!reader_->read_front(byte_offset, static_cast<std::uint32_t>(chunk),
+                                         bytes.data(), cycle)) {
+                    // Front bytes are not readable yet (lease latency/backpressure);
+                    // retry next cycle without consuming read credit.
+                    ++stall_scan_port_;
+                    break;
+                }
+                if (!scan_budget.request(chunk)) {
                     ++stall_scan_port_;
                     break;
                 }
                 const std::uint32_t elements = static_cast<std::uint32_t>(chunk / 4);
                 scan_bytes_remaining_ -= chunk;
                 for (std::uint32_t e = 0; e < elements; ++e) {
-                    const std::uint64_t index = scan_elements_done_ + e;
-                    const std::uint32_t row =
-                        static_cast<std::uint32_t>(index / request_.front_dim);
-                    const std::uint32_t col =
-                        static_cast<std::uint32_t>(index % request_.front_dim);
-                    const float value =
-                        store_->data(tile_slot(TileCoord{row / 16, col / 16}))
-                            [(row % 16) * 16 + (col % 16)];
+                    float value = 0.0f;
+                    std::memcpy(&value, bytes.data() + static_cast<std::size_t>(e) * 4, 4);
                     if (!std::isfinite(value)) {
                         scan_non_finite_ = true;
                     } else {
@@ -756,7 +696,7 @@ void PanelController::reset() {
     request_ = PanelCommandRequest{};
     phase_ = Phase::Idle;
     epoch_ = 0;
-    slot_base_ = 0;
+    layout_ = PanelFrontLayout{};
     local_grid_ = 0;
     num_steps_ = 0;
     step_ = 0;

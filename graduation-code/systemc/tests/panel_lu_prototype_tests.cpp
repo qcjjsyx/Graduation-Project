@@ -1128,7 +1128,7 @@ void test_trsm_right_forward_substitution() {
     {
         float u[4] = {2.0f, 1.0f, 0.0f, 4.0f};
         float b[2] = {2.0f, 5.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 2, 1, 2, u, 2);
+        const auto outcome = pl::kernels::run_trsm_right(b, 2, 1, 2, u, 2);
         expect(outcome.status == cmd::StatusCode::Ok, "trsm_right 2x2 succeeds");
         expect(
             std::fabs(b[0] - 1.0f) < 1e-6f && std::fabs(b[1] - 1.0f) < 1e-6f,
@@ -1142,7 +1142,7 @@ void test_trsm_right_forward_substitution() {
     {
         float u[9] = {1.0f, 2.0f, 3.0f, 0.0f, 4.0f, 5.0f, 0.0f, 0.0f, 6.0f};
         float b[3] = {1.0f, 2.0f, 3.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 3, 1, 3, u, 3);
+        const auto outcome = pl::kernels::run_trsm_right(b, 3, 1, 3, u, 3);
         expect(outcome.status == cmd::StatusCode::Ok, "trsm_right 3x3 succeeds");
         expect(
             std::fabs(b[0] - 1.0f) < 1e-6f && std::fabs(b[1]) < 1e-6f &&
@@ -1163,7 +1163,7 @@ void test_trsm_right_forward_substitution() {
     {
         float u[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         float b[2] = {1.0f, 1.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 2, 1, 2, u, 2);
+        const auto outcome = pl::kernels::run_trsm_right(b, 2, 1, 2, u, 2);
         expect(
             outcome.status == cmd::StatusCode::StaticPivotFailure &&
                 outcome.failed_column == 1,
@@ -1175,7 +1175,7 @@ void test_trsm_right_forward_substitution() {
         // before (and not masked by) the later zero diagonal at column 1.
         float u[4] = {1.0e-39f, 0.0f, 0.0f, 0.0f};
         float b[2] = {1.0f, 1.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 2, 1, 2, u, 2);
+        const auto outcome = pl::kernels::run_trsm_right(b, 2, 1, 2, u, 2);
         expect(
             outcome.status == cmd::StatusCode::NonFiniteValue &&
                 outcome.failed_column == 0 && outcome.diagonal_failure,
@@ -1185,7 +1185,7 @@ void test_trsm_right_forward_substitution() {
         // Overflow at column 1 when column 0 is healthy.
         float u[4] = {2.0f, 0.0f, 0.0f, 1.0e-39f};
         float b[2] = {1.0f, 1.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 2, 1, 2, u, 2);
+        const auto outcome = pl::kernels::run_trsm_right(b, 2, 1, 2, u, 2);
         expect(
             outcome.status == cmd::StatusCode::NonFiniteValue &&
                 outcome.failed_column == 1 && outcome.diagonal_failure,
@@ -1195,7 +1195,7 @@ void test_trsm_right_forward_substitution() {
         // A wide but representable dynamic range stays finite and succeeds.
         float u[4] = {1.0e-30f, 0.0f, 0.0f, 1.0e+30f};
         float b[2] = {1.0f, 1.0f};
-        const auto outcome = pl::synthetic::run_trsm_right(b, 2, 1, 2, u, 2);
+        const auto outcome = pl::kernels::run_trsm_right(b, 2, 1, 2, u, 2);
         expect(outcome.status == cmd::StatusCode::Ok, "extreme finite range succeeds");
         expect(
             std::isfinite(b[0]) && std::isfinite(b[1]) &&

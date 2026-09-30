@@ -462,9 +462,40 @@ ctest --test-dir /tmp/t04-build --output-on-failure      # 运行当前注册的
 
 ## 8. T06 原型与 T07 接入位置
 
-T06 代码位于 `include/panel_lu/` 和 `src/panel_lu/`，包含 PanelController、TileDispatcher、MultiModePe、TileStore 和 PanelLuPrototype。它独立接收合成 PanelCommandRequest，尚未挂接 CommandDevice；其通过原型测试不代表现有命令设备已支持真实 Panel。
+T06 代码位于 `include/panel_lu/` 和 `src/panel_lu/`，包含 PanelController、TileDispatcher、MultiModePe、TileStore 和 PanelLuPrototype。T06 原型独立接收合成 PanelCommandRequest，其通过原型测试不代表真实 Panel；T07 已在其上交付正式引擎并接入 CommandDevice：
 
-目标路径如下，虚线边界表示 T07 起实施的迁移：
+- `controlplane/panel_exec_unit.hpp/.cpp`：`PanelExecutionUnit`（共享
+  `PanelEngine` 的 IExecutionUnit 适配器，`tick()` 为 no-op）与
+  `FactorStoreUnit`（kind=Factor，STORE_FACTOR 真实 L/U 转换）。
+- `panel_lu/panel_engine.hpp/.cpp`：共享 PE 池 + dispatcher + 每 command
+  controller；真实 front 通过 BufferManager lease 读写；扫描与装载共享读
+  预算（有界轮转），写回有独立写预算与 reservation；每拍由 CommandDevice
+  统一 `tick()` 一次。
+- `IExecutionUnit` 新增 `abort_txn`（定向取消）与 `deliver_memory_response`
+  （默认空）；`abort_node` 改为定向 `abort_txn`，不再用共享 epoch 取消。
+- `ControlPlaneConfig` 新增 `enable_real_panel` 与 `panel=PanelLuConfig`；
+  `start()` 在 `RequireRealKernels` 下必须显式开启 real panel，两个后端都
+  未开启则拒绝。未绑定 unit 的 kind（TRSM/GEMM/assemble/solve）在派发前
+  返回 `POLICY_NOT_SUPPORTED`，不落 stub、不永久等待。
+- P-vector 仍由 PostExec 写完整 identity 并等确认；真实引擎只返回
+  `needs_pvector_write`。
+- `summary.json` 增加 `panel_backend_real_fp32`、`mixed_backend_explicit`、
+  `numerical_scope` 与 `panel_engine` 统计；真实引擎运行时额外输出
+  `panel_tasks.csv`（task/PE/mode/周期/字节/提交状态）。
+- `reset()` 额外复位共享引擎；失败/abort 后在途任务安全排空，旧响应由
+  `handle_exec_response` 的终态守卫丢弃。
+- 定向 abort：`abort_node` 调用 `unit->abort_txn` 后**保留 tracker 与 lease**，
+  等执行单元产出唯一终态响应（Factor 单元还会等已接受的 DDR 写确认）才释放
+  资源、结束命令；`tick()` 的 Completed 判定额外要求所有执行单元 `!busy()`、
+  DMA 空闲且 `exec_inbox` 为空，避免“取消已请求”被当成“执行已排空”。
+- `STORE_FACTOR`：绑定正式 Factor 单元时忙则等待（`stall_resource`），旧
+  DMA 矩形复制只在显式 test-stub 后端（无 Factor 单元）运行。
+- 内存响应按 request id 精确路由：`IExecutionUnit::handles_request` 决定属主，
+  单实例只看到自己的未决写；未决集合为空且无新写时才返回终态。
+- T07 测试：`panel_lu_real_tests`（206 checks，含数值/失败/双 front/abort、定向 drain、Factor 路由/背压/FP64 诊断/
+  reset/背压）与 `panel_lu_real_systemc_tests`（sc_clock 集成）。
+
+目标路径如下，T07 已完成其中 Panel 分支的迁移：
 
 ```text
 CommandDevice：command 依赖/准入/lease/失败传播/completion

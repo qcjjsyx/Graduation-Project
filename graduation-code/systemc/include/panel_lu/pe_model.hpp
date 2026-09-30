@@ -11,6 +11,7 @@
 // has no dependence on SystemC. The prototype is marked
 // architecture_prototype / numerical_validation=not_performed.
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -58,11 +59,12 @@ public:
     std::uint32_t active_task_count() const;
 
     // Accepts a task into a free slot when the PE-local operand FIFO has room.
-    // Returns false (stall, not an error) otherwise.
+    // Operands are NOT read here: the bounded Loading phase fetches them
+    // through TileAccess under the shared read budget, then computes on the
+    // staged snapshot. Returns false (stall, not an error) otherwise.
     bool try_accept(
         const TileTask& task,
         std::uint64_t cycle,
-        TileStore& store,
         std::string* reason);
 
     // Advances one cycle. Shared per-cycle budgets and the bounded writeback
@@ -72,7 +74,7 @@ public:
         PortBudget& load_budget,
         PortBudget& store_write_budget,
         WritebackReservation& writeback_reservation,
-        TileStore& store);
+        TileAccess& access);
 
     bool poll_response(TileTaskResponse& out, std::uint64_t cycle);
 
@@ -116,8 +118,17 @@ private:
         StatusCode status{StatusCode::Ok};
         std::string reason;
         std::uint32_t failed_column{0};
-        // Functional result precomputed at accept time; it becomes visible in
+        // Staged operand snapshots (index 0=dst, 1=lhs, 2=rhs per mode) and
+        // the functional result. Nothing is read at accept time; the bounded
+        // Loading phase fills these under the shared read budget, then runs
+        // the kernel on the completed snapshot. The result becomes visible in
         // the tile store only when the modeled writeback completes.
+        std::vector<std::vector<float>> operand_tiles;
+        std::array<TileOperand, 3> operand_refs{};
+        std::array<bool, 3> operand_present{};
+        std::uint32_t load_operand{0};
+        std::uint32_t load_row{0};
+        std::uint32_t load_col{0};
         std::vector<float> result;
         std::uint64_t exec_cycles{0};
         std::uint64_t accepted_cycle{0};

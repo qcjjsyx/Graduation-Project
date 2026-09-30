@@ -121,13 +121,14 @@ add_library(controlplane STATIC
     src/controlplane/token_scoreboard.cpp
     src/controlplane/completion_writer.cpp
     src/controlplane/dma_arbiter.cpp
+    src/controlplane/panel_exec_unit.cpp
     src/controlplane/test_stub_unit.cpp
     src/controlplane/control_plane.cpp
 )
 target_include_directories(controlplane
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
-target_link_libraries(controlplane PUBLIC dataplane)
+target_link_libraries(controlplane PUBLIC dataplane panel_lu)
 enable_project_warnings(controlplane)
 enable_project_sanitizers(controlplane)
 
@@ -172,6 +173,7 @@ add_library(panel_lu STATIC
     src/panel_lu/pe_model.cpp
     src/panel_lu/tile_dispatcher.cpp
     src/panel_lu/panel_controller.cpp
+    src/panel_lu/panel_engine.cpp
     src/panel_lu/panel_lu_prototype.cpp
 )
 target_include_directories(panel_lu
@@ -193,6 +195,21 @@ if(SYSTEMC_HOME AND APPLE)
     set_target_properties(
         panel_lu_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
 endif()
+
+add_executable(panel_lu_real_systemc_tests tests/panel_lu_real_systemc_tests.cpp)
+target_link_libraries(panel_lu_real_systemc_tests
+    PRIVATE controlplane panel_lu fp64_reference SystemC::systemc)
+enable_project_warnings(panel_lu_real_systemc_tests)
+enable_project_sanitizers(panel_lu_real_systemc_tests)
+if(SYSTEMC_HOME AND APPLE)
+    set_target_properties(
+        panel_lu_real_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
+endif()
+
+add_executable(panel_lu_real_tests tests/panel_lu_real_tests.cpp)
+target_link_libraries(panel_lu_real_tests PRIVATE controlplane panel_lu fp64_reference)
+enable_project_warnings(panel_lu_real_tests)
+enable_project_sanitizers(panel_lu_real_tests)
 
 add_executable(panel_lu_prototype_smoke src/panel_lu_prototype_smoke.cpp)
 target_link_libraries(panel_lu_prototype_smoke PRIVATE panel_lu)
@@ -265,6 +282,10 @@ if(BUILD_TESTING)
 
     add_test(NAME panel_lu_prototype_tests COMMAND panel_lu_prototype_tests
         "${CMAKE_CURRENT_BINARY_DIR}/t06_output")
+
+    add_test(NAME panel_lu_real_tests COMMAND panel_lu_real_tests
+        "${CMAKE_CURRENT_BINARY_DIR}/t07_output")
+    add_test(NAME panel_lu_real_systemc_tests COMMAND panel_lu_real_systemc_tests)
 
     add_test(NAME panel_lu_systemc_tests COMMAND panel_lu_systemc_tests)
     set_tests_properties(panel_lu_systemc_tests PROPERTIES

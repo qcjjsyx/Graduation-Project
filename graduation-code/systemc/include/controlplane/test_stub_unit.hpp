@@ -29,6 +29,7 @@ public:
     void tick(std::uint64_t cycle) override;
     bool poll_response(ExecResponse& response) override;
     bool busy() const override;
+    void abort_txn(std::uint64_t txn_id, std::uint64_t cycle) override;
     void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
     void reset() override;
 
@@ -37,7 +38,7 @@ public:
     void inject_failure(std::uint32_t command_id, ExecFailure failure);
     void clear_injections();
 
-    std::uint32_t active_command_id() const;
+    std::uint32_t active_command_id() const override;
     std::uint64_t busy_start() const { return busy_start_; }
     std::uint32_t accepted_count() const { return accepted_count_; }
 

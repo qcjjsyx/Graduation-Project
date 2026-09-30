@@ -369,6 +369,20 @@ reset：丢弃活动传输与 pending 响应（不交付）、`abort_lease` 回�
 - `DP-I-25` FP32/INT32 位模式逐字节保持，无隐式数值转换。
   验证：`test_bit_patterns_preserved`。
 
+T07 真实 Panel 引擎对数据面的使用（仅授权接口）：
+
+- 只通过 `BufferManager::lease_read/lease_write` 读写 front buffer；lease
+  由 T05 在派发时原子获取，命令终结才释放，引擎不重复申请整 front lease。
+- `lease.ready_cycle`、owner、handle generation、范围检查全部生效；端口
+  占用（port_count/活动 lease）表示“能否访问”，引擎每拍字节预算
+  （`PanelLuConfig::load/writeback_bytes_per_cycle`）表示“带宽”，二者不
+  重复计费。
+- `FactorStoreUnit` 的 L/U 持久化通过 `MemoryService` 写入（`Fp32Data`），
+  与 P-vector 的 `Int32Data` 写共用 ExecUnit 客户端；响应按 request_id 路由，
+  非 P-vector 响应对所有 unit 广播、由请求方消费。
+- 扫描与 PE 装载共享同一读预算（有界轮转仲裁）；`stall_scan_port` 与
+  `panel_tasks.csv` 使竞争可观察。
+
 ## 6. 错误、reset 与资源生命周期
 
 ### 6.1 错误分类

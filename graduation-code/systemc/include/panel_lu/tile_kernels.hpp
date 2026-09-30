@@ -1,21 +1,25 @@
 #pragma once
 
-// Synthetic FP32 tile kernels for the T06 architecture prototype ONLY.
+// Formal FP32 tile numerical primitives (T07). These are the production
+// primitives used by the real Panel engine and reused by T09/T10:
+//   - STATIC packed LU_DIAG with post-elimination pivot checks,
+//   - unit-lower TRSM_LEFT (forward substitution),
+//   - non-unit-upper TRSM_RIGHT (reciprocal precompute + multiply substitution),
+//   - GEMM_UPDATE with fused multiply-add.
 //
-// These kernels exist so that the prototype can produce data-dependent pivot
-// failures and dependency-consistent tile versions for explicitly synthetic
-// workloads. They are *not* a device numerical backend, are not validated
-// against the FP64 reference, do not implement the frozen rounding/FMA
-// contract of the production path and must never be wired into a real
-// CommandDevice execution slot. Prototype runs are marked
-// architecture_prototype / numerical_validation=not_performed.
+// Semantics: explicit FP32 FMA for all multiply-accumulate updates, gradual
+// underflow (subnormals are preserved, never flushed to zero), no fast-math,
+// and per-column finiteness checks so the first failing column/stage is
+// reported consistently with the modeled execution-time contract. The T06
+// architecture prototype calls the same primitives on synthetic workloads;
+// the primitive semantics themselves are the production ones.
 
 #include <cstdint>
 #include <string>
 
 #include "panel_lu/task_types.hpp"
 
-namespace hw::panel_lu::synthetic {
+namespace hw::panel_lu::kernels {
 
 struct KernelOutcome {
     StatusCode status{StatusCode::Ok};
@@ -69,4 +73,46 @@ KernelOutcome run_gemm_update(
     std::uint32_t n,
     std::uint32_t k);
 
-}  // namespace hw::panel_lu::synthetic
+// Explicit FP64 module diagnostic primitives: same algorithms, same status
+// semantics and failure columns, but binary64 accumulation. Only reachable
+// when PanelNumericMode::Fp64Diagnostic is declared; results are rounded back
+// to binary32 storage by the caller.
+namespace fp64_diagnostic {
+
+KernelOutcome run_lu_diag(
+    double* data,
+    std::uint32_t stride_floats,
+    std::uint32_t k,
+    double threshold_product,
+    std::uint32_t pivot_base);
+
+KernelOutcome run_trsm_left(
+    double* rhs,
+    std::uint32_t rhs_stride,
+    std::uint32_t k,
+    std::uint32_t n,
+    const double* l,
+    std::uint32_t l_stride);
+
+KernelOutcome run_trsm_right(
+    double* rhs,
+    std::uint32_t rhs_stride,
+    std::uint32_t m,
+    std::uint32_t k,
+    const double* u,
+    std::uint32_t u_stride);
+
+KernelOutcome run_gemm_update(
+    double* dst,
+    std::uint32_t dst_stride,
+    const double* lhs,
+    std::uint32_t lhs_stride,
+    const double* rhs,
+    std::uint32_t rhs_stride,
+    std::uint32_t m,
+    std::uint32_t n,
+    std::uint32_t k);
+
+}  // namespace fp64_diagnostic
+
+}  // namespace hw::panel_lu::kernels

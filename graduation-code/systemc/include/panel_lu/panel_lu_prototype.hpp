@@ -22,6 +22,24 @@
 
 namespace hw::panel_lu {
 
+// Reads assembled front bytes from per-tile synthetic store slots (T06 layout).
+class SyntheticFrontReader : public FrontReader {
+public:
+    explicit SyntheticFrontReader(TileStore& store) : store_(store) {}
+
+    void configure(const PanelFrontLayout& layout) { layout_ = layout; }
+
+    bool read_front(
+        std::uint64_t byte_offset,
+        std::uint32_t length_bytes,
+        std::uint8_t* out,
+        std::uint64_t cycle) override;
+
+private:
+    TileStore& store_;
+    PanelFrontLayout layout_{};
+};
+
 // Consolidated record of one internal tile task as observed by the prototype.
 struct TaskRecord {
     TileTask task;
@@ -103,6 +121,7 @@ public:
 
 private:
     struct ControllerSlot {
+        std::unique_ptr<SyntheticFrontReader> reader;
         std::unique_ptr<PanelController> controller;
         std::uint32_t command_id{hw::command::NONE};
         bool active{false};
@@ -128,6 +147,7 @@ private:
     std::uint32_t global_grid_{16};
     std::uint32_t max_tiles_{256};
     TileStore store_;
+    SyntheticTileAccess synthetic_access_;
     std::vector<MultiModePe> pes_;
     WritebackReservation writeback_reservation_;
     TileDispatcher dispatcher_;
