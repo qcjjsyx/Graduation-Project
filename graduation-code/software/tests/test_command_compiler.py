@@ -5,18 +5,25 @@ import pytest
 
 from src.command_codec import (
     NONE,
+    SCALE_AUTO,
     DataFormat,
     DescriptorType,
+    KernelBackend,
     Opcode,
     PivotPolicy,
+    ScaleDesc,
+    ScaleSaturationPolicy,
     encode_pivot_threshold,
 )
-from src.config import CommandCompilerConfig, PivotPolicyConfig
+from src.config import CommandCompilerConfig, GemmConfig, PivotPolicyConfig
 from src.dataStruct import MapTableEntry, NodeCompileRecord, NodeRange
 from src.scheduler.command_compiler import CommandCompileError, compile_command_artifact
 
 
-def _tree_fixture(config: CommandCompilerConfig | None = None):
+def _tree_fixture(
+    config: CommandCompilerConfig | None = None,
+    gemm: GemmConfig | None = None,
+):
     nodes = [
         NodeCompileRecord(0, 1, NodeRange(0, 1), (0, 1)),
         NodeCompileRecord(1, -1, NodeRange(1, 2), (1,)),
@@ -34,7 +41,144 @@ def _tree_fixture(config: CommandCompilerConfig | None = None):
         rhs=np.array([1.0, 2.0]),
         config=config or CommandCompilerConfig(),
         pivot=PivotPolicyConfig(),
+        gemm=gemm or GemmConfig(),
     )
+
+
+def test_int32_gemm_emits_scale_desc_and_only_switches_gemm_backend():
+    """FP32_SYSTEMC_INT32_GEMM changes only the top-level GEMM kernel."""
+
+    artifact = _tree_fixture(gemm=GemmConfig(backend="FP32_SYSTEMC_INT32_GEMM"))
+    kernels = [
+        descriptor
+        for descriptor in artifact.descriptors
+        if descriptor.descriptor_type == DescriptorType.KERNEL_DESC
+    ]
+    assert kernels
+    int32_kernels = 0
+    for kernel in kernels:
+        backend = KernelBackend(kernel.body_words[6])
+        if backend == KernelBackend.SYSTEMC_INT32_GEMM_MODEL:
+            int32_kernels += 1
+            scale_id = kernel.body_words[8]
+            assert scale_id != NONE
+            scale = artifact.descriptors[scale_id]
+            assert scale.descriptor_type == DescriptorType.SCALE_DESC
+            assert scale.body_words[0] == SCALE_AUTO
+            assert scale.body_words[1] == SCALE_AUTO
+            assert scale.body_words[2] == SCALE_AUTO
+            assert scale.body_words[3:6] == (1, 1, 1)
+            assert scale.body_words[6:] == (0, 0, 0, 0)
+        else:
+            assert kernel.body_words[8] == NONE
+    # One SCALE_DESC per node GEMM kernel; TRSM kernels stay FP32.
+    assert int32_kernels == len(artifact.manifest["symbolic"]["parent"])
+    assert artifact.manifest["compiler"]["kernel_backend"] == "SYSTEMC_INT32_GEMM_MODEL"
+    assert artifact.manifest["gemm"]["storage_format"] == "INT32"
+    assert artifact.manifest["gemm"]["effective_bits"] == 30
+    assert artifact.manifest["gemm"]["accumulator_bits"] == 64
+    assert artifact.manifest["gemm"]["propagates_to_front_or_tree"] is False
+
+
+def test_fp32_gemm_never_references_a_scale_desc():
+    artifact = _tree_fixture()
+    for descriptor in artifact.descriptors:
+        if descriptor.descriptor_type == DescriptorType.KERNEL_DESC:
+            assert descriptor.body_words[8] == NONE
+            assert (
+                KernelBackend(descriptor.body_words[6])
+                == KernelBackend.SYSTEMC_FP32_DEVICE_MODEL
+            )
+    assert artifact.manifest["gemm"]["backend"] == "FP32_SYSTEMC"
+    assert artifact.manifest["gemm"]["storage_format"] == "FP32"
+
+
+def test_factorization_only_scope_has_no_solve_commands_and_keeps_tree_dependencies(tmp_path):
+    from src.verify.manifest import validate_manifest
+    import json
+
+    artifact = _tree_fixture(config=CommandCompilerConfig(emit_solve_commands=False))
+    assert not any(command.opcode in (Opcode.SOLVE_FORWARD, Opcode.SOLVE_BACKWARD)
+                   for command in artifact.commands)
+    assert sum(command.opcode == Opcode.NODE_COMMIT for command in artifact.commands) == 2
+    assert any(command.opcode == Opcode.ASSEMBLE_EXTEND_ADD for command in artifact.commands)
+    assert artifact.manifest["compiler"]["operation_scope"] == "factorization_only"
+    assert "tree_solve" not in artifact.manifest["required_device_capabilities"]["always"]
+    artifact.manifest["preprocess"] = {"matching": {"method": "none"},
+        "transform": {"row_perm_match": [0,1], "ordering_perm": [0,1], "rhs_row_map": [0,1]}}
+    (tmp_path / "manifest.json").write_text(json.dumps(artifact.manifest))
+    (tmp_path / "memory_image.bin").write_bytes(artifact.image)
+    assert validate_manifest(tmp_path / "manifest.json").command_count == len(artifact.commands)
+    # The historical default still declares and emits the solve chain.
+    assert any(command.opcode == Opcode.SOLVE_FORWARD for command in _tree_fixture().commands)
+
+
+@pytest.mark.parametrize("scope,emit_solve", [("unknown", False),
+    ("factorization_only", True), ("factorization_and_solve", False)])
+def test_operation_scope_cannot_hide_missing_or_unexpected_solve_commands(tmp_path, scope, emit_solve):
+    import json
+    from src.verify.manifest import ManifestValidationError, validate_manifest
+    artifact = _tree_fixture(config=CommandCompilerConfig(emit_solve_commands=emit_solve))
+    artifact.manifest["compiler"]["operation_scope"] = scope
+    artifact.manifest["preprocess"] = {"matching": {"method": "none"},
+        "transform": {"row_perm_match": [0,1], "ordering_perm": [0,1], "rhs_row_map": [0,1]}}
+    (tmp_path / "manifest.json").write_text(json.dumps(artifact.manifest))
+    (tmp_path / "memory_image.bin").write_bytes(artifact.image)
+    with pytest.raises(ManifestValidationError, match="operation_scope|solve|SOLVE"):
+        validate_manifest(tmp_path / "manifest.json")
+
+
+def test_factorization_scope_rejects_ambiguous_boolean_configuration():
+    with pytest.raises(ValueError, match="boolean"):
+        CommandCompilerConfig(emit_solve_commands="false")
+
+
+def test_gemm_config_selects_fixed_exponents_and_clamp_policy():
+    artifact = _tree_fixture(
+        gemm=GemmConfig(
+            backend="FP32_SYSTEMC_INT32_GEMM",
+            scale_desc=ScaleDesc(
+                exponent_a=-4,
+                exponent_b=6,
+                saturation=ScaleSaturationPolicy.CLAMP_AND_REPORT,
+            ),
+        )
+    )
+    scales = [
+        descriptor
+        for descriptor in artifact.descriptors
+        if descriptor.descriptor_type == DescriptorType.SCALE_DESC
+    ]
+    assert scales
+    for scale in scales:
+        assert scale.body_words[0] == (-4) & 0xFFFFFFFF
+        assert scale.body_words[1] == 6
+        assert scale.body_words[2] == SCALE_AUTO
+        assert scale.body_words[4] == 2
+    assert artifact.manifest["gemm"]["saturation_policy"] == "CLAMP_AND_REPORT"
+
+
+def test_gemm_config_rejects_unsupported_and_unsafe_options():
+    with pytest.raises(ValueError):
+        GemmConfig(backend="FP8_EXPERIMENTAL")
+    with pytest.raises(ValueError):
+        GemmConfig(effective_bits=31)
+    with pytest.raises(ValueError):
+        GemmConfig(accumulator_bits=32)
+    with pytest.raises(ValueError):
+        GemmConfig(k_block_max=17)
+    with pytest.raises(ValueError):
+        GemmConfig(conversion_rate=0)
+    with pytest.raises(ValueError):
+        GemmConfig(scale_desc=ScaleDesc(exponent_a=257))
+    # FP32 mode must not carry INT32 scale settings.
+    with pytest.raises(ValueError):
+        GemmConfig(backend="FP32_SYSTEMC", scale_desc=ScaleDesc(exponent_a=1))
+    with pytest.raises(ValueError):
+        GemmConfig(
+            backend="FP32_SYSTEMC",
+            scale_desc=ScaleDesc(saturation=ScaleSaturationPolicy.CLAMP_AND_REPORT),
+        )
 
 
 def test_parent_waits_for_child_update_token_and_all_records_decode():

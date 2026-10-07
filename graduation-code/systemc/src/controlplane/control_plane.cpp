@@ -24,6 +24,16 @@ const char* batch_state_name(BatchState state) {
 
 namespace {
 
+std::string csv_field(const std::string& value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
+    std::string escaped = "\"";
+    for (const char c : value) {
+        if (c == '"') escaped += '"';
+        escaped += c;
+    }
+    return escaped + '"';
+}
+
 bool opcode_touches_front(cmd::Opcode opcode) {
     switch (opcode) {
     case cmd::Opcode::NodeBegin:
@@ -154,16 +164,66 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
     plane_.set_memory_sink(dp::MemoryClient::CompletionWriter, &completion_writer_);
     plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
 
+    if (artifact_.config.gemm_model.has_value()) {
+        const auto& model = *artifact_.config.gemm_model;
+        hw::panel_lu::PrecisionConfig declared;
+        declared.effective_bits = model.effective_bits;
+        declared.accumulator_bits = model.accumulator_bits;
+        declared.k_block_max = model.k_block_max;
+        declared.maxabs_elements_per_cycle = model.conversion_rate_per_cycle;
+        declared.quantize_elements_per_cycle = model.conversion_rate_per_cycle;
+        declared.dequantize_elements_per_cycle = model.conversion_rate_per_cycle;
+        const auto equal = [](const hw::panel_lu::PrecisionConfig& a,
+                              const hw::panel_lu::PrecisionConfig& b) {
+            return a.effective_bits == b.effective_bits &&
+                   a.accumulator_bits == b.accumulator_bits &&
+                   a.k_block_max == b.k_block_max &&
+                   a.maxabs_elements_per_cycle == b.maxabs_elements_per_cycle &&
+                   a.quantize_elements_per_cycle == b.quantize_elements_per_cycle &&
+                   a.dequantize_elements_per_cycle == b.dequantize_elements_per_cycle;
+        };
+        // Default device settings inherit the artifact declaration. Explicit
+        // non-default settings must agree; they never silently override it.
+        if (!equal(config_.panel.precision, hw::panel_lu::PrecisionConfig{}) &&
+            !equal(config_.panel.precision, declared)) {
+            model_config_error_ =
+                "device precision configuration conflicts with manifest gemm model parameters";
+        } else {
+            config_.panel.precision = declared;
+        }
+    }
+
+    // Device-wide unified on-chip bandwidth: one arbiter, one initialization
+    // per cycle, shared by the panel engine, factor units and DMA.
+    on_chip_.configure(
+        config_.panel.load_bytes_per_cycle, config_.panel.writeback_bytes_per_cycle);
+    plane_.set_on_chip_arbiter(&on_chip_);
+
     if (config_.enable_real_panel) {
+        for (std::uint32_t index = 0; index < config_.assemble_unit_count; ++index) {
+            units_.push_back(std::make_unique<AssemblyExecutionUnit>(
+                index, &plane_.buffers(), &on_chip_, config_.assembly));
+        }
         panel_engine_ = std::make_unique<hw::panel_lu::PanelEngine>(config_.panel);
         panel_engine_->set_buffers(&plane_.buffers());
+        panel_engine_->set_arbiter(&on_chip_);
         for (std::uint32_t index = 0; index < config_.panel_unit_count; ++index) {
             units_.push_back(
                 std::make_unique<PanelExecutionUnit>(index, panel_engine_.get()));
         }
+        for (std::uint32_t index = 0; index < config_.trsm_unit_count; ++index) {
+            units_.push_back(
+                std::make_unique<TrsmExecutionUnit>(index, panel_engine_.get()));
+        }
+        for (std::uint32_t index = 0; index < config_.gemm_unit_count; ++index) {
+            units_.push_back(
+                std::make_unique<GemmExecutionUnit>(index, panel_engine_.get()));
+        }
         for (std::uint32_t index = 0; index < config_.factor_unit_count; ++index) {
-            units_.push_back(std::make_unique<FactorStoreUnit>(
-                index, &plane_.buffers(), &plane_.memory_service()));
+            auto factor = std::make_unique<FactorStoreUnit>(
+                index, &plane_.buffers(), &plane_.memory_service());
+            factor->set_on_chip_arbiter(&on_chip_);
+            units_.push_back(std::move(factor));
         }
     }
     if (config_.enable_test_stub) {
@@ -173,7 +233,9 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
                     kind, index, config_.stub, &plane_.buffers()));
             }
         };
-        make_units(UnitKind::Assemble, config_.assemble_unit_count);
+        if (!config_.enable_real_panel) {
+            make_units(UnitKind::Assemble, config_.assemble_unit_count);
+        }
         make_units(UnitKind::Panel, config_.panel_unit_count);
         make_units(UnitKind::Trsm, config_.trsm_unit_count);
         make_units(UnitKind::Gemm, config_.gemm_unit_count);
@@ -187,6 +249,12 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
 CommandDevice::~CommandDevice() = default;
 
 bool CommandDevice::start(std::string* error) {
+    if (!model_config_error_.empty()) {
+        if (error != nullptr) {
+            *error = model_config_error_;
+        }
+        return false;
+    }
     if (config_.backend == ExecBackend::RequireRealKernels &&
         !config_.enable_real_panel) {
         if (error != nullptr) {
@@ -258,6 +326,10 @@ bool CommandDevice::start(std::string* error) {
     if (config_.enable_real_panel && config_.factor_unit_count < 1) {
         return reject("the real panel backend needs at least one factor unit");
     }
+    if (config_.enable_real_panel &&
+        (config_.assemble_unit_count < 1 || config_.assembly.add_latency_cycles < 1)) {
+        return reject("real assembly needs a unit and positive FP32 add latency");
+    }
     if (config_.enable_test_stub &&
         (config_.panel_unit_count < 1 || config_.trsm_unit_count < 1 ||
          config_.gemm_unit_count < 1 || config_.solve_unit_count < 1 ||
@@ -286,6 +358,8 @@ void CommandDevice::tick() {
         return;
     }
     const std::uint64_t cycle = plane_.begin_tick();
+    // Exactly one global budget initialization per cycle.
+    on_chip_.begin_cycle(cycle);
     plane_.tick_memory_and_route();
     update_phase(cycle);
     if (state_ == BatchState::Running) {
@@ -786,7 +860,10 @@ bool CommandDevice::acquire_exec_resources(
     request.node_id = tracker.command.node_id;
     request.opcode = tracker.command.opcode;
     request.unit_id = unit->unit_id();
-    request.front = tracker.front_view;
+    // Front-derived fields always come from the RESIDENT front context: a
+    // KERNEL command's own descriptor does not carry policy/pivot/layout, and
+    // its defaults must never be mistaken for real request parameters.
+    request.front = front_slots_[*context_index].front_view;
     request.factor = tracker.factor_view;
     request.contribution = tracker.contribution_view;
     request.kernel = tracker.kernel_view;
@@ -794,6 +871,9 @@ bool CommandDevice::acquire_exec_resources(
     request.front_slot = front_slots_[*context_index].front;
     request.temp_slot = front_slots_[*context_index].temp;
     request.total_dim = front_slots_[*context_index].front_view.total_dim;
+    // update_dim keeps the legacy meaning for assemble/solve staging (child
+    // update block width); TRSM block shapes come from KERNEL_DESC + the
+    // resident front in the engine adapter.
     request.update_dim = tracker.contribution_view.col_count;
     request.front_lease = tracker.front_lease;
     request.temp_lease = tracker.temp_lease;
@@ -801,8 +881,12 @@ bool CommandDevice::acquire_exec_resources(
     request.has_temp_lease = tracker.has_temp_lease;
     request.range_bytes =
         static_cast<std::uint64_t>(request.total_dim) * request.total_dim * 4;
-    request.policy = tracker.front_view.policy;
-    request.threshold_bits = tracker.front_view.threshold_bits;
+    request.policy = front_slots_[*context_index].front_view.policy;
+    request.threshold_bits = front_slots_[*context_index].front_view.threshold_bits;
+    // Latched numeric context from the front slot (set by PANEL_LU); TRSM
+    // diagonal checks must not re-derive the scale from the eliminated front.
+    request.front_scale = front_slots_[*context_index].front_scale;
+    request.threshold_product = front_slots_[*context_index].threshold_product;
 
     if (!unit->submit(request, cycle)) {
         release_command_resources(tracker, cycle);
@@ -1167,6 +1251,14 @@ void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
             return;
         }
         const auto& slot = front_slots_[*context];
+        if (config_.enable_real_panel) {
+            const auto reason = validate_contribution(
+                tracker.contribution_view, slot.front_view, tracker.command.node_id);
+            if (!reason.empty()) {
+                finish_command(tracker, cmd::StatusCode::BadDescriptor, reason, cycle);
+                return;
+            }
+        }
         if (plane_.buffers().state(slot.temp.slot) != dp::BufferState::Reserved) {
             // Refill path: a previously used temp slot must be re-armed before
             // the DMA load; a freshly allocated one is already RESERVED.
@@ -1559,6 +1651,19 @@ void CommandDevice::handle_exec_response(
         return;
     }
     tracker.unit_active = false;
+    // An aborted transaction may already have performed scratchpad work.
+    // Account its one terminal response before suppressing further outputs.
+    tracker.bytes_read += response.bytes_read;
+    tracker.bytes_written += response.bytes_written;
+    tracker.gemm_backend = response.gemm_backend;
+    tracker.gemm_saturation_count = response.saturation_count;
+    tracker.gemm_local_conversion_bytes = response.local_conversion_bytes;
+    tracker.gemm_scale_reduction_cycles = response.scale_reduction_cycles;
+    tracker.gemm_quantize_cycles = response.quantize_cycles;
+    tracker.gemm_integer_compute_cycles = response.integer_compute_cycles;
+    tracker.gemm_dequantize_cycles = response.dequantize_cycles;
+    tracker.gemm_exponent_a = response.exponent_a;
+    tracker.gemm_exponent_b = response.exponent_b;
     if (tracker.aborted) {
         if (tracker.dma_jobs_done + tracker.dma_jobs_cancelled <
             tracker.dma_jobs_total) {
@@ -1572,8 +1677,12 @@ void CommandDevice::handle_exec_response(
     }
     tracker.pivot_count = response.pivot_count;
     tracker.overflow_count = response.overflow_count;
-    tracker.bytes_read += response.bytes_read;
-    tracker.bytes_written += response.bytes_written;
+    if (response.front_scale > 0.0 && tracker.front_slot_index != cmd::NONE &&
+        tracker.front_slot_index < front_slots_.size()) {
+        front_slots_[tracker.front_slot_index].front_scale = response.front_scale;
+        front_slots_[tracker.front_slot_index].threshold_product =
+            response.threshold_product;
+    }
     if (response.status != cmd::StatusCode::Ok) {
         release_command_resources(tracker, cycle);
         finish_command(tracker, response.status, response.reason, cycle);
@@ -1731,6 +1840,18 @@ void CommandDevice::drain_completion_results(std::uint64_t cycle) {
         stats.pivot_count = tracker->pivot_count;
         stats.overflow_count = tracker->overflow_count;
         stats.dma_jobs = tracker->dma_jobs_total;
+        if (tracker->command.opcode == cmd::Opcode::GemmSchur) {
+            stats.gemm_backend =
+                hw::panel_lu::gemm_backend_name(tracker->gemm_backend);
+            stats.saturation_count = tracker->gemm_saturation_count;
+            stats.local_conversion_bytes = tracker->gemm_local_conversion_bytes;
+            stats.scale_reduction_cycles = tracker->gemm_scale_reduction_cycles;
+            stats.quantize_cycles = tracker->gemm_quantize_cycles;
+            stats.integer_compute_cycles = tracker->gemm_integer_compute_cycles;
+            stats.dequantize_cycles = tracker->gemm_dequantize_cycles;
+            stats.exponent_a = tracker->gemm_exponent_a;
+            stats.exponent_b = tracker->gemm_exponent_b;
+        }
         command_stats_.push_back(stats);
 
         if (tracker->owns_temp) {
@@ -1881,6 +2002,9 @@ void CommandDevice::reset() {
     if (panel_engine_ != nullptr) {
         panel_engine_->reset();
     }
+    on_chip_.reset();
+    on_chip_.configure(
+        config_.panel.load_bytes_per_cycle, config_.panel.writeback_bytes_per_cycle);
     scoreboard_ = TokenScoreboard();
     scoreboard_.init(plane_.boot().token_count);
     trackers_.clear();
@@ -2030,26 +2154,66 @@ std::string CommandDevice::debug_dump() const {
     return out;
 }
 
+bool CommandDevice::numeric_status_pass() const {
+    if (!config_.enable_real_panel || config_.enable_test_stub || !control_flow_pass() ||
+        completion_status_.size() != total_commands_) return false;
+    return std::all_of(completion_status_.begin(), completion_status_.end(),
+        [](const auto& entry) { return entry.second == cmd::StatusCode::Ok; });
+}
+
 void CommandDevice::write_reports(const std::string& output_dir) const {
     std::filesystem::create_directories(output_dir);
     plane_.trace().write_csv(output_dir);
+    {
+        const auto& image = plane_.memory().image();
+        std::ofstream out(output_dir + "/final_memory_image.bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+    }
+    {
+        std::ofstream out(output_dir + "/nodes.csv");
+        out << "node_id,start_cycle,finish_cycle,completion_cycle,commands,failed_commands,status\n";
+        for (std::uint32_t node = 0; node < plane_.boot().node_count; ++node) {
+            std::uint64_t start = 0, finish = 0, completion = 0;
+            std::uint32_t count = 0, failed = 0;
+            bool committed = false;
+            for (const auto& row : command_stats_) {
+                if (row.node_id != node) continue;
+                ++count;
+                committed = committed || (row.opcode == std::to_string(static_cast<std::uint32_t>(cmd::Opcode::NodeCommit)) && row.status == "OK");
+                failed += row.status != "OK";
+                if (row.start_cycle != 0 && (start == 0 || row.start_cycle < start)) start = row.start_cycle;
+                finish = std::max(finish, row.finish_cycle);
+                completion = std::max(completion, row.completion_cycle);
+            }
+            out << node << ',' << start << ',' << finish << ',' << completion << ','
+                << count << ',' << failed << ',' << (failed ? "FAILED" : (committed ? "OK" : (count ? "INCOMPLETE" : "NOT_EXECUTED"))) << '\n';
+        }
+    }
 
     {
         std::ofstream out(output_dir + "/commands.csv");
         out << "command_id,node_id,opcode,unit_kind,unit_id,fetch_cycle,admit_cycle,"
                "start_cycle,finish_cycle,completion_cycle,status,reason,bytes_read,"
                "bytes_written,stall_window,stall_cycles,stall_dep,stall_resource,"
-               "stall_dma,pivot_count,overflow_count,dma_jobs\n";
+               "stall_dma,pivot_count,overflow_count,dma_jobs,gemm_backend,"
+               "saturation_count,local_conversion_bytes,scale_reduction_cycles,"
+               "quantize_cycles,integer_compute_cycles,dequantize_cycles,"
+               "exponent_a,exponent_b\n";
         for (const auto& row : command_stats_) {
             out << row.command_id << ',' << row.node_id << ',' << row.opcode << ','
                 << row.unit_kind << ',' << row.unit_id << ',' << row.fetch_cycle << ','
                 << row.admit_cycle << ',' << row.start_cycle << ',' << row.finish_cycle
                 << ',' << row.completion_cycle << ',' << row.status << ','
-                << row.reason << ',' << row.bytes_read << ',' << row.bytes_written
+                << csv_field(row.reason) << ',' << row.bytes_read << ',' << row.bytes_written
                 << ',' << row.stall_window << ',' << row.stall_cycles << ','
                 << row.stall_dep << ',' << row.stall_resource << ','
                 << row.stall_dma << ',' << row.pivot_count << ','
-                << row.overflow_count << ',' << row.dma_jobs << '\n';
+                << row.overflow_count << ',' << row.dma_jobs << ','
+                << row.gemm_backend << ',' << row.saturation_count << ','
+                << row.local_conversion_bytes << ',' << row.scale_reduction_cycles
+                << ',' << row.quantize_cycles << ',' << row.integer_compute_cycles
+                << ',' << row.dequantize_cycles << ',' << row.exponent_a << ','
+                << row.exponent_b << '\n';
         }
     }
     {
@@ -2076,6 +2240,50 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
         if (mixed) {
             execution_backend = "real_panel_fp32_plus_test_stub";
         }
+        // Actual GEMM execution mode of this run (never hard-coded to FP32).
+        std::uint32_t gemm_commands = 0;
+        std::uint32_t gemm_int32_commands = 0;
+        std::uint64_t gemm_saturation = 0;
+        std::uint64_t gemm_overflow = 0;
+        std::int32_t gemm_exponent_a = 0;
+        std::int32_t gemm_exponent_b = 0;
+        bool gemm_exponents_set = false;
+        std::uint64_t gemm_local_bytes = 0;
+        std::uint64_t gemm_scale_cycles = 0;
+        std::uint64_t gemm_quantize_cycles = 0;
+        std::uint64_t gemm_integer_cycles = 0;
+        std::uint64_t gemm_dequantize_cycles = 0;
+        const std::string gemm_opcode_name = std::to_string(
+            static_cast<std::uint32_t>(cmd::Opcode::GemmSchur));
+        for (const auto& entry : command_stats_) {
+            if (entry.opcode != gemm_opcode_name) {
+                continue;
+            }
+            ++gemm_commands;
+            if (entry.gemm_backend == "int32_gemm") {
+                ++gemm_int32_commands;
+            }
+            gemm_saturation += entry.saturation_count;
+            gemm_overflow += entry.overflow_count;
+            if (!gemm_exponents_set && entry.gemm_backend == "int32_gemm") {
+                gemm_exponent_a = entry.exponent_a;
+                gemm_exponent_b = entry.exponent_b;
+                gemm_exponents_set = true;
+            }
+            gemm_local_bytes += entry.local_conversion_bytes;
+            gemm_scale_cycles += entry.scale_reduction_cycles;
+            gemm_quantize_cycles += entry.quantize_cycles;
+            gemm_integer_cycles += entry.integer_compute_cycles;
+            gemm_dequantize_cycles += entry.dequantize_cycles;
+        }
+        const bool gemm_int32_active = gemm_int32_commands > 0;
+        std::string numerical_scope = real_panel ? "panel_fp32_external_reference_only"
+                                                 : "control_flow_only";
+        if (real_panel && gemm_commands > 0) {
+            numerical_scope = gemm_int32_active
+                                  ? "panel_trsm_fp32_gemm_int32_external_reference_only"
+                                  : "panel_trsm_gemm_fp32_external_reference_only";
+        }
         std::ofstream out(output_dir + "/summary.json");
         out << "{\n"
             << "  \"tool\": \"t05_command_control_plane\",\n"
@@ -2085,11 +2293,12 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
             << "  \"mixed_backend_explicit\": " << (mixed ? "true" : "false") << ",\n"
             << "  \"control_flow_pass\": "
             << (state_ == BatchState::Completed ? "true" : "false") << ",\n"
+            << "  \"numeric_status_pass\": " << (numeric_status_pass() ? "true" : "false") << ",\n"
+            << "  \"assembly_backend\": \"" << (real_panel ? "fp32_extend_add" : "test_stub_copy") << "\",\n"
+            << "  \"assembly_staging_bytes_per_unit\": 12,\n"
+            << "  \"assembly_add_latency_cycles\": " << config_.assembly.add_latency_cycles << ",\n"
             << "  \"numerical_validation\": \"not_performed\",\n"
-            << "  \"numerical_scope\": \""
-            << (real_panel ? "panel_fp32_external_reference_only"
-                           : "control_flow_only")
-            << "\",\n"
+            << "  \"numerical_scope\": \"" << numerical_scope << "\",\n"
             << "  \"batch_state\": \"" << batch_state_name(state_) << "\",\n"
             << "  \"fault_reason\": \"" << fault_reason_ << "\",\n"
             << "  \"cycles\": " << plane_.cycle() << ",\n"
@@ -2099,8 +2308,47 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
             << "  \"panel_numeric_mode\": \""
             << hw::panel_lu::panel_numeric_mode_name(config_.panel.numeric_mode)
             << "\",\n"
+            << "  \"gemm_execution\": {\n"
+            << "    \"commands\": " << gemm_commands << ",\n"
+            << "    \"int32_commands\": " << gemm_int32_commands << ",\n"
+            << "    \"int32_active\": " << (gemm_int32_active ? "true" : "false")
+            << ",\n"
+            << "    \"effective_bits\": " << config_.panel.precision.effective_bits
+            << ",\n"
+            << "    \"accumulator_bits\": "
+            << config_.panel.precision.accumulator_bits << ",\n"
+            << "    \"k_block_max\": " << config_.panel.precision.k_block_max
+            << ",\n"
+            << "    \"precision_config_source\": \""
+            << (artifact_.config.gemm_model.has_value() ? "artifact_manifest" : "device_config")
+            << "\",\n"
+            << "    \"maxabs_elements_per_cycle\": "
+            << config_.panel.precision.maxabs_elements_per_cycle << ",\n"
+            << "    \"quantize_elements_per_cycle\": "
+            << config_.panel.precision.quantize_elements_per_cycle << ",\n"
+            << "    \"dequantize_elements_per_cycle\": "
+            << config_.panel.precision.dequantize_elements_per_cycle << ",\n"
+            << "    \"saturation_policy_default\": \"FAIL\",\n"
+            << "    \"conversion_staging_bytes_per_pe_slot\": "
+            << (16 * 16 * 4 * 2) << ",\n"
+            << "    \"int64_accumulator_bytes_per_pe_slot\": "
+            << (16 * 16 * 8) << ",\n"
+            << "    \"saturation_count\": " << gemm_saturation << ",\n"
+            << "    \"overflow_count\": " << gemm_overflow << ",\n"
+            << "    \"representative_exponent_a\": " << gemm_exponent_a << ",\n"
+            << "    \"representative_exponent_b\": " << gemm_exponent_b << ",\n"
+            << "    \"local_conversion_bytes\": " << gemm_local_bytes << ",\n"
+            << "    \"scale_reduction_cycles\": " << gemm_scale_cycles << ",\n"
+            << "    \"quantize_cycles\": " << gemm_quantize_cycles << ",\n"
+            << "    \"integer_compute_cycles\": " << gemm_integer_cycles << ",\n"
+            << "    \"dequantize_cycles\": " << gemm_dequantize_cycles << "\n"
+            << "  },\n"
             << "  \"panel_engine\": {\n"
-            << "    \"pe_count\": " << config_.panel.pe_count << ",\n"
+            << "    \"compute_group_count\": " << config_.panel.compute_group_count
+            << ",\n"
+            << "    \"pes_per_group\": " << config_.panel.pes_per_group
+            << ",\n"
+            << "    \"pe_count\": " << config_.panel.total_pe_count() << ",\n"
             << "    \"task_slots_per_pe\": " << config_.panel.task_slots_per_pe
             << ",\n"
             << "    \"tile_dim\": " << config_.panel.tile_dim << ",\n"
@@ -2133,9 +2381,12 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
     if (panel_engine_ != nullptr) {
         std::ofstream out(output_dir + "/panel_tasks.csv");
         out << "task_id,command_id,node_id,step,tile_row,tile_col,mode,eff_m,eff_n,"
-               "eff_k,pivot_base,pe_id,status,committed,cancelled,failed_column,"
-               "enqueue_cycle,dispatch_cycle,exec_start_cycle,exec_done_cycle,"
-               "writeback_done_cycle,bytes_read,bytes_written,reason\n";
+               "eff_k,pivot_base,group_id,pe_id,status,committed,cancelled,"
+               "failed_column,enqueue_cycle,dispatch_cycle,exec_start_cycle,"
+               "exec_done_cycle,writeback_done_cycle,bytes_read,bytes_written,"
+               "gemm_backend,gemm_phase,gemm_exp_a,gemm_exp_b,saturation_count,"
+               "overflow_count,local_conversion_bytes,scale_reduction_cycles,"
+               "quantize_cycles,integer_compute_cycles,dequantize_cycles,reason\n";
         for (const auto& record : panel_engine_->task_records()) {
             out << record.task.task_id << ',' << record.task.command_id << ','
                 << record.task.node_id << ',' << record.task.step << ','
@@ -2143,13 +2394,22 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
                 << hw::panel_lu::tile_mode_name(record.task.mode) << ','
                 << record.task.dims.m << ',' << record.task.dims.n << ','
                 << record.task.dims.k << ',' << record.task.pivot_base << ','
-                << record.pe_id << ',' << hw::dataplane::status_name(record.status)
+                << record.group_id << ',' << record.pe_id << ','
+                << hw::dataplane::status_name(record.status)
                 << ',' << (record.committed ? 1 : 0) << ','
                 << (record.cancelled ? 1 : 0) << ',' << record.failed_column << ','
                 << record.enqueue_cycle << ',' << record.dispatch_cycle << ','
                 << record.exec_start_cycle << ',' << record.exec_done_cycle << ','
                 << record.writeback_done_cycle << ',' << record.bytes_read << ','
-                << record.bytes_written << ',' << record.reason << '\n';
+                << record.bytes_written << ','
+                << hw::panel_lu::gemm_backend_name(record.gemm_backend) << ','
+                << hw::panel_lu::gemm_phase_name(record.gemm_failed_phase) << ','
+                << record.gemm_exponent_a << ',' << record.gemm_exponent_b << ','
+                << record.saturation_count << ',' << record.overflow_count << ','
+                << record.local_conversion_bytes << ','
+                << record.scale_reduction_cycles << ',' << record.quantize_cycles
+                << ',' << record.integer_compute_cycles << ','
+                << record.dequantize_cycles << ',' << csv_field(record.reason) << '\n';
         }
     }
 }

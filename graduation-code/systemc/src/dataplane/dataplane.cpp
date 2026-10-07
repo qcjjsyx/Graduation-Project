@@ -14,6 +14,11 @@ DataPlane::DataPlane(LoadedArtifact artifact, DataPlaneConfig config)
 
 std::uint64_t DataPlane::begin_tick() {
     ++cycle_;
+    if (on_chip_arbiter_ != nullptr) {
+        // Standalone owner initializes the per-cycle budget window; the
+        // control-plane owner's call with the same cycle is idempotent.
+        on_chip_arbiter_->begin_cycle(cycle_);
+    }
     return cycle_;
 }
 

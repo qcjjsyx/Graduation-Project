@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/on_chip_arbiter.hpp"
+#include "panel_lu/compute_controller.hpp"
 #include "panel_lu/task_types.hpp"
 #include "panel_lu/tile_dispatcher.hpp"
 #include "panel_lu/tile_store.hpp"
@@ -62,6 +64,17 @@ struct PanelCommandRequest {
     std::uint32_t tile_size{16};
     SyntheticFrontSpec synthetic;
     std::string label;
+    // Compute-command kind routed to the shared engine (default PANEL_LU).
+    ComputeKind compute_kind{ComputeKind::PanelLu};
+    // Latched front numeric context for checks that must NOT re-derive the
+    // scale from the already-eliminated front (TRSM U diagonal checks).
+    double front_pre_elimination_max_abs{0.0};
+    double threshold_product{0.0};
+    // T10 top-level Schur backend + validated SCALE_DESC policy (GemmSchur).
+    GemmBackend gemm_backend{GemmBackend::Fp32Device};
+    GemmScalePolicy gemm_scale;
+    // KERNEL_DESC id of the command (kept for the unified GemmReq records).
+    std::uint32_t descriptor_id{hw::command::NONE};
 };
 
 // Physical placement of one command's front buffer.
@@ -80,6 +93,9 @@ struct PanelFrontLayout {
     std::uint32_t row_stride_bytes{0};
     std::uint32_t global_grid{0};
     std::uint32_t total_dim{0};  // front n (scan/reader extent)
+    // PE group that owns the command; every generated task carries it so the
+    // dispatcher only uses this group's PEs.
+    std::uint32_t group_id{0};
 };
 
 // Byte source for the full-front scan. Implementations copy an assembled span
@@ -116,9 +132,21 @@ struct PanelCommandResponse {
     std::uint32_t tasks_cancelled{0};
     std::uint64_t stall_dispatcher_full{0};
     std::uint64_t stall_scan_port{0};
+    // T10 GEMM_SCHUR backend statistics aggregated over the command's tiles
+    // (zero for every other compute kind).
+    GemmBackend gemm_backend{GemmBackend::Fp32Device};
+    std::uint64_t saturation_count{0};
+    std::uint64_t overflow_count{0};
+    std::uint64_t local_conversion_bytes{0};
+    std::uint64_t scale_reduction_cycles{0};
+    std::uint64_t quantize_cycles{0};
+    std::uint64_t integer_compute_cycles{0};
+    std::uint64_t dequantize_cycles{0};
+    std::int32_t exponent_a{0};
+    std::int32_t exponent_b{0};
 };
 
-class PanelController {
+class PanelController : public IComputeController {
 public:
     enum class Phase {
         Idle = 0,
@@ -147,36 +175,37 @@ public:
         std::uint64_t cycle,
         std::uint64_t epoch,
         const PanelFrontLayout& layout,
-        std::uint64_t first_task_id);
+        std::uint64_t first_task_id) override;
 
-    void tick(std::uint64_t cycle, PortBudget& scan_budget, PortBudget& write_budget);
-    void on_task_response(const TileTaskResponse& response, std::uint64_t cycle);
-    void on_tasks_cancelled(const std::vector<TileTask>& tasks);
+    void tick(std::uint64_t cycle, hw::dataplane::OnChipArbiter& arbiter) override;
+    void on_task_response(const TileTaskResponse& response, std::uint64_t cycle) override;
+    void on_tasks_cancelled(const std::vector<TileTask>& tasks) override;
 
     // Sets the abort flag and stops generating; outstanding tasks must still
     // terminate before the ABORTED response is published.
-    void request_abort();
+    void request_abort() override;
 
     // Returns true exactly once after a failure/abort requires the prototype to
     // cancel queued tasks and abort PE-owned tasks of this command.
-    bool take_cancel_request();
+    bool take_cancel_request() override;
 
-    bool finished() const;
-    bool poll_response(PanelCommandResponse& out);
-    void reset();
+    bool finished() const override;
+    bool poll_response(PanelCommandResponse& out) override;
+    void reset() override;
 
     Phase phase() const { return phase_; }
     std::uint32_t step() const { return step_; }
-    const PanelCommandRequest& request() const { return request_; }
+    const PanelCommandRequest& request() const override { return request_; }
     const std::vector<TileTask>& task_graph() const { return task_graph_; }
-    const TileTask* find_task(std::uint64_t task_id) const;
+    std::vector<TileTask> task_graph_snapshot() const override { return task_graph_; }
+    const TileTask* find_task(std::uint64_t task_id) const override;
     const std::vector<TileTask>& cancelled_tasks() const { return cancelled_tasks_; }
     double front_max_abs() const { return front_max_abs_; }
     double threshold_product() const { return threshold_product_; }
     std::uint64_t scan_done_cycle() const { return scan_done_cycle_; }
-    std::uint64_t outstanding_count() const { return outstanding_.size(); }
+    std::size_t outstanding_count() const override { return outstanding_.size(); }
     // Next task id after the last allocation (global, prototype-assigned base).
-    std::uint64_t next_task_id() const { return next_task_id_; }
+    std::uint64_t next_task_id() const override { return next_task_id_; }
 
 private:
     struct TileCoord {

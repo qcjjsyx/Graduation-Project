@@ -16,8 +16,10 @@ from src.command_codec import (
     PVECTOR_INIT_VALUE,
     DataFormat,
     DescriptorType,
+    KernelBackend,
     Opcode,
     PivotPolicy,
+    ScaleDesc,
     StatusCode,
     decode_commands,
     decode_completions,
@@ -280,6 +282,10 @@ def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
 
     seen_commands: set[int] = set()
     max_front = _as_int(manifest["compiler"]["max_front_size"], "max_front_size")
+    scope = manifest["compiler"].get("operation_scope", "factorization_and_solve")
+    if scope not in ("factorization_only", "factorization_and_solve"):
+        raise ManifestValidationError("unknown compiler operation_scope")
+    solve_opcodes = {Opcode.SOLVE_FORWARD, Opcode.SOLVE_BACKWARD}
     for node_id in range(node_count):
         node = nodes[str(node_id)]
         if _as_int(node["parent_id"], "parent_id") != parent[node_id]:
@@ -309,13 +315,14 @@ def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
             Opcode.PANEL_LU,
             Opcode.STORE_FACTOR,
             Opcode.NODE_COMMIT,
-            Opcode.SOLVE_FORWARD,
-            Opcode.SOLVE_BACKWARD,
+            *(() if scope == "factorization_only" else solve_opcodes),
         ):
             if required not in opcodes:
                 raise ManifestValidationError(
                     f"node {node_id} is missing command {required.name}"
                 )
+        if scope == "factorization_only" and opcodes.intersection(solve_opcodes):
+            raise ManifestValidationError("factorization-only artifact contains solve commands")
     if seen_commands != set(range(len(commands))):
         raise ManifestValidationError("manifest does not assign every command to a node")
     return node_count
@@ -355,13 +362,49 @@ def _validate_descriptor_references(descriptors) -> None:
         elif kind == DescriptorType.KERNEL_DESC:
             for index in (0, 1, 2):
                 require(body[index], {DescriptorType.FRONT_DESC}, "kernel operand")
-            require(body[8], {DescriptorType.SCALE_DESC}, "kernel scale")
+            try:
+                backend = KernelBackend(body[6])
+            except ValueError as error:
+                raise ManifestValidationError(
+                    "kernel backend is unknown"
+                ) from error
+            if backend == KernelBackend.SYSTEMC_INT32_GEMM_MODEL:
+                # The local INT32 GEMM backend must reference a real
+                # SCALE_DESC; a missing policy must never be silently
+                # defaulted at execution time.
+                require_mandatory(
+                    body[8], {DescriptorType.SCALE_DESC}, "INT32 kernel scale"
+                )
+                _check_scale_desc(descriptors, body[8])
+            else:
+                if body[8] != NONE:
+                    raise ManifestValidationError(
+                        "FP32 kernel must not reference a SCALE_DESC "
+                        "(scale_desc_id must be NONE)"
+                    )
         elif kind == DescriptorType.SOLVE_DESC:
             require_mandatory(body[0], {DescriptorType.FACTOR_DESC}, "solve factor")
             require(body[1], {DescriptorType.REGION_DESC}, "solve RHS region")
             require(body[2], {DescriptorType.REGION_DESC}, "solve solution region")
             require_mandatory(body[3], {DescriptorType.REGION_DESC}, "solve P-vector")
             require(body[4], {DescriptorType.REGION_DESC}, "solve workspace")
+
+
+def _check_scale_desc(descriptors, index: int) -> None:
+    """Validate a referenced SCALE_DESC body (T10 frozen word semantics)."""
+
+    if index >= len(descriptors):
+        raise ManifestValidationError("kernel scale reference is unknown")
+    descriptor = descriptors[index]
+    if DescriptorType(descriptor.descriptor_type) != DescriptorType.SCALE_DESC:
+        raise ManifestValidationError("kernel scale reference is not a SCALE_DESC")
+    body = descriptor.body_words
+    if any(word != 0 for word in body[6:10]):
+        raise ManifestValidationError("SCALE_DESC reserved words 6..9 must be zero")
+    try:
+        ScaleDesc.from_body_words(body)
+    except ValueError as error:
+        raise ManifestValidationError(f"SCALE_DESC policy rejected: {error}") from error
 
 
 def _check_p_vector_reference(

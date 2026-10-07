@@ -29,6 +29,7 @@ from src.command_codec import (  # noqa: E402
     DescriptorType,
     Opcode,
     PivotPolicy,
+    ScaleDesc,
     StatusCode,
     encode_pivot_threshold,
 )
@@ -170,6 +171,28 @@ def main() -> None:
         ]
     )
     write("parent_child_commands", parent_child)
+
+    # T10 SCALE_DESC fixtures: the default INT32 GEMM policy and a fixed
+    # two's-complement exponent policy. Python and C++ decode/validate them
+    # identically.
+    write(
+        "scale_desc_default",
+        Descriptor(
+            descriptor_type=DescriptorType.SCALE_DESC,
+            payload_offset=0,
+            payload_bytes=0,
+            body_words=ScaleDesc().to_body_words(),
+        ).to_bytes(),
+    )
+    write(
+        "scale_desc_fixed_exponents",
+        Descriptor(
+            descriptor_type=DescriptorType.SCALE_DESC,
+            payload_offset=0,
+            payload_bytes=0,
+            body_words=ScaleDesc(exponent_a=-3, exponent_b=5).to_body_words(),
+        ).to_bytes(),
+    )
 
     region = Descriptor(
         descriptor_type=DescriptorType.REGION_DESC,

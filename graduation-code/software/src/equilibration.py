@@ -42,7 +42,7 @@ def equilibrate_system(
     if config.mode == "pow2-row":
         nonzero = row_max_before > 0.0
         raw = np.zeros(csr.shape[0], dtype=np.float64)
-        raw[nonzero] = -np.rint(np.log2(row_max_before[nonzero]))
+        raw[nonzero] = -np.rint(np.log2(row_max_before[nonzero])) ## np.rint 舍入到最近整数
         raw = np.clip(
             raw,
             -config.max_scale_exponent,

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "command_codec.hpp"
+#include "dataplane/scale_desc.hpp"
 
 namespace {
 
@@ -243,6 +244,95 @@ void test_front_descriptor_policy(const std::string& fixture_dir) {
         "FRONT_DESC payload must fail");
 }
 
+void test_scale_descriptor(const std::string& fixture_dir) {
+    // T10 SCALE_DESC fixtures: the codec layout plus the policy decoder must
+    // agree with the Python generator word-for-word.
+    const auto default_fixture = read_file(fixture_dir + "/scale_desc_default.bin");
+    const auto decoded =
+        cmd::DescriptorCodec::decode(default_fixture.data(), default_fixture.size());
+    expect(
+        decoded.descriptor_type == cmd::DescriptorType::Scale,
+        "scale descriptor type mismatch");
+    expect(
+        decoded.body_words[0] == hw::dataplane::kScaleAutoWord &&
+            decoded.body_words[1] == hw::dataplane::kScaleAutoWord &&
+            decoded.body_words[2] == hw::dataplane::kScaleAutoWord,
+        "scale AUTO words mismatch");
+    expect(
+        decoded.body_words[3] == 1 && decoded.body_words[4] == 1 &&
+            decoded.body_words[5] == 1,
+        "scale policy words mismatch");
+    hw::dataplane::GemmScalePolicy policy;
+    std::string reason;
+    expect(
+        hw::dataplane::decode_scale_policy(
+            decoded.body_words[0], decoded.body_words.data(), &policy, &reason) ==
+            cmd::StatusCode::Ok,
+        "scale default policy must decode");
+    expect(
+        policy.auto_exponent_a && policy.auto_exponent_b && policy.auto_output_scale,
+        "scale default policy must be AUTO");
+    expect(
+        hw::dataplane::decode_scale_policy(
+            0, decoded.body_words.data(), &policy, &reason) ==
+            cmd::StatusCode::Ok,
+        "scale policy decode must accept the fixture independently of the id");
+
+    // Re-encode the same record from the frozen C++ semantics.
+    cmd::Descriptor rebuilt{};
+    rebuilt.descriptor_type = cmd::DescriptorType::Scale;
+    rebuilt.body_words[0] = hw::dataplane::kScaleAutoWord;
+    rebuilt.body_words[1] = hw::dataplane::kScaleAutoWord;
+    rebuilt.body_words[2] = hw::dataplane::kScaleAutoWord;
+    rebuilt.body_words[3] = 1;
+    rebuilt.body_words[4] = 1;
+    rebuilt.body_words[5] = 1;
+    expect_equal(
+        cmd::DescriptorCodec::encode(rebuilt), default_fixture,
+        "scale default golden mismatch");
+
+    // Fixed two's-complement exponents: -3 and +5.
+    const auto fixed = read_file(fixture_dir + "/scale_desc_fixed_exponents.bin");
+    const auto fixed_decoded =
+        cmd::DescriptorCodec::decode(fixed.data(), fixed.size());
+    expect(
+        hw::dataplane::decode_scale_policy(
+            0, fixed_decoded.body_words.data(), &policy, &reason) ==
+                cmd::StatusCode::Ok &&
+            !policy.auto_exponent_a && policy.exponent_a == -3 &&
+            !policy.auto_exponent_b && policy.exponent_b == 5,
+        "scale fixed exponent fixture must decode to -3/+5");
+
+    // Reserved words 6..9 are enforced by the codec itself.
+    auto tampered = default_fixture;
+    write_u32(tampered, 24 + 6 * 4, 1);
+    expect_throws(
+        [&] { (void)cmd::DescriptorCodec::decode(tampered.data(), tampered.size()); },
+        "non-zero SCALE_DESC reserved word must fail");
+
+    // Unknown zero enumerations are malformed policies.
+    auto malformed = default_fixture;
+    write_u32(malformed, 24 + 3 * 4, 0);
+    cmd::Descriptor malformed_record =
+        cmd::DescriptorCodec::decode(malformed.data(), malformed.size());
+    expect(
+        hw::dataplane::decode_scale_policy(
+            0, malformed_record.body_words.data(), &policy, &reason) ==
+            cmd::StatusCode::BadDescriptor,
+        "rounding_mode 0 must be BAD_DESCRIPTOR");
+
+    // Fixed output scale is defined but unsupported in this version.
+    auto fixed_output = default_fixture;
+    write_u32(fixed_output, 24 + 2 * 4, 0);
+    cmd::Descriptor fixed_output_record =
+        cmd::DescriptorCodec::decode(fixed_output.data(), fixed_output.size());
+    expect(
+        hw::dataplane::decode_scale_policy(
+            0, fixed_output_record.body_words.data(), &policy, &reason) ==
+            cmd::StatusCode::PolicyNotSupported,
+        "fixed output scale must be POLICY_NOT_SUPPORTED");
+}
+
 void test_descriptor(const std::string& fixture_dir) {
     auto descriptor = dependency_descriptor(0x80, 3);
     const auto golden = read_file(fixture_dir + "/golden_dependency_descriptor.bin");
@@ -444,6 +534,7 @@ int main(int argc, char** argv) {
         test_frozen_constants();
         test_command(fixture_dir);
         test_front_descriptor_policy(fixture_dir);
+        test_scale_descriptor(fixture_dir);
         test_descriptor(fixture_dir);
         test_completion(fixture_dir);
         test_token_states(fixture_dir);

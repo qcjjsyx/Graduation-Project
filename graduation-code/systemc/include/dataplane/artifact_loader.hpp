@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,15 @@ public:
         : std::runtime_error(message) {}
 };
 
+// Boot-time architecture-model parameters, distinct from the runtime
+// SCALE_DESC policy. Older artifacts may omit this optional declaration.
+struct GemmModelConfig {
+    std::uint32_t effective_bits{30};
+    std::uint32_t accumulator_bits{64};
+    std::uint32_t k_block_max{16};
+    std::uint32_t conversion_rate_per_cycle{1};
+};
+
 // Validated boot-time view of a schema v2 device artifact. Decoding is done for
 // validation only; runtime descriptor reads must go through DescriptorReader.
 struct DeviceBootConfig {
@@ -24,6 +34,7 @@ struct DeviceBootConfig {
     hw::command::PivotPolicy pivot_policy{hw::command::PivotPolicy::Static};
     std::uint32_t pivot_threshold_bits{0};
     float pivot_threshold{0.0f};
+    std::optional<GemmModelConfig> gemm_model;
 
     std::uint32_t command_count{0};
     std::uint32_t descriptor_count{0};

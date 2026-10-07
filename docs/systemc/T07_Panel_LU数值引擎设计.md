@@ -1,8 +1,13 @@
 # T07 Panel-LU SystemC 数值引擎设计（正式 FP32 STATIC）
 
-状态：**T07 Panel 子系统已实现并完成数值验证**；顶层 TRSM/GEMM/solve
-数值核与完整分解/求解闭环仍属 T09/T10/T11/T12。本文是 T07 的权威设计说明，
-按“架构组成 → 模块交互 → 接口 → 实现机制 → 验证”组织。T06 的合成架构原型
+状态：**T07 Panel 子系统已实现并完成数值验证**。T09 已在此基础上把
+`PanelEngine` 扩展为共享计算引擎（Panel/TRSM 共用 PE 池、PE 分组、
+统一片上带宽仲裁、完整 L/U 保存），见
+[TRSM架构设计](../architecture/TRSM架构设计.md)。T10 已接入顶层 GEMM，T11
+已接入真实 assemble/STATIC 树形分解，见
+[T11 集成设计](../architecture/T11_真实装配与树形分解集成.md)；solve/Ax=b
+属于 T12。本文保留 T07 的权威设计说明（架构组成
+→ 模块交互 → 接口 → 实现机制 → 验证）。T06 的合成架构原型
 （`panel_lu_prototype`）与其测试保持独立，本文描述的是接入 T05 真实
 command/completion/token 流程的正式引擎。
 
@@ -204,7 +209,7 @@ ControlPlaneConfig {
 
 ### 6.1 数值
 
-`panel_lu_real_tests`（206 checks，Release+ASan/UBSan）：
+`panel_lu_real_tests`（215 checks，Release+ASan/UBSan）：
 
 - 资源/路由回归（对应审查修复）：绑定但忙的 Factor 单元必须等待（双
   front、1 个 Factor 单元时第二个 STORE_FACTOR 不落 DMA、L 仍为单位
@@ -212,7 +217,7 @@ ControlPlaneConfig {
   `command finish ≥ 该命令最后一笔 DDR 写完成拍`（独立 trace 证据）；实例
   reset 复用后因子正确重写；`memory.max_inflight=1` 的合法背压下
   STORE_FACTOR 成功而不是 `ADDRESS_FAULT`；L 已接受/U 背压窗口内 abort
-  排空后同一单元服务另一 front，L/U 全量匹配且字节数完整（206 checks）；
+  排空后同一单元服务另一 front，L/U 全量匹配且字节数完整（215 checks）；
   `load_bytes_per_cycle=8` 时
   diag 任务 `bytes_read=1024` 且 `load_done-dispatch ≥ 128`、执行在装载
   之后；abort 后 lease 不立即释放、batch 完成时引擎全部 adapter 空闲；
@@ -247,6 +252,19 @@ tick 模型逐周期一致；运行时模型不自行推进 SystemC 时间。
 - `panel_tasks.csv`：任务级 mode/pe_id/周期/字节/提交状态。
 - 周期是未综合校准的架构模型周期；不得写成芯片实测或加速比。
 
+## 6b. T09 扩展（共享引擎、分组与仲裁）
+
+- `pe_count` 由 `compute_group_count × pes_per_group` 唯一推导（冲突配置
+  拒绝）；一条被接受的计算命令独占一个 PE 组（含扫描阶段），dispatcher 只
+  向该组派发，组在终态响应被 T05 接收后释放。
+- `IComputeController` 统一 PanelController/TrsmController；
+  `TrsmController` 的左右解、步屏障与失败映射见 T08/T09 设计文档。
+- 读/写预算由设备级 `OnChipArbiter` 统一仲裁（每域每拍单请求方 grant、
+  确定性轮转、剩余不共享），覆盖扫描、PE 装载/写回、Factor 读取与 DMA
+  片上读写；本文 §4.1 中“共享读预算”由该仲裁器实现。
+- `FactorStoreUnit` 升级为完整 L/U 保存（L11 单位对角 + L21、U11 mask +
+  U12），成功字节数 8·n·p。
+
 ## 7. FP64 模块诊断模式（显式）
 
 T07 提供 `PanelNumericMode::Fp64Diagnostic` 显式模块诊断模式（默认
@@ -264,13 +282,21 @@ T07 提供 `PanelNumericMode::Fp64Diagnostic` 显式模块诊断模式（默认
 - 验证：1×1 subnormal 用例（输入 `1e-39f` 在两种格式都可精确表示）——
   FP32 设备倒数溢出报 `NON_FINITE_VALUE`，显式 FP64 诊断模式成功并保留
   subnormal 因子；另有 16×16 诊断模式与 FP64 reference 对照。
+- 舍入回 FP32 的溢出检查沿用各模式既有失败坐标约定：`LU_DIAG` 报全局
+  主元列 `pivot_base + local`（与 FP32/FP64 kernel 的失败列语义一致，
+  `pivot_count` 随之为已完成主元数）；`TRSM_LEFT` 报局部行、其余模式报
+  局部列，由 controller 映射到 front 坐标。回归：n=p=18、第二个对角块
+  `[[0.5, FLT_MAX],[FLT_MAX, FLT_MAX]]` 在诊断模式舍入溢出报告列 16、
+  `pivot_count=16`（而非局部列 0）。
 
-## 8. 尚未完成 / T09/T10 复用点
+## 8. 尚未完成 / T10 复用点
 
-- 未实现：顶层 TRSM_LEFT/TRSM_RIGHT/GEMM_SCHUR/assemble/solve 数值执行
-  （显式拒绝）；L21/U12 持久化；完整分解/求解闭环；DYNAMIC_PANEL；INT32；
-  RTL；bank/NoC 细化；跨步 lookahead。
-- 复用点：`kernels` 四个原语、`TileDispatcher`/`MultiModePe`、
-  `PanelFrontLayout`/`TileAccess`/`FrontReader`、`PanelEngine` 的共享读/写
-  预算与上下文管理；T09/T10 只需新增 controller 与任务生成，并把同批
-  PE/dispatcher 继续共享，不得各建计算池。
+- T09 已完成：顶层 TRSM_LEFT/TRSM_RIGHT 数值执行（TrsmController）、
+  PE 分组调度、统一片上带宽仲裁、完整 L/U（L11/L21/U11/U12）持久化。
+- T10 已实现顶层 GEMM_SCHUR（FP32/局部 INT32）；T11 已实现真实 assemble
+  与 STATIC 树形分解。未实现：树形 solve/完整 Ax=b；DYNAMIC_PANEL；
+  INT32 RTL；bank/NoC 细化；跨步 lookahead。
+- T10 复用点：`kernels` 原语、`TileDispatcher`/`MultiModePe`、PE 分组与
+  `IComputeController` 契约、`OnChipArbiter` 预算接口、
+  `PanelFrontLayout`/`TileAccess`；只需新增 GEMM/Schur controller 与任务
+  生成，继续共享同批 PE/dispatcher，不得各建计算池。

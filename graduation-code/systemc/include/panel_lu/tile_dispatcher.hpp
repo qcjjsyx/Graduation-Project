@@ -44,6 +44,10 @@ public:
 
     void tick(std::uint64_t cycle);
 
+    // Group layout: per-group contiguous PE id ranges [first, first+count).
+    // Tasks are only dispatched to PEs of their own group.
+    void set_group_ranges(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& ranges);
+
     // Commit callback for a task whose result became visible. Commits the tile
     // version and keeps the commit record until release_command(). Returns
     // false on a stale version (only possible if a control invariant was
@@ -106,6 +110,7 @@ private:
     std::unordered_map<std::uint64_t, DispatchRecord> records_;
     // Committed task ids per command; released when the command terminates.
     std::map<std::uint32_t, std::set<std::uint64_t>> committed_by_command_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> group_ranges_;
     std::vector<std::uint32_t> command_order_;
     std::size_t rr_cursor_{0};
     std::size_t pe_cursor_{0};

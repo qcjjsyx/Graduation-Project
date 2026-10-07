@@ -271,7 +271,9 @@ SYSTEMC_FP32_DEVICE_MODEL
 SYSTEMC_INT32_GEMM_MODEL
 ```
 
-在 `FP32_SYSTEMC_INT32_GEMM` 中，`PANEL_LU`、`TRSM`、pivot 和树形依赖仍使用浮点；只有 `GEMM_SCHUR` 通过 `ScaleDesc` 进行局部 INT32 适配。
+在 `FP32_SYSTEMC_INT32_GEMM` 中，`PANEL_LU`、`TRSM`、pivot 和树形依赖仍使用浮点；只有 `GEMM_SCHUR` 通过 `ScaleDesc` 进行局部 INT32 适配。T10 已冻结 `SCALE_DESC` word 0–5 的编码与 `KERNEL_DESC`/backend 组合规则，见
+[Command_Schema_v2.md](Command_Schema_v2.md) §3.2.1 与
+[../architecture/T10_GEMM_Schur与局部INT32设计.md](../architecture/T10_GEMM_Schur与局部INT32设计.md)。
 
 ## 10. 当前实现策略
 
@@ -289,4 +291,7 @@ RTL executor
 `archive/legacy-node-task-abi-v2/`（与 schema v2 无关）。固定二进制布局和错误码见
 [Command_Schema_v2.md](Command_Schema_v2.md)，[Command_Schema_v1.md](Command_Schema_v1.md)
 仅作追溯。T04/T05 的 SystemC executor（数据面/控制面、DMA、descriptor reader、token
-scoreboard 运行时、FP32 数值闭环）尚未实现。
+scoreboard 运行时）已实现；T07–T11 已接入 STATIC Panel/TRSM/GEMM/真实
+extend-add 与树形分解。完整 solve/Ax=b 属于 T12。软件显式分解模式通过
+`compiler.operation_scope=factorization_only` 声明并省略 solve 命令，未声明
+该字段的旧 artifact 仍要求含 solve 的完整链，32B/64B/64B 记录布局不变。

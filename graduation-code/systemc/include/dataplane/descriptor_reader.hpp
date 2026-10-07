@@ -11,6 +11,7 @@
 #include "dataplane/memory_service.hpp"
 #include "dataplane/region_view.hpp"
 #include "dataplane/trace.hpp"
+#include "dataplane/scale_desc.hpp"
 
 namespace hw::dataplane {
 
@@ -69,6 +70,20 @@ struct FrontView {
     float threshold{0.0f};
 };
 
+// Decoded SCALE_DESC (schema v2 body words 0..5). Carries the raw words and
+// the validated policy; decode failures are reported as the descriptor read's
+// terminal status so a malformed policy never reaches execution.
+struct ScaleView {
+    std::uint32_t descriptor_id{hw::command::NONE};
+    std::uint32_t word_a{0};
+    std::uint32_t word_b{0};
+    std::uint32_t word_output{0};
+    std::uint32_t rounding_mode{0};
+    std::uint32_t saturation_policy{0};
+    std::uint32_t overflow_policy{0};
+    GemmScalePolicy policy{};
+};
+
 struct KernelView {
     std::uint32_t descriptor_id{0};
     RegionView a;
@@ -83,6 +98,7 @@ struct KernelView {
     std::uint32_t tile_size{0};
     std::uint32_t scale_descriptor_id{hw::command::NONE};
     bool has_scale{false};
+    ScaleView scale;
 };
 
 struct SolveView {
@@ -187,7 +203,11 @@ private:
     void on_reference(Task& task, const MemoryResponse& response, std::uint64_t cycle);
     void on_payload(Task& task, const MemoryResponse& response, std::uint64_t cycle);
     void finish(Task& task, hw::command::StatusCode status, std::string reason, std::uint64_t cycle);
-    bool finalize(Task& task, ReadOutcome& outcome, std::string* reason);
+    bool finalize(
+        Task& task,
+        ReadOutcome& outcome,
+        std::string* reason,
+        hw::command::StatusCode* rejected_status);
     bool build_region_view(
         std::uint32_t descriptor_id,
         const hw::command::Descriptor& descriptor,

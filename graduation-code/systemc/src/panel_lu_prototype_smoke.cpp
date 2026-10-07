@@ -25,7 +25,6 @@ struct Options {
     std::uint32_t dispatcher_depth{32};
     std::uint32_t load_bytes{64};
     std::uint32_t writeback_bytes{64};
-    std::uint32_t scan_bytes{64};
     std::string mode{"tail"};
     std::string inject;
     std::string trace_dir{"panel_lu_trace"};
@@ -52,7 +51,6 @@ void print_usage() {
                  "  --dispatcher-depth N  bounded dispatcher queue (default 32)\n"
                  "  --load-bytes N        tile-store load bytes/cycle (default 64)\n"
                  "  --writeback-bytes N   writeback bytes/cycle (default 64)\n"
-                 "  --scan-bytes N        scan bytes/cycle (default 64)\n"
                  "  --mode tail|mixed|latency\n"
                  "  --inject zero|tiny|singular|nan\n"
                  "  --seed N\n"
@@ -86,8 +84,6 @@ int main(int argc, char** argv) {
             options.load_bytes = parse_u32(argv[++i], options.load_bytes);
         } else if (arg == "--writeback-bytes" && has_value) {
             options.writeback_bytes = parse_u32(argv[++i], options.writeback_bytes);
-        } else if (arg == "--scan-bytes" && has_value) {
-            options.scan_bytes = parse_u32(argv[++i], options.scan_bytes);
         } else if (arg == "--mode" && has_value) {
             options.mode = argv[++i];
         } else if (arg == "--inject" && has_value) {
@@ -110,12 +106,14 @@ int main(int argc, char** argv) {
     }
 
     pl::PanelLuConfig config;
+    config.compute_group_count = 1;
+    config.pes_per_group = options.pe_count;
     config.pe_count = options.pe_count;
     config.task_slots_per_pe = options.task_slots;
     config.dispatcher_queue_depth = options.dispatcher_depth;
     config.load_bytes_per_cycle = options.load_bytes;
     config.writeback_bytes_per_cycle = options.writeback_bytes;
-    config.scan_bytes_per_cycle = options.scan_bytes;
+
     config.timing.div_latency_cycles = options.div_latency;
 
     pl::PanelLuPrototype prototype(config);

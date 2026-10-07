@@ -4,7 +4,90 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-from src.command_codec import normalize_pivot_threshold
+from src.command_codec import (
+    ScaleDesc,
+    ScaleSaturationPolicy,
+    normalize_pivot_threshold,
+)
+
+
+@dataclass(frozen=True)
+class GemmConfig:
+    """Top-level GEMM_SCHUR backend and local precision policy (T10).
+
+    ``FP32_SYSTEMC`` (default) keeps every kernel on the formal FP32 device
+    path: the GEMM ``KERNEL_DESC`` carries ``scale_desc_id = NONE``.
+
+    ``FP32_SYSTEMC_INT32_GEMM`` switches ONLY the top-level ``GEMM_SCHUR``
+    kernel to the local INT32 behavior model and emits one ``SCALE_DESC`` per
+    node GEMM kernel.  Panel/TRSM and the panel-internal updates stay FP32, and
+    the device front/DDR image keeps FP32 storage.
+
+    The supported precision range is INT32 storage / 30 effective quantization
+    bits / INT64 accumulator: ``effective_bits`` in ``[1, 30]`` with
+    ``k_block_max * (2^(bits-1)-1)^2 < 2^(accumulator_bits-2)``.  Any other
+    configuration is rejected here instead of being ignored at execution time.
+    """
+
+    backend: str = "FP32_SYSTEMC"
+    effective_bits: int = 30
+    accumulator_bits: int = 64
+    k_block_max: int = 16
+    scale_desc: ScaleDesc = ScaleDesc()
+    conversion_rate: int = 1
+
+    _VALID_BACKENDS: ClassVar[frozenset[str]] = frozenset(
+        {"FP32_SYSTEMC", "FP32_SYSTEMC_INT32_GEMM"}
+    )
+
+    def __post_init__(self) -> None:
+        if self.backend not in self._VALID_BACKENDS:
+            raise ValueError(
+                f"gemm backend must be one of {sorted(self._VALID_BACKENDS)}, "
+                f"got {self.backend!r}"
+            )
+        if not 1 <= self.effective_bits <= 30:
+            raise ValueError(
+                "effective_bits must be in [1, 30]: INT32 storage with 30 "
+                "effective quantization bits is the largest range whose "
+                "16-term dot product is provably < 2^62"
+            )
+        if self.accumulator_bits != 64:
+            raise ValueError("only the INT64 accumulator (64) is supported")
+        if not 1 <= self.k_block_max <= 16:
+            raise ValueError("k_block_max must be in [1, 16]")
+        qmax = (1 << (self.effective_bits - 1)) - 1
+        if self.k_block_max * qmax * qmax >= 1 << (self.accumulator_bits - 2):
+            raise ValueError(
+                "unsafe quantization range: k_block_max * qmax^2 must stay "
+                "below 2^(accumulator_bits-2)"
+            )
+        if self.conversion_rate < 1:
+            raise ValueError("conversion_rate must be >= 1 element per cycle")
+        ScaleDesc(
+            exponent_a=self.scale_desc.exponent_a,
+            exponent_b=self.scale_desc.exponent_b,
+            rounding=self.scale_desc.rounding,
+            saturation=self.scale_desc.saturation,
+            overflow=self.scale_desc.overflow,
+        )
+        if self.backend == "FP32_SYSTEMC":
+            if (
+                self.scale_desc.exponent_a is not None
+                or self.scale_desc.exponent_b is not None
+                or self.scale_desc.rounding
+                != ScaleDesc().rounding
+                or self.scale_desc.saturation
+                != ScaleSaturationPolicy.FAIL
+            ):
+                raise ValueError(
+                    "FP32_SYSTEMC must not carry INT32 scale settings; the "
+                    "FP32 GEMM kernel keeps scale_desc_id = NONE"
+                )
+
+    @property
+    def int32_gemm_enabled(self) -> bool:
+        return self.backend == "FP32_SYSTEMC_INT32_GEMM"
 
 
 @dataclass(frozen=True)
@@ -124,8 +207,12 @@ class CommandCompilerConfig:
     tile_size: int = 16
     max_front_size: int = 256
     max_wait_tokens: int = 256
+    # T11 emits a complete factorization without unimplemented T12 solve commands.
+    emit_solve_commands: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.emit_solve_commands, bool):
+            raise ValueError("emit_solve_commands must be a boolean")
         if self.alignment <= 0 or self.alignment & (self.alignment - 1):
             raise ValueError("alignment must be a positive power of two")
         if self.tile_size <= 0:
@@ -150,6 +237,7 @@ class PipelineConfig:
     matching: MatchingConfig = MatchingConfig()
     pivot: PivotPolicyConfig = PivotPolicyConfig()
     command: CommandCompilerConfig = CommandCompilerConfig()
+    gemm: GemmConfig = GemmConfig()
     solve: SolveInputConfig = SolveInputConfig()
     # Explicit opt-in: run the host FP64 front-tree reference (preflight +
     # residual metrics) around compilation.  Normal compilation never depends

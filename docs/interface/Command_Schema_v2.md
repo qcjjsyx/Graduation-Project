@@ -120,6 +120,35 @@ word9  pivot_threshold        IEEE-754 binary32 位型，[0, 1)
   `0..update_dim-1`，装配语义为
   `target[col_map[i], col_map[j]] += source[i, j]`。
 
+#### 3.2.1 KERNEL_DESC 与 SCALE_DESC（T10 冻结）
+
+- `KERNEL_DESC.format` 仍为 FP32；`tile_size` 当前只支持物理 16，其他值在
+  能力预检时明确拒绝。
+- `KERNEL_DESC.backend`：
+  - `0x01 SYSTEMC_FP32_DEVICE_MODEL`：`scale_desc_id` 必须为 `NONE`；
+    `TRSM_LEFT M/N/K = p/u/p`、`TRSM_RIGHT = u/p/p`、
+    `GEMM_SCHUR = u/u/p`（`u = n - p`）。
+  - `0x02 SYSTEMC_INT32_GEMM_MODEL`：`scale_desc_id` 必须引用有效
+    `SCALE_DESC`；只用于顶层 `GEMM_SCHUR`，Panel/TRSM 与内部更新保持 FP32。
+- `SCALE_DESC` word 6–9 必须为 0；word 0–5 的冻结语义：
+
+  | word | 语义 | 取值 |
+  | ---: | --- | --- |
+  | 0 | A 的有符号二的幂 exponent | `AUTO = 0x80000000`，否则 i32 补码 `[-256, 256]` |
+  | 1 | B 的有符号二的幂 exponent | 同上 |
+  | 2 | output scale | 本版仅 `AUTO`（由实际 `eA+eB` 推导）；固定值 `POLICY_NOT_SUPPORTED` |
+  | 3 | rounding mode | `1 = nearest, ties-to-even` |
+  | 4 | saturation policy | `1 = FAIL`，`2 = CLAMP_AND_REPORT` |
+  | 5 | overflow policy | `1 = FAIL` |
+
+- 默认 SCALE_DESC 为 `AUTO, AUTO, AUTO, 1, 1, 1`。
+- 未知枚举（0 值）或保留字非零 → `BAD_DESCRIPTOR`；已定义但本版不支持
+  （固定 output scale、exponent 越界）→ `POLICY_NOT_SUPPORTED`。
+- INT32 数值模型固定表述为 **INT32 storage / 30 effective quantization
+  bits / INT64 accumulator**：对称范围 `[-(2^29-1), +(2^29-1)]`，默认 16 项
+  点积满足 `16·(2^29-1)^2 < 2^62`；不得宣称任意完整 INT32 范围安全。
+- scale 只作用于一次 GEMM 调用，不传播为 front 或整棵树的数值格式。
+
 ## 4. 主元策略语义
 
 ### 4.1 STATIC（默认）

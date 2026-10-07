@@ -1,9 +1,11 @@
 #include "panel_lu/pe_model.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
+#include "panel_lu/precision_adapter.hpp"
 #include "panel_lu/tile_kernels.hpp"
 
 namespace hw::panel_lu {
@@ -38,6 +40,19 @@ const char* pe_event_name(PeEventKind kind) {
 
 namespace {
 
+bool is_int32_schur(const TileTask& task) {
+    return task.mode == TileMode::GemmSchur &&
+           task.gemm_backend == GemmBackend::Int32Gemm;
+}
+
+// Model cycles of one completed (or failed) INT32 GEMM_SCHUR task from its
+// phase counters. The kernel stores only the cycles consumed before a failure,
+// so the sum is the truthful partial progress.
+std::uint64_t int32_outcome_cycles(const kernels::KernelOutcome& outcome) {
+    return outcome.scale_reduction_cycles + outcome.quantize_cycles +
+           outcome.integer_compute_cycles + outcome.dequantize_cycles;
+}
+
 std::uint64_t failure_exec_cycles(
     const TileTask& task,
     const PeTimingConfig& timing,
@@ -64,6 +79,7 @@ std::uint64_t failure_exec_cycles(
             return (timing.div_latency_cycles + (task.dims.k - 1)) +
                    timing.tsolve_fill_cycles + (local + 1) + task.dims.m;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             return timing.fill_cycles + task.dims.k * timing.gemm_k_ii +
                    (local + 1) * timing.drain_row_cycles;
     }
@@ -93,6 +109,7 @@ std::uint32_t operand_specs(const TileTask& task, std::array<OperandSpec, 3>& sp
             specs[1] = {&task.rhs, task.dims.k, task.dims.k};
             return 2;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             specs[0] = {&task.dst, task.dims.m, task.dims.n};
             specs[1] = {&task.lhs, task.dims.m, task.dims.k};
             specs[2] = {&task.rhs, task.dims.k, task.dims.n};
@@ -144,9 +161,10 @@ kernels::KernelOutcome run_staged_fp64(
             copy_region(0, task.dims.m, task.dims.k);
             outcome = kernels::fp64_diagnostic::run_trsm_right(
                 computed.data(), stride, task.dims.m, task.dims.k,
-                wide[1].data(), stride);
+                wide[1].data(), stride, task.threshold_product);
             break;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             copy_region(0, task.dims.m, task.dims.n);
             outcome = kernels::fp64_diagnostic::run_gemm_update(
                 computed.data(), stride, wide[1].data(), stride, wide[2].data(),
@@ -157,6 +175,43 @@ kernels::KernelOutcome run_staged_fp64(
     for (std::size_t i = 0; i < computed.size(); ++i) {
         result[i] = static_cast<float>(computed[i]);
     }
+    if (outcome.status == StatusCode::Ok) {
+        // Rounding the binary64 result back to FP32 storage must stay finite;
+        // an overflow is a NON_FINITE_VALUE at the affected element and the
+        // tile must not be committed.
+        const std::uint32_t rows = task.mode == TileMode::TrsmRight ||
+                                           task.mode == TileMode::GemmUpdate ||
+                                           task.mode == TileMode::GemmSchur
+                                       ? task.dims.m
+                                       : task.dims.k;
+        const std::uint32_t cols = task.mode == TileMode::TrsmLeft ||
+                                           task.mode == TileMode::GemmUpdate ||
+                                           task.mode == TileMode::GemmSchur
+                                       ? task.dims.n
+                                       : task.dims.k;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            for (std::uint32_t c = 0; c < cols; ++c) {
+                if (!std::isfinite(result[r * 16 + c])) {
+                    outcome.status = StatusCode::NonFiniteValue;
+                    // LU_DIAG failure columns use the global pivot coordinate
+                    // (kernel convention: pivot_base + local); the other modes
+                    // keep local coordinates and are mapped by the controller.
+                    if (task.mode == TileMode::LuDiag) {
+                        outcome.failed_column = task.pivot_base + c;
+                    } else if (task.mode == TileMode::TrsmLeft) {
+                        outcome.failed_column = r;
+                    } else {
+                        outcome.failed_column = c;
+                    }
+                    outcome.reason =
+                        "fp64 diagnostic result overflowed to a non-finite "
+                        "FP32 value";
+                    outcome.diagonal_failure = false;
+                    return outcome;
+                }
+            }
+        }
+    }
     return outcome;
 }
 
@@ -164,7 +219,9 @@ kernels::KernelOutcome run_staged_fp64(
 kernels::KernelOutcome run_staged(
     const TileTask& task,
     const std::vector<std::vector<float>>& operands,
-    std::vector<float>& result) {
+    std::vector<float>& result,
+    const PrecisionConfig& precision,
+    const PeTimingConfig& timing) {
     constexpr std::uint32_t stride = 16;
     result.assign(TileStore::kTileFloats, 0.0f);
     kernels::KernelOutcome outcome;
@@ -190,8 +247,8 @@ kernels::KernelOutcome run_staged(
         case TileMode::TrsmRight:
             copy(0, task.dims.m, task.dims.k);
             return kernels::run_trsm_right(
-                result.data(), stride, task.dims.m, task.dims.k, operands[1].data(),
-                stride);
+                result.data(), stride, task.dims.m, task.dims.k,
+                operands[1].data(), stride, task.threshold_product);
         case TileMode::GemmUpdate:
             copy(0, task.dims.m, task.dims.n);
             return kernels::run_gemm_update(
@@ -204,6 +261,63 @@ kernels::KernelOutcome run_staged(
                 task.dims.m,
                 task.dims.n,
                 task.dims.k);
+        case TileMode::GemmSchur: {
+            copy(0, task.dims.m, task.dims.n);
+            if (task.gemm_backend != GemmBackend::Int32Gemm) {
+                return kernels::run_gemm_update(
+                    result.data(),
+                    stride,
+                    operands[1].data(),
+                    stride,
+                    operands[2].data(),
+                    stride,
+                    task.dims.m,
+                    task.dims.n,
+                    task.dims.k);
+            }
+            // Local INT32 backend: quantize the staged FP32 operands, compute
+            // with INT64 accumulation, dequantize one rounded FP32 partial
+            // product per output element and subtract it from the staged C.
+            // Result viability is delayed until the modeled writeback.
+            Int32GemmStats stats;
+            std::string reason;
+            const StatusCode status = run_int32_gemm_update(
+                result.data(),
+                stride,
+                operands[1].data(),
+                stride,
+                operands[2].data(),
+                stride,
+                task.dims.m,
+                task.dims.n,
+                task.dims.k,
+                precision,
+                timing,
+                task.gemm_scale,
+                &stats,
+                &reason);
+            outcome.status = status;
+            outcome.reason = reason;
+            outcome.gemm_failed_phase = stats.failed_phase;
+            outcome.gemm_failed_local_row = stats.failed_local_row;
+            outcome.gemm_failed_local_col = stats.failed_local_col;
+            outcome.gemm_exponent_a = stats.exponent_a;
+            outcome.gemm_exponent_b = stats.exponent_b;
+            outcome.saturation_count = stats.saturation_count;
+            outcome.overflow_count = stats.overflow_count;
+            outcome.local_conversion_bytes = stats.local_conversion_bytes;
+            outcome.scale_reduction_cycles = stats.scale_reduction_cycles;
+            outcome.quantize_cycles = stats.quantize_cycles;
+            outcome.integer_compute_cycles = stats.integer_compute_cycles;
+            outcome.dequantize_cycles = stats.dequantize_cycles;
+            if (status != StatusCode::Ok) {
+                // Local failure coordinates are mapped to the response column
+                // later by the controller; the PE only reports the first
+                // affected column consistently with the other modes.
+                outcome.failed_column = stats.failed_local_col;
+            }
+            return outcome;
+        }
     }
     outcome.status = StatusCode::BadDescriptor;
     outcome.reason = "unknown tile mode";
@@ -296,6 +410,7 @@ bool MultiModePe::try_accept(
     target->status = StatusCode::Ok;
     target->reason.clear();
     target->failed_column = 0;
+    target->gemm_backend = task.gemm_backend;
     target->result.assign(TileStore::kTileFloats, 0.0f);
     target->operand_tiles.assign(
         spec_count, std::vector<float>(TileStore::kTileFloats, 0.0f));
@@ -323,8 +438,7 @@ bool MultiModePe::try_accept(
 
 void MultiModePe::tick(
     std::uint64_t cycle,
-    PortBudget& load_budget,
-    PortBudget& store_write_budget,
+    hw::dataplane::OnChipArbiter& arbiter,
     WritebackReservation& writeback_reservation,
     TileAccess& access) {
     // Phase 1: per-slot progression (load, ready, execute, drain).
@@ -354,11 +468,17 @@ void MultiModePe::tick(
                     const OperandSpec& spec = specs[slot.load_operand];
                     const std::uint64_t row_bytes =
                         static_cast<std::uint64_t>(spec.cols - slot.load_col) * 4;
-                    std::uint64_t chunk =
-                        std::min(row_bytes, load_budget.remaining());
+                    // Unified budget: acquire BEFORE moving any byte. A denied
+                    // grant keeps the row/segment progress and retries later.
+                    const std::uint32_t granted = arbiter.acquire(
+                        hw::dataplane::OnChipDomain::Read,
+                        hw::dataplane::OnChipClientKind::PeLoad,
+                        pe_id_,
+                        static_cast<std::uint32_t>(row_bytes));
+                    std::uint64_t chunk = granted;
                     chunk -= chunk % 4;
                     if (chunk == 0) {
-                        break;  // budget exhausted this cycle
+                        break;  // not selected this cycle / budget exhausted
                     }
                     const std::uint32_t count = static_cast<std::uint32_t>(chunk / 4);
                     if (!access.read_operand_segment(
@@ -372,7 +492,6 @@ void MultiModePe::tick(
                         read_failed = true;
                         break;
                     }
-                    load_budget.request(chunk);
                     slot.bytes_read += chunk;
                     slot.load_remaining -= chunk;
                     slot.load_col += count;
@@ -404,16 +523,45 @@ void MultiModePe::tick(
                 const kernels::KernelOutcome outcome =
                     config_.numeric_mode == PanelNumericMode::Fp64Diagnostic
                         ? run_staged_fp64(slot.task, slot.operand_tiles, slot.result)
-                        : run_staged(slot.task, slot.operand_tiles, slot.result);
+                        : run_staged(
+                              slot.task, slot.operand_tiles, slot.result,
+                              config_.precision, config_.timing);
                 slot.status = outcome.status;
                 slot.reason = outcome.reason;
                 slot.failed_column = outcome.failed_column;
-                slot.exec_cycles = failure_exec_cycles(
-                    slot.task,
-                    config_.timing,
-                    outcome.status,
-                    outcome.failed_column,
-                    outcome.diagonal_failure);
+                slot.gemm_backend = slot.task.gemm_backend;
+                slot.gemm_failed_phase = outcome.gemm_failed_phase;
+                slot.gemm_failed_local_row = outcome.gemm_failed_local_row;
+                slot.gemm_failed_local_col = outcome.gemm_failed_local_col;
+                slot.gemm_exponent_a = outcome.gemm_exponent_a;
+                slot.gemm_exponent_b = outcome.gemm_exponent_b;
+                slot.saturation_count = outcome.saturation_count;
+                slot.overflow_count = outcome.overflow_count;
+                slot.local_conversion_bytes = outcome.local_conversion_bytes;
+                slot.scale_reduction_cycles = outcome.scale_reduction_cycles;
+                slot.quantize_cycles = outcome.quantize_cycles;
+                slot.integer_compute_cycles = outcome.integer_compute_cycles;
+                slot.dequantize_cycles = outcome.dequantize_cycles;
+                if (is_int32_schur(slot.task)) {
+                    // Success uses the full phase model; a failure keeps only
+                    // the cycles actually consumed before detection.
+                    slot.exec_cycles =
+                        outcome.status == StatusCode::Ok
+                            ? int32_gemm_exec_cycles(
+                                  slot.task.dims.m,
+                                  slot.task.dims.n,
+                                  slot.task.dims.k,
+                                  config_.precision,
+                                  config_.timing)
+                            : int32_outcome_cycles(outcome);
+                } else {
+                    slot.exec_cycles = failure_exec_cycles(
+                        slot.task,
+                        config_.timing,
+                        outcome.status,
+                        outcome.failed_column,
+                        outcome.diagonal_failure);
+                }
                 slot.load_done_cycle = cycle;
                 slot.ready_at = cycle + config_.load_latency_cycles;
                 slot.phase = TaskPhase::ReadyWait;
@@ -480,9 +628,13 @@ void MultiModePe::tick(
                 break;
             case TaskPhase::Writeback: {
                 if (slot.wb_remaining > 0) {
-                    const std::uint64_t chunk =
-                        std::min<std::uint64_t>(slot.wb_remaining, store_write_budget.remaining());
-                    if (chunk > 0 && store_write_budget.request(chunk)) {
+                    const std::uint32_t granted = arbiter.acquire(
+                        hw::dataplane::OnChipDomain::Write,
+                        hw::dataplane::OnChipClientKind::PeStore,
+                        pe_id_,
+                        static_cast<std::uint32_t>(slot.wb_remaining));
+                    const std::uint64_t chunk = granted;
+                    if (chunk > 0) {
                         slot.wb_remaining -= chunk;
                         slot.bytes_written += chunk;
                     } else {
@@ -646,6 +798,33 @@ void MultiModePe::queue_response(Slot& slot, std::uint64_t cycle) {
     response.bytes_written = slot.bytes_written;
     response.stall_port_cycles = slot.load_stall;
     response.stall_writeback_cycles = slot.wb_stall;
+    response.gemm_backend = slot.gemm_backend;
+    response.gemm_failed_phase = slot.gemm_failed_phase;
+    response.gemm_failed_local_row = slot.gemm_failed_local_row;
+    response.gemm_failed_local_col = slot.gemm_failed_local_col;
+    response.gemm_exponent_a = slot.gemm_exponent_a;
+    response.gemm_exponent_b = slot.gemm_exponent_b;
+    response.saturation_count = slot.saturation_count;
+    response.overflow_count = slot.overflow_count;
+    response.local_conversion_bytes = slot.local_conversion_bytes;
+    response.scale_reduction_cycles = slot.scale_reduction_cycles;
+    response.quantize_cycles = slot.quantize_cycles;
+    response.integer_compute_cycles = slot.integer_compute_cycles;
+    response.dequantize_cycles = slot.dequantize_cycles;
+    if (is_int32_schur(slot.task) && slot.exec_start_cycle == 0) {
+        // The functional snapshot is computed after loading, but none of its
+        // forecast conversion/compute work has run on the modeled PE yet.
+        response.saturation_count = 0;
+        response.overflow_count = 0;
+        response.local_conversion_bytes = 0;
+        response.scale_reduction_cycles = 0;
+        response.quantize_cycles = 0;
+        response.integer_compute_cycles = 0;
+        response.dequantize_cycles = 0;
+        response.gemm_failed_phase = GemmPhase::None;
+        response.gemm_exponent_a = 0;
+        response.gemm_exponent_b = 0;
+    }
     responses_.emplace_back(cycle + config_.response_hold_cycles, response);
 
     fifo_used_bytes_ -= static_cast<std::uint32_t>(slot.fifo_bytes);

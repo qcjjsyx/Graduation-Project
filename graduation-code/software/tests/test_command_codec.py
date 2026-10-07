@@ -9,10 +9,16 @@ from src.command_codec import (
     COMMAND_RECORD_BYTES,
     COMMAND_SCHEMA_VERSION,
     COMPLETION_RECORD_BYTES,
+    DEFAULT_GEMM_SCALE,
     DESCRIPTOR_RECORD_BYTES,
     NONE,
     PVECTOR_INIT_VALUE,
+    SCALE_AUTO,
+    SCALE_EXPONENT_MAX,
+    SCALE_EXPONENT_MIN,
     TRACE_ENABLE,
+    ScaleDesc,
+    ScaleSaturationPolicy,
     Command,
     Completion,
     DataFormat,
@@ -218,6 +224,78 @@ def test_pivot_threshold_bit_helpers():
         encode_pivot_threshold(-0.25)
     with pytest.raises(ValueError, match=r"\[0\.0, 1\.0\)"):
         decode_pivot_threshold(0x40000000)
+
+
+def test_scale_descriptor_golden_roundtrip_and_validation():
+    """T10 SCALE_DESC encoding is frozen and shared with the C++ decoder."""
+
+    # Default INT32 GEMM policy: AUTO, AUTO, AUTO, 1, 1, 1, 0..0.
+    assert DEFAULT_GEMM_SCALE.to_body_words() == (
+        SCALE_AUTO,
+        SCALE_AUTO,
+        SCALE_AUTO,
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
+    golden = fixture("scale_desc_default.bin")
+    descriptor = Descriptor.from_bytes(golden)
+    assert descriptor.descriptor_type == DescriptorType.SCALE_DESC
+    assert descriptor.body_words == DEFAULT_GEMM_SCALE.to_body_words()
+    assert ScaleDesc.from_body_words(descriptor.body_words) == DEFAULT_GEMM_SCALE
+
+    fixed = Descriptor.from_bytes(fixture("scale_desc_fixed_exponents.bin"))
+    decoded = ScaleDesc.from_body_words(fixed.body_words)
+    assert decoded.exponent_a == -3 and decoded.exponent_b == 5
+    assert decoded.rounding == DEFAULT_GEMM_SCALE.rounding
+    assert (
+        Descriptor(
+            descriptor_type=DescriptorType.SCALE_DESC,
+            payload_offset=0,
+            payload_bytes=0,
+            body_words=ScaleDesc(exponent_a=-3, exponent_b=5).to_body_words(),
+        ).to_bytes()
+        == fixture("scale_desc_fixed_exponents.bin")
+    )
+
+    # Malformed encodings are rejected instead of defaulted.
+    malformed = list(DEFAULT_GEMM_SCALE.to_body_words())
+    malformed[3] = 0
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(malformed)
+    malformed = list(DEFAULT_GEMM_SCALE.to_body_words())
+    malformed[4] = 0
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(malformed)
+    malformed = list(DEFAULT_GEMM_SCALE.to_body_words())
+    malformed[5] = 0
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(malformed)
+    malformed = list(DEFAULT_GEMM_SCALE.to_body_words())
+    malformed[9] = 1
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(malformed)
+
+    # Defined but unsupported values are explicit failures.
+    unsupported = list(DEFAULT_GEMM_SCALE.to_body_words())
+    unsupported[2] = 0  # fixed output scale
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(unsupported)
+    unsupported = list(DEFAULT_GEMM_SCALE.to_body_words())
+    unsupported[0] = (SCALE_EXPONENT_MAX + 1) & 0xFFFFFFFF
+    with pytest.raises(ValueError):
+        ScaleDesc.from_body_words(unsupported)
+    with pytest.raises(ValueError):
+        ScaleDesc(exponent_a=SCALE_EXPONENT_MIN - 1)
+    # CLAMP_AND_REPORT is a supported policy value.
+    clamp = ScaleDesc(saturation=ScaleSaturationPolicy.CLAMP_AND_REPORT)
+    words = clamp.to_body_words()
+    assert words[4] == 2
+    assert ScaleDesc.from_body_words(words).saturation == ScaleSaturationPolicy.CLAMP_AND_REPORT
 
 
 def test_dependency_descriptor_golden_payload_and_roundtrip():

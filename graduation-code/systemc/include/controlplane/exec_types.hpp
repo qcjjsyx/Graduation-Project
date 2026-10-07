@@ -10,6 +10,7 @@
 #include "dataplane/buffer_manager.hpp"
 #include "dataplane/descriptor_reader.hpp"
 #include "dataplane/memory_service.hpp"
+#include "panel_lu/gemm_types.hpp"
 
 namespace hw::controlplane {
 
@@ -89,6 +90,11 @@ struct ExecRequest {
 
     hw::command::PivotPolicy policy{hw::command::PivotPolicy::Static};
     std::uint32_t threshold_bits{0};
+    // Latched front numeric context produced by PANEL_LU and consumed by
+    // top-level TRSM diagonal checks (never re-derived from the eliminated
+    // front). Zero when unavailable.
+    double front_scale{0.0};
+    double threshold_product{0.0};
 };
 
 struct ExecResponse {
@@ -107,6 +113,19 @@ struct ExecResponse {
     std::uint64_t finish_cycle{0};
     bool needs_pvector_write{false};  // PANEL_LU success under STATIC
     std::uint32_t pvector_dim{0};
+    double front_scale{0.0};
+    double threshold_product{0.0};
+    // T10 GEMM_SCHUR backend statistics (zero for other opcodes). These stay
+    // internal; the external completion record is not extended.
+    hw::panel_lu::GemmBackend gemm_backend{hw::panel_lu::GemmBackend::Fp32Device};
+    std::uint64_t saturation_count{0};
+    std::uint64_t local_conversion_bytes{0};
+    std::uint64_t scale_reduction_cycles{0};
+    std::uint64_t quantize_cycles{0};
+    std::uint64_t integer_compute_cycles{0};
+    std::uint64_t dequantize_cycles{0};
+    std::int32_t exponent_a{0};
+    std::int32_t exponent_b{0};
 };
 
 // Replaceable execution unit. The test stub is only used when explicitly

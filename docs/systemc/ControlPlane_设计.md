@@ -2,7 +2,7 @@
 
 本文按“架构 → 命令交互 → 模块接口 → 实现机制”的顺序解释当前控制面，供对照代码阅读。代码位于 `graduation-code/systemc/include/controlplane/` 与 `src/controlplane/`，命名空间为 `hw::controlplane`。
 
-任务范围与历史验收见 [T05 任务记录](T05_SystemC_控制面设计.md)；搬运与片上访问见 [DataPlane 设计](DataPlane_设计.md)；外部格式见 [Command schema v2](../interface/Command_Schema_v2.md)。正文的当前执行路径是 T05 test stub；T06 独立原型与 T07 迁移点单列在第 8 节。
+任务范围与历史验收见 [T05 任务记录](T05_SystemC_控制面设计.md)；搬运与片上访问见 [DataPlane 设计](DataPlane_设计.md)；外部格式见 [Command schema v2](../interface/Command_Schema_v2.md)。第 2–7 节记录 T05 test stub 路径，正式数值迁移见第 8 节，T11 当前树形分解见第 9 节。
 
 ## 1. 控制面解决什么问题
 
@@ -10,7 +10,11 @@
 
 输入为已校验的 `LoadedArtifact` 和 `ControlPlaneConfig`；输出为设备 completion 区、token 终态、batch 状态及执行 trace。FP64 reference 不参与派发。依赖只来自命令 wait token，包括 NODE_BEGIN 对子节点 NODE_COMMIT 的显式等待，设备不根据 Host 消除树补推依赖。
 
-当前 `CommandDevice` 必须显式启用 `test_stub`。它验证调度和搬运，不提供正式 LU/TRSM/GEMM/solve 数值结果。报告始终标记 `execution_backend=test_stub`、`numerical_validation=not_performed`；`RequireRealKernels` 在启动时拒绝。T06 原型存在不改变这一后端边界。
+`CommandDevice` 显式选择后端：test stub 仅验证调度和搬运；正式后端通过
+`enable_real_panel=true` 绑定共享 Panel/TRSM/GEMM 引擎、FactorStoreUnit 和
+T11 AssemblyExecutionUnit，支持 `RequireRealKernels`。STATIC 树形分解已有
+独立 FP64 因子/update 验收，solve 与 DYNAMIC_PANEL 仍显式拒绝。设备报告
+`numerical_validation=not_performed`，外部 checker 独立记录验收结果。
 
 ## 2. 总体结构、所有权与调用关系
 
@@ -321,7 +325,8 @@ fetch FIFO 深度 = `command_window_depth + 2`；每拍扫描 FIFO 取**第一�
   `test_dynamic_panel_refusal`、`test_failure_propagation`。
 - `CP-I-17` `RequireRealKernels` 是**启动级拒绝**，绝不“默默用 stub 报成功”。
   验证：`test_backend_gating`。
-当前 ASSEMBLE 路径以映射搬运验证控制流，stub 不执行正式 extend-add；solve 按完整范围分块搬运，不执行三角求解。表中的 L/U/update 表示 STORE 的目标布局，不表示 stub 已算出这些数值。
+本节 T05 stub 的 ASSEMBLE 路径只执行映射搬运，solve 只分块搬运；T11
+正式 ASSEMBLE 则真实累加，见第 9 节。表中的 stub STORE 数据不代表数值因子。
 
 ## 6. completion、失败、abort 与 reset
 
@@ -431,7 +436,7 @@ summary.json : tool, execution_backend, control_flow_pass, numerical_validation,
 abort 场景因“abort 前已完成命令保留原状态”，测试改用不变量断言
 （全部终态 + 集合 ⊆ {ABORTED, OK, DEPENDENCY_FAILED} + 独立 front 正常）。
 
-### 7.3 实现边界
+### 7.3 T05 test stub 的历史实现边界
 
 - 无正式数值 kernel：PANEL/TRSM/GEMM/ASSEMBLE/SOLVE 全部由 test stub 承接，
   数据只透传或按 `command_id` 填充；STORE_* 写回的是**测试数据**，
@@ -475,7 +480,7 @@ T06 代码位于 `include/panel_lu/` 和 `src/panel_lu/`，包含 PanelControlle
   （默认空）；`abort_node` 改为定向 `abort_txn`，不再用共享 epoch 取消。
 - `ControlPlaneConfig` 新增 `enable_real_panel` 与 `panel=PanelLuConfig`；
   `start()` 在 `RequireRealKernels` 下必须显式开启 real panel，两个后端都
-  未开启则拒绝。未绑定 unit 的 kind（TRSM/GEMM/assemble/solve）在派发前
+  未开启则拒绝。未绑定 unit 的 kind 在派发前
   返回 `POLICY_NOT_SUPPORTED`，不落 stub、不永久等待。
 - P-vector 仍由 PostExec 写完整 identity 并等确认；真实引擎只返回
   `needs_pvector_write`。
@@ -484,6 +489,20 @@ T06 代码位于 `include/panel_lu/` 和 `src/panel_lu/`，包含 PanelControlle
   `panel_tasks.csv`（task/PE/mode/周期/字节/提交状态）。
 - `reset()` 额外复位共享引擎；失败/abort 后在途任务安全排空，旧响应由
   `handle_exec_response` 的终态守卫丢弃。
+- TRSM 派发前核对 `KERNEL_DESC` 三个操作数与驻留 front 的 REGION_DESC
+  一致（cross-node/other-region 引用 → `BAD_DESCRIPTOR`，不执行、不改数据、
+  不发布 READY）；operand 偏移为 front 相对口径，front 起点只叠加一次。
+- T09 起共享引擎同时服务 `PANEL_LU` 与顶层 `TRSM_LEFT/TRSM_RIGHT`：
+  `TrsmExecutionUnit`（kind=Trsm）严格核对 KERNEL_DESC 形状
+  （左解 p/u/p、右解 u/p/p）、tile_size=16 与 FP32 backend；PANEL 响应把
+  `front_pre_elimination_max_abs/threshold_product` 存入 front slot，后续
+  TRSM 的对角检查直接使用该锁存值。
+- PE 资源按 `compute_group_count × pes_per_group` 分组，一条计算命令独占
+  一组（含扫描）；`pe_count` 字段只是与乘积一致的兼容校验，不是第二个
+  资源来源。`STORE_FACTOR` 等搬运命令不领取计算组。
+- 设备级 `OnChipArbiter` 统一仲裁片上读/写预算（每域每拍单请求方 grant、
+  确定性轮转），覆盖 Panel 扫描、PE 装载/写回、Factor 读取与 DMA 片上读写；
+  `summary.json` 增加组/PE 配置，`panel_tasks.csv` 增加 `group_id`。
 - 定向 abort：`abort_node` 调用 `unit->abort_txn` 后**保留 tracker 与 lease**，
   等执行单元产出唯一终态响应（Factor 单元还会等已接受的 DDR 写确认）才释放
   资源、结束命令；`tick()` 的 Completed 判定额外要求所有执行单元 `!busy()`、
@@ -492,10 +511,10 @@ T06 代码位于 `include/panel_lu/` 和 `src/panel_lu/`，包含 PanelControlle
   DMA 矩形复制只在显式 test-stub 后端（无 Factor 单元）运行。
 - 内存响应按 request id 精确路由：`IExecutionUnit::handles_request` 决定属主，
   单实例只看到自己的未决写；未决集合为空且无新写时才返回终态。
-- T07 测试：`panel_lu_real_tests`（206 checks，含数值/失败/双 front/abort、定向 drain、Factor 路由/背压/FP64 诊断/
+- T07 测试：`panel_lu_real_tests`（215 checks，含数值/失败/双 front/abort、定向 drain、Factor 路由/背压/FP64 诊断（含舍入失败列/pivot_count）/
   reset/背压）与 `panel_lu_real_systemc_tests`（sc_clock 集成）。
 
-目标路径如下，T07 已完成其中 Panel 分支的迁移：
+数值路径如下，T07/T09/T10 已完成 Panel/TRSM/GEMM 分支的迁移：
 
 ```text
 CommandDevice：command 依赖/准入/lease/失败传播/completion
@@ -544,6 +563,38 @@ Panel 内部的 TRSM/GEMM task 与外部 TRSM/GEMM command 是两层概念：内
 | 片上 buffer 与冲突 | `BufferManager`（lease/transient/transfer_owner/rearm） | `DP-I-17~20` |
 | 数据搬运 | `DmaEngine` + `DmaArbiter`（owner 可配、retryable） | `DP-I-21~25` |
 | 追踪 | `TraceRecorder` + `write_reports` | `DP-I-27/28`、`CP-I-20` |
+## 9. T11 当前树形分解路径（2026-10-04）
+
+正式后端实例包括共享 Panel/TRSM/GEMM command adapter、FactorStoreUnit 和
+`AssemblyExecutionUnit`。实验固定 2 组×2 个 16×16 PE（配置可修改），装配
+是独立标量通路，共用统一 OnChipArbiter，不新增计算 PE 池。
+
+`ASSEMBLE_EXTEND_ADD` 派发前验证运行时 ContributionView 的身份、FP32
+布局、源/目标 stride、resident target 和 map。DMA 从 child 持久 DDR update
+装载到 parent temp，随后逐元素执行
+`parent[col_map[i],col_map[j]] += child[row_map[i],row_map[j]]`。每元素经
+两次 4 B lease 读、FP32 加法延迟、一次 4 B lease 写，单元 staging 12 B。
+响应保持期间单元 busy，控制面消费终态后释放 lease。无整 front 数值旁路。
+
+节点准入沿用所有 child commit token 的等待；同 parent 的装配串行，Panel
+等待全部装配。child 自己 commit 后 scratch 可以复用，但其 DDR update 在
+batch 静态内存区中保留；parent front/temp 保留至 parent commit。abort
+等待已接受 DMA/单元响应排空，已完成 scratch 字节仍计入命令统计；reset
+清空旧 epoch、lease 和 pending 请求。
+
+`tree_factor_device` 只接受显式 `factorization_only` scope 和真实后端。
+运行时选 FP32 或局部 INT32 GEMM 时校验 manifest 与实际 GEMM descriptor，
+不改写命令。未实现 solve/DYNAMIC_PANEL 仍明确失败。
+报告新增 `nodes.csv`、最终 DDR image、`numeric_status_pass` 和装配配置；
+节点必须成功 commit 才能标为 OK。控制完成与所有数值命令 OK 分开记录；
+独立 `tree_factor_check` 才生成 FP64 因子/update/P 误差验收。
+
+Release / ASan+UBSan 32/32、Python 120 passed。24 个两模式 tree artifact
+中 23 个通过参考检查，1 个 INT32 STATIC 主元失败符合预期；树中
+abort/reset/复用、child 完成次序与两模式 sc_clock 对照均通过。
+完整方案、生命周期、误差定义和复现位置见
+[T11 集成设计](../architecture/T11_真实装配与树形分解集成.md)。
+
 ## 附录 A：不变量与测试索引
 
 | ID | 不变量（摘要） | 验证 |

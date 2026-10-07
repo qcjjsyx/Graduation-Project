@@ -48,6 +48,10 @@ std::uint32_t threshold_bits_0001() {
 
 pl::PanelLuConfig base_config(std::uint32_t pe_count = 1) {
     pl::PanelLuConfig config;
+    // T06 prototype explicit test config: one legacy group holding all PEs
+    // (the synthetic prototype is not the grouped device path).
+    config.compute_group_count = 1;
+    config.pes_per_group = pe_count;
     config.pe_count = pe_count;
     config.task_slots_per_pe = 4;
     config.dispatcher_queue_depth = 32;
@@ -56,7 +60,6 @@ pl::PanelLuConfig base_config(std::uint32_t pe_count = 1) {
     config.load_latency_cycles = 2;
     config.writeback_bytes_per_cycle = 64;
     config.writeback_latency_cycles = 2;
-    config.scan_bytes_per_cycle = 64;
     config.scan_reduce_latency_cycles = 8;
     return config;
 }
@@ -158,8 +161,18 @@ void test_config_validation() {
     config.tile_dim = 8;
     rejected(config, "tile_dim=8");
     config = base_config();
-    config.pe_count = 0;
-    rejected(config, "pe_count=0");
+    config.pe_count = 3;  // conflicts with 1 x 1
+    rejected(config, "conflicting pe_count");
+    config = base_config();
+    config.compute_group_count = 0;
+    rejected(config, "compute_group_count=0");
+    config = base_config();
+    config.pes_per_group = 0;
+    rejected(config, "pes_per_group=0");
+    config = base_config();
+    config.pe_count = 0;  // 0 = derive from the product: valid
+    pl::PanelLuPrototype derived(config);
+    expect(derived.configure().ok, "pe_count=0 derives from the group product");
     config = base_config();
     config.task_slots_per_pe = 0;
     rejected(config, "task_slots=0");
@@ -711,7 +724,7 @@ void test_scan_dependency_and_finite_check() {
     // Two resident commands with a narrow scan port: scan contention is
     // observable through the per-command stall counter.
     pl::PanelLuConfig scan_config = base_config(1);
-    scan_config.scan_bytes_per_cycle = 16;
+    scan_config.load_bytes_per_cycle = 16;
     pl::PanelLuPrototype scan_prototype(scan_config);
     expect(scan_prototype.configure().ok, "configure scan contention");
     expect(scan_prototype.submit_command(make_request(0, 32, 32)).ok, "submit scan 0");

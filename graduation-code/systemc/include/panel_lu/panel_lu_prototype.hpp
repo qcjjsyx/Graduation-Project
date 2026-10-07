@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/on_chip_arbiter.hpp"
 #include "panel_lu/panel_controller.hpp"
 #include "panel_lu/task_types.hpp"
 #include "panel_lu/tile_dispatcher.hpp"
@@ -152,9 +153,7 @@ private:
     WritebackReservation writeback_reservation_;
     TileDispatcher dispatcher_;
     std::vector<ControllerSlot> controller_slots_;
-    PortBudget load_budget_;
-    PortBudget store_write_budget_;
-    PortBudget scan_budget_;
+    hw::dataplane::OnChipArbiter arbiter_;
 
     std::vector<TaskRecord> task_records_;
     std::vector<PrototypeEvent> events_;

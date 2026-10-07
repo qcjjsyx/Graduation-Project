@@ -1,5 +1,7 @@
 #include "dataplane/dma_engine.hpp"
 
+#include <cstring>
+
 #include <algorithm>
 #include <limits>
 
@@ -259,6 +261,9 @@ void DmaEngine::accept_request(std::uint64_t cycle) {
     memory_pending_ = false;
     memory_response_ready_ = false;
     have_lease_ = false;
+    beat_read_progress_ = 0;
+    beat_write_progress_ = 0;
+    beat_staged_ = false;
     memory_wait_cycles_ = 0;
     buffer_wait_cycles_ = 0;
     pipeline_wait_cycles_ = 0;
@@ -337,7 +342,52 @@ void DmaEngine::accept_request(std::uint64_t cycle) {
 
 void DmaEngine::start_next_beat(std::uint64_t cycle) {
     const Beat beat = current_beat();
-    if (!first_beat_started_) {
+    if (active_.direction == DmaDirection::BufferToMemory) {
+        if (!first_beat_started_) {
+            response_.first_beat_cycle = cycle;
+            first_beat_started_ = true;
+        }
+        // On-chip budget gate with segment progress: the whole beat is staged
+        // exactly once before one DDR write is submitted. Staging is
+        // (re)initialized only when a NEW beat starts; budget waits and DDR
+        // backpressure retries keep the already loaded bytes and progress.
+        if (!beat_staged_) {
+            beat_buffer_data_.assign(static_cast<std::size_t>(beat.length), 0);
+            beat_read_progress_ = 0;
+            beat_staged_ = true;
+        }
+        while (beat_read_progress_ < beat.length) {
+            const std::uint32_t want =
+                static_cast<std::uint32_t>(beat.length - beat_read_progress_);
+            std::uint32_t take = want;
+            if (arbiter_ != nullptr) {
+                take = arbiter_->acquire(
+                    OnChipDomain::Read, OnChipClientKind::Dma, 0, want);
+                if (take == 0) {
+                    ++buffer_wait_cycles_;
+                    return;
+                }
+            }
+            std::string reason;
+            std::vector<std::uint8_t> segment;
+            const auto read_status = buffers_.lease_read(
+                lease_.lease_id, beat.buffer_offset + beat_read_progress_, take,
+                segment, cycle, &reason);
+            if (read_status == hw::command::StatusCode::BufferFull) {
+                ++buffer_wait_cycles_;
+                return;
+            }
+            if (read_status != hw::command::StatusCode::Ok) {
+                fail_transfer(read_status, reason, cycle);
+                return;
+            }
+            std::memcpy(
+                beat_buffer_data_.data() + beat_read_progress_, segment.data(),
+                segment.size());
+            beat_read_progress_ += static_cast<std::uint32_t>(segment.size());
+            scratch_read_bytes_ += segment.size();
+        }
+    } else if (!first_beat_started_) {
         response_.first_beat_cycle = cycle;
         first_beat_started_ = true;
     }
@@ -363,19 +413,9 @@ void DmaEngine::start_next_beat(std::uint64_t cycle) {
         return;
     }
 
-    std::string reason;
-    const auto read_status = buffers_.lease_read(
-        lease_.lease_id, beat.buffer_offset, beat.length, beat_buffer_data_, cycle,
-        &reason);
-    if (read_status == hw::command::StatusCode::BufferFull) {
-        // Port/lease not ready yet; retry next cycle.
-        ++buffer_wait_cycles_;
-        return;
-    }
-    if (read_status != hw::command::StatusCode::Ok) {
-        fail_transfer(read_status, reason, cycle);
-        return;
-    }
+    // BufferToMemory: the whole beat is already staged above under the read
+    // budget; do NOT re-read it here (that would double-count scratchpad
+    // traffic and re-read data on DDR backpressure retries).
     request.write = true;
     request.address = beat.ddr_address;
     request.length = beat.length;
@@ -406,6 +446,9 @@ void DmaEngine::complete_beat(std::uint64_t cycle) {
 
     memory_response_ready_ = false;
     memory_pending_ = false;
+    beat_read_progress_ = 0;
+    beat_write_progress_ = 0;
+    beat_staged_ = false;
 
     ++index_in_row_;
     if (index_in_row_ >= beats_per_row_) {
@@ -564,19 +607,49 @@ void DmaEngine::tick(std::uint64_t cycle) {
         }
         if (active_.direction == DmaDirection::MemoryToBuffer) {
             const Beat beat = current_beat();
-            std::string reason;
-            const auto write_status = buffers_.lease_write(
-                lease_.lease_id, beat.buffer_offset,
-                pending_memory_response_.read_data, cycle, &reason);
-            if (write_status == hw::command::StatusCode::BufferFull) {
+            const std::size_t total = pending_memory_response_.read_data.size();
+            // On-chip budget gate with segment progress: a grant smaller than
+            // the beat is written partially and resumed next cycle.
+            std::size_t take = total - beat_write_progress_;
+            if (take > 0) {
+                if (arbiter_ != nullptr) {
+                    const std::uint32_t granted = arbiter_->acquire(
+                        OnChipDomain::Write,
+                        OnChipClientKind::Dma,
+                        0,
+                        static_cast<std::uint32_t>(take));
+                    if (granted == 0) {
+                        ++buffer_wait_cycles_;
+                        return;
+                    }
+                    take = std::min<std::size_t>(take, granted);
+                }
+                std::vector<std::uint8_t> segment(
+                    pending_memory_response_.read_data.begin() +
+                        static_cast<std::ptrdiff_t>(beat_write_progress_),
+                    pending_memory_response_.read_data.begin() +
+                        static_cast<std::ptrdiff_t>(beat_write_progress_ + take));
+                std::string reason;
+                const auto write_status = buffers_.lease_write(
+                    lease_.lease_id, beat.buffer_offset + beat_write_progress_,
+                    segment, cycle, &reason);
+                if (write_status == hw::command::StatusCode::BufferFull) {
+                    ++buffer_wait_cycles_;
+                    return;
+                }
+                if (write_status != hw::command::StatusCode::Ok) {
+                    memory_response_ready_ = false;
+                    fail_transfer(write_status, reason, cycle);
+                    return;
+                }
+                beat_write_progress_ += static_cast<std::uint32_t>(take);
+                scratch_write_bytes_ += take;
+            }
+            if (beat_write_progress_ < total) {
                 ++buffer_wait_cycles_;
-                return;
+                return;  // budget exhausted mid-beat
             }
-            if (write_status != hw::command::StatusCode::Ok) {
-                memory_response_ready_ = false;
-                fail_transfer(write_status, reason, cycle);
-                return;
-            }
+            beat_write_progress_ = 0;
         }
         memory_response_ready_ = false;
         complete_beat(cycle);
@@ -614,6 +687,9 @@ void DmaEngine::reset() {
     issue_recorded_ = false;
     phase_ = Phase::Idle;
     response_ = DmaResponse{};
+    beat_read_progress_ = 0;
+    beat_write_progress_ = 0;
+    beat_staged_ = false;
     memory_wait_cycles_ = 0;
     buffer_wait_cycles_ = 0;
     pipeline_wait_cycles_ = 0;

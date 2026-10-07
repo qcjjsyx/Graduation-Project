@@ -369,6 +369,20 @@ reset：丢弃活动传输与 pending 响应（不交付）、`abort_lease` 回�
 - `DP-I-25` FP32/INT32 位模式逐字节保持，无隐式数值转换。
   验证：`test_bit_patterns_preserved`。
 
+DMA beat staging（T09 修复后的规则）：`BufferToMemory` 的 beat 只在开始
+新 beat 时初始化 staging，按 grant 分段读取恰好一次；预算等待与 DDR 提交
+背压重试保留进度，不整 beat 重读、不清零已装载数据。DmaEngine 暴露
+`scratch_read_bytes()/scratch_write_bytes()`；BufferManager 暴露累计
+`total_lease_access_bytes()`，两者与仲裁器字节数用于独立核对
+（`dataplane_systemc_tests` 回归）。
+
+T09 统一片上带宽仲裁：设备级 `OnChipArbiter`（`dataplane/on_chip_arbiter`）
+把 scratchpad 读/写预算建模为两个域，每域每拍最多一个请求方获得最多完整
+预算（剩余不共享、确定性轮转、未获 grant 保留进度）。DMA 的片上 buffer
+侧读写通过 `DmaEngine::set_on_chip_arbiter` 受限；beat 大于单拍预算时分段
+推进，不重复读取/写入已完成的字节。T04 独立测试不设置仲裁器，保持
+原有 standalone 语义。
+
 T07 真实 Panel 引擎对数据面的使用（仅授权接口）：
 
 - 只通过 `BufferManager::lease_read/lease_write` 读写 front buffer；lease

@@ -31,6 +31,8 @@ std::uint32_t threshold_bits_0001() {
 
 pl::PanelLuConfig base_config(std::uint32_t pe_count) {
     pl::PanelLuConfig config;
+    config.compute_group_count = 1;
+    config.pes_per_group = pe_count;
     config.pe_count = pe_count;
     config.task_slots_per_pe = 4;
     config.dispatcher_queue_depth = 32;

@@ -130,6 +130,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineOutputs:
         rhs=rhs_permuted,
         config=config.command,
         pivot=config.pivot,
+        gemm=config.gemm,
     )
 
     out_dir = config.out_dir

@@ -1,8 +1,11 @@
 # Panel-LU 硬件架构与多模式 PE 接口/时序原型（T06）
 
 状态：**T06 架构设计 + 可执行原型已交付；T07 正式 FP32 STATIC Panel 引擎已接入
-T05 真实数据面/控制面并完成数值验证**（详见
-[T07_Panel_LU数值引擎设计](../systemc/T07_Panel_LU数值引擎设计.md)）。本文是
+T05 真实数据面/控制面并完成数值验证；T09 将该引擎扩展为共享计算引擎**
+（Panel/TRSM 共用 PE 池、`compute_group_count × pes_per_group` 分组、统一
+片上带宽仲裁、完整 L/U 保存），详见
+[T07_Panel_LU数值引擎设计](../systemc/T07_Panel_LU数值引擎设计.md) 与
+[TRSM架构设计](TRSM架构设计.md)。本文是
 Panel-LU 子系统与共享多模式 PE 池的设计权威文档；T06 合成原型配套可编译接口
 （`graduation-code/systemc/include/panel_lu/`）、可执行时序/资源原型
 （`src/panel_lu/`）与测试（`tests/panel_lu_prototype_tests.cpp`、

@@ -431,8 +431,9 @@ void DescriptorReader::finish(
     outcome.descriptor = task.record;
     if (status == cmd::StatusCode::Ok) {
         std::string reason_text;
-        if (!finalize(task, outcome, &reason_text)) {
-            outcome.status = cmd::StatusCode::BadDescriptor;
+        cmd::StatusCode rejected = cmd::StatusCode::BadDescriptor;
+        if (!finalize(task, outcome, &reason_text, &rejected)) {
+            outcome.status = rejected;
             outcome.reason = std::move(reason_text);
         }
     }
@@ -450,7 +451,8 @@ void DescriptorReader::finish(
 bool DescriptorReader::finalize(
     Task& task,
     ReadOutcome& outcome,
-    std::string* reason) {
+    std::string* reason,
+    cmd::StatusCode* rejected_status) {
     const auto body = task.record.body_words;
     switch (task.kind) {
     case ReadKind::Region:
@@ -664,6 +666,29 @@ bool DescriptorReader::finalize(
             if (found == task.refs.end() ||
                 found->descriptor.descriptor_type != cmd::DescriptorType::Scale) {
                 *reason = "kernel scale reference is not a SCALE_DESC";
+                return false;
+            }
+            // Actually parse and validate the SCALE_DESC body (through the
+            // device transaction that already fetched the record). A malformed
+            // encoding is BAD_DESCRIPTOR; a well-formed but unsupported policy
+            // is POLICY_NOT_SUPPORTED; neither is silently ignored.
+            const auto& scale_body = found->descriptor.body_words;
+            view.scale.descriptor_id = view.scale_descriptor_id;
+            view.scale.word_a = scale_body[0];
+            view.scale.word_b = scale_body[1];
+            view.scale.word_output = scale_body[2];
+            view.scale.rounding_mode = scale_body[3];
+            view.scale.saturation_policy = scale_body[4];
+            view.scale.overflow_policy = scale_body[5];
+            std::string policy_reason;
+            const cmd::StatusCode policy_status = decode_scale_policy(
+                view.scale_descriptor_id, scale_body.data(), &view.scale.policy,
+                &policy_reason);
+            if (policy_status != cmd::StatusCode::Ok) {
+                *reason = "SCALE_DESC policy rejected: " + policy_reason;
+                if (rejected_status != nullptr) {
+                    *rejected_status = policy_status;
+                }
                 return false;
             }
         }

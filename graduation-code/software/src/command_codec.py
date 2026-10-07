@@ -102,6 +102,132 @@ class KernelBackend(IntEnum):
     SYSTEMC_INT32_GEMM_MODEL = 0x02
 
 
+# ---------------------------------------------------------------------------
+# SCALE_DESC (T10 frozen semantics)
+# ---------------------------------------------------------------------------
+
+#: AUTO marker for a signed power-of-two exponent word.
+SCALE_AUTO = 0x80000000
+#: Supported fixed exponent range (i32 two's complement words).
+SCALE_EXPONENT_MIN = -256
+SCALE_EXPONENT_MAX = 256
+
+
+class ScaleRoundingMode(IntEnum):
+    NEAREST_TIES_EVEN = 1
+
+
+class ScaleSaturationPolicy(IntEnum):
+    FAIL = 1
+    CLAMP_AND_REPORT = 2
+
+
+class ScaleOverflowPolicy(IntEnum):
+    FAIL = 1
+
+
+@dataclass(frozen=True)
+class ScaleDesc:
+    """Decoded SCALE_DESC policy (schema v2 body words 0..5).
+
+    ``exponent_a``/``exponent_b`` are ``None`` for AUTO (the device derives a
+    per-tile power-of-two scale from the local maxabs) or a fixed i32 exponent
+    in ``[-256, 256]``.  The output scale is AUTO only in this version: it is
+    derived from the actual ``eA + eB`` of each tile.  Words 6..9 stay zero.
+    """
+
+    exponent_a: Optional[int] = None
+    exponent_b: Optional[int] = None
+    rounding: ScaleRoundingMode = ScaleRoundingMode.NEAREST_TIES_EVEN
+    saturation: ScaleSaturationPolicy = ScaleSaturationPolicy.FAIL
+    overflow: ScaleOverflowPolicy = ScaleOverflowPolicy.FAIL
+
+    def __post_init__(self) -> None:
+        for name, value in (("exponent_a", self.exponent_a), ("exponent_b", self.exponent_b)):
+            if value is None:
+                continue
+            if not SCALE_EXPONENT_MIN <= value <= SCALE_EXPONENT_MAX:
+                raise ValueError(
+                    f"{name} must be in "
+                    f"[{SCALE_EXPONENT_MIN}, {SCALE_EXPONENT_MAX}], got {value}"
+                )
+        ScaleRoundingMode(self.rounding)
+        ScaleSaturationPolicy(self.saturation)
+        ScaleOverflowPolicy(self.overflow)
+
+    def to_body_words(self) -> Tuple[int, ...]:
+        def exponent_word(value: Optional[int]) -> int:
+            if value is None:
+                return SCALE_AUTO
+            return value & 0xFFFFFFFF
+
+        return (
+            exponent_word(self.exponent_a),
+            exponent_word(self.exponent_b),
+            SCALE_AUTO,
+            int(self.rounding),
+            int(self.saturation),
+            int(self.overflow),
+            0,
+            0,
+            0,
+            0,
+        )
+
+    @classmethod
+    def from_body_words(cls, body_words: Sequence[int]) -> "ScaleDesc":
+        """Decode and validate a SCALE_DESC body.
+
+        Malformed encodings (undefined zero enumerations, non-zero reserved
+        words) raise ``ValueError``; well-formed but unsupported values (fixed
+        output scale, exponent outside the supported range) also raise, since
+        the compiler never emits them and a decoder must not silently ignore
+        device-visible policy.
+        """
+
+        if len(body_words) != 10:
+            raise ValueError("SCALE_DESC body must have 10 words")
+        if any(word != 0 for word in body_words[6:10]):
+            raise ValueError("SCALE_DESC reserved words 6..9 must be zero")
+        if body_words[2] != SCALE_AUTO:
+            raise ValueError(
+                "fixed output_scale is defined but not supported in this version"
+            )
+
+        def decode_exponent(word: int, label: str) -> Optional[int]:
+            if word == SCALE_AUTO:
+                return None
+            signed = word - (1 << 32) if word & 0x80000000 else word
+            if not SCALE_EXPONENT_MIN <= signed <= SCALE_EXPONENT_MAX:
+                raise ValueError(
+                    f"{label} outside the supported range "
+                    f"[{SCALE_EXPONENT_MIN}, {SCALE_EXPONENT_MAX}]"
+                )
+            return signed
+
+        rounding = body_words[3]
+        if rounding == 0:
+            raise ValueError("SCALE_DESC rounding_mode 0 is undefined")
+        saturation = body_words[4]
+        if saturation == 0:
+            raise ValueError("SCALE_DESC saturation_policy 0 is undefined")
+        overflow = body_words[5]
+        if overflow == 0:
+            raise ValueError("SCALE_DESC overflow_policy 0 is undefined")
+        return cls(
+            exponent_a=decode_exponent(body_words[0], "exponent_a"),
+            exponent_b=decode_exponent(body_words[1], "exponent_b"),
+            rounding=ScaleRoundingMode(rounding),
+            saturation=ScaleSaturationPolicy(saturation),
+            overflow=ScaleOverflowPolicy(overflow),
+        )
+
+
+#: Default SCALE_DESC emitted for the INT32 GEMM backend: AUTO, AUTO, AUTO,
+#: nearest ties-to-even, FAIL, FAIL.
+DEFAULT_GEMM_SCALE = ScaleDesc()
+
+
 class SolveDirection(IntEnum):
     FORWARD = 0x01
     BACKWARD = 0x02

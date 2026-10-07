@@ -1,12 +1,18 @@
 # 毕业设计当前任务状态
 
-状态：**T00–T07 已完成（含主元策略、schema v2、SystemC 数据面与控制面、Panel-LU 硬件架构/多模式 PE 原型、正式 FP32 STATIC Panel 数值引擎与 T05 接入）；下一步为 T09/T10 顶层 TRSM/GEMM 数值核并复用共享 PE 池；T14 后移至 STATIC 数值闭环之后。**
+状态：**T00–T11 的 STATIC 分解阶段已完成。T11 补齐真实 FP32 extend-add、单节点/多节点/forest 分解、两种后端设备入口与独立 FP64 因子/update 验收；实验采用 2 组×每组 2 个 16×16 PE，配置可修改。下一步为 T12 树形 solve 与完整 Ax=b 闭环；T14 后移至 STATIC 数值闭环之后。**
 
 > 本文档只记录当前主线已经完成的工作、验证证据和后续边界，不再按月份或周数安排进度。
 > T06 完成的是硬件设计、可编译内部契约与可执行时序/资源原型；T07 完成的是
-> Panel（A11）子系统的正式 FP32 STATIC 数值执行与 T05 接入，**尚未**包含顶层
-> TRSM/GEMM/solve 与完整分解/求解闭环，也不能据此宣称 FP32 全链路数值通过、
-> 芯片周期或加速比。
+> Panel（A11）子系统的正式 FP32 STATIC 数值执行与 T05 接入；T09 完成顶层
+> 左右 TRSM 数值执行、2 组×2 PE 分组调度（可配置）、统一片上带宽仲裁与
+> 完整 L/U 因子保存；T10 完成顶层 GEMM_Schur（FP32 与局部 INT32 行为模型，
+> INT32 storage / 30 effective quantization bits / INT64 accumulator）、
+> 统一 `GemmReq/GemmRsp`、运行时 SCALE_DESC 读取、控制面接入与受控 STATIC
+> 主元传播验证。T11 已完成真实 assemble 与 STATIC 整树分解；**尚未**包含
+> 树形 solve。已有受控真实树 INT32 主元失败传播证据，总体失败率仍待实验；
+> 不能据此宣称完整
+> Ax=b 闭环、芯片周期或加速比。
 
 ## 1. 当前主线
 
@@ -32,7 +38,8 @@
     验证设备主元失败生成合法输入；未执行时参考解文件与指标缺省；参考不向
     设备产物注入结果。
 - 主线 SystemC 保留：
-  - schema v2 的 Command/Descriptor/Completion C++ codec（含策略字段校验）；
+  - schema v2 的 Command/Descriptor/Completion C++ codec（含策略字段校验、
+    T10 SCALE_DESC 编码与运行时读取）；
   - 独立 FP64 reference（`PivotPolicy`/`PivotFailure`、`panel_lu_policy`，
     与通用 dense partial-pivot `panel_lu` 明确分离）；
   - 独立 ATU / HPU 模块（DYNAMIC_PANEL 用）与测试；
@@ -47,9 +54,12 @@
   双 front 驻留与共享单元池调度、执行派发、completion/token 写回、
   abort/reset 与统计；设计权威见 `docs/systemc/ControlPlane_设计.md`，
   任务记录见 `docs/systemc/T05_SystemC_控制面设计.md`。
-- **正式数值 kernel 尚未实现**：Panel-LU/TRSM/GEMM/solve 数值核按后续任务
-  实现；T05 以显式 test stub 验证控制流，结果标记
-  `execution_backend=test_stub`，不得宣称数值正确性或加速比。
+- **STATIC 分解数值链已实现**：Panel-LU（T07）、顶层左右 TRSM（T09）与
+  顶层 GEMM_Schur（T10，含局部 INT32 行为模型）在共享引擎上真实执行；
+  真实 FP32 assemble 与树形分解（T11）已通过独立 FP64 因子/update 对照。
+  solve 尚未实现，相关命令显式 `POLICY_NOT_SUPPORTED` 或依赖失败。
+  T05 的 test stub 仍只用于显式控制流
+  验证，不得宣称数值正确性或加速比。
 - **T06 共享多模式 PE 架构/原型已交付**：详细设计见
   `docs/architecture/Panel-LU架构设计.md`；内部 task/config/response 契约
   （`include/panel_lu/task_types.hpp`）与可执行时序/资源原型
@@ -343,28 +353,131 @@
 | T06 尾块/混合 trace | p=23 pe=1 尾块 5 任务；p=40 双 front 双 PE 混合模式全部提交 |
 | T06 手算周期证据 | p=16 LU_DIAG exec 136、wb_done 199；TRSM_RIGHT 57 拍（div 敏感）；p=32 GEMM 16³ exec 34、wb_done 496；失败列 1/1/0 分别 10/10/1 拍 |
 | T07 主线 CTest | 18/18 passed（16 既有 + panel_lu_real_tests / panel_lu_real_systemc_tests） |
-| T07 测试规模 | real 206 checks、real SystemC 10 checks |
+| T07 测试规模 | real 215 checks、real SystemC 10 checks |
 | T07 数值证据 | n=p ∈ {4,15,16,17,23} L/U 对 FP64 STATIC 参考 max diff < 5e-3（实测 ~1e-7），L·U 重构 A11，P-vector identity |
-| T07 边界证据 | n=17,p=16：A11 与参考一致、A12/A21/A22 字节不变、顶层 TRSM/GEMM/solve `POLICY_NOT_SUPPORTED`（无 stub 回退） |
+| T07 边界证据 | n=17,p=16：A11 与参考一致、A12/A21/A22 字节不变、顶层 GEMM/solve `POLICY_NOT_SUPPORTED`（无 stub 回退）；TRSM 自 T09 起真实执行 |
+| T09 主线 CTest | 19/19 passed（18 既有 + trsm_real_tests 160 checks） |
+| T09 数值证据 | n=42/p=23/u=19：L/U 对 FP64 oracle max diff < 5e-3；`L11·U12−A12`、`L21·U11−A21` 归一化残差 < 5e-3；完整因子 8·n·p=7728 B；A11/A22/guard 字节不变 |
+| T09 分组/带宽证据 | 2 组×2 PE：命令独占组（组冲突=0）、组内多 PE 并行、跨 kind/跨 front 复用、每 PE 排他；仲裁器单 grant/轮转/剩余不共享；低带宽 16B/cycle 下扫描/装载/写回/DMA 全部获 grant 且无饥饿 |
+| T10 主线 CTest | 21/21 passed（20 既有 + gemm_real_tests），ASan+UBSan 21/21 |
+| T10 测试规模 | gemm_real_tests 214 checks（含跨语言 8 checks）；trsm_real_tests 162 checks；panel_lu_real_tests 215 checks |
+| T10 数值证据 | n=42/p=23/u=19：8 个 GEMM 任务、operand read 9880 B、writeback 2888 B、STORE_UPDATE 1444 B；FP32 A22 对独立 FP64 递推相对误差 < 5e-5；INT32 最终 Schur 对设备因子 FP64 复核相对误差 < 1e-4；良态构造与独立 INT64 oracle 精确一致 |
+| T10 SCALE_DESC/策略 | 默认 `AUTO,AUTO,AUTO,1,1,1`；畸形 → BAD_DESCRIPTOR、固定 output scale/exponent 越界 → POLICY_NOT_SUPPORTED；FP32+SCALE/INT32 缺 SCALE → BAD_DESCRIPTOR；饱和 FAIL 拒绝、CLAMP_AND_REPORT 继续并计数；完整 INT32 极值 → NUMERIC_OVERFLOW |
+| T10 跨语言 | 生产编译器生成 INT32 设备目录由 C++ 设备加载执行：node.0.update=-0.5（精确）、node.1.update≈2/3（量化步内），summary 记录实际 INT32 模式 |
+| T10 STATIC 主元传播 | A11=I2、A12=[1,1]^T、A21=[1,2^-35]、A22=[1]：FP32 GEMM → -2^-35 → 下一单主元 PANEL 成功；默认 INT32 GEMM → 0 → STATIC_PIVOT_FAILURE（未注入 FP64 pivot；整树失败率统计依赖 T11） |
+| T11 回归（2026-10-04） | Release 与 ASan+UBSan CTest 各 32/32；Python 120 passed；装配 81 checks、树集成 1062 checks |
+| T11 树形数值验收 | 24 个 artifact，两后端覆盖单节点/两层/三层/fork/forest/映射/尾块/迟到 child/固定随机种子；23 个通过独立 FP64 L/U/update/P 检查，最大归一化误差 2.636e-7，1 个 INT32 受控 STATIC 失败符合预期 |
+| T11 时钟与软件 CLI | sc_clock 两模式周期与最终 image 完全一致；软件 CLI 16 节点/155 命令，两后端全部数值状态 OK，checker 最大误差 5.273e-8 |
 
 说明：
 
 - `example/*fuv.mat` 不是方阵，不能作为矩阵输入（历史 RHS/向量文件）。
-- 当前数值验证仅覆盖 FP64 参考路径；**FP32 静态设备路径的稳定性尚未被完整验证**。
+- FP32/局部 INT32 静态设备分解已在 T11 输入上验收；完整求解稳定性与实际矩阵总体失败率尚未验证。
 - 本次不依据算法操作数或局部模块测试宣称任何硬件加速比。
 
 ## 4. 当前未完成内容
 
 以下内容不属于已完成范围，不能作为当前能力对外宣称：
 
-- [ ] SystemC Panel-LU（STATIC 固定主元 + 数值检查）、TRSM、GEMM、assemble、update 和 solve 正式执行 kernel（后续任务）。
+- [ ] 树形 solve 与完整 Ax=b 闭环（T12）；真实 assemble/整树分解已完成（T11）。
+- [ ] 实际矩阵总体 STATIC 主元失败率统计；T11 已具备真实树执行和受控失败传播证据。
 - [ ] DYNAMIC_PANEL 的设备执行（HPU/ATU 动态选择与映射），未实现前必须 `POLICY_NOT_SUPPORTED` 拒绝（后续）。
-- [ ] FP32 Command 全链路数值闭环（当前控制流正确性已闭环，数值由 test stub 透传/测试变换）。
-- [ ] 局部 INT32 / BFP GEMM（需重新评估对静态主元的影响）。
+- [ ] FP32 Command 整树分解—求解闭环（分解已真实执行并验收，solve 未实现）。
+- [x] 局部 INT32 GEMM（T10）；T11 已验证其经 DDR/extend-add 对 parent 静态主元的受控影响。
 - [ ] RTL Command Processor、GCU、DMA、HPU/PE 和完整 RTL 仿真闭环。
 - [ ] 性能、带宽和面积证据。
 
 ## 5. 下一阶段
+
+### T11：真实装配与 STATIC 树形分解 [x]
+
+- [x] 真实 `AssemblyExecutionUnit`，12 B staging、运行时映射、DDR update
+  加载、lease/统一预算、逐元素 FP32 累加与异常/abort/reset。
+- [x] `--factorization-only` / scope 双语言校验，真实两后端 CLI 和独立 FP64
+  checker；节点报告与最终 DDR 镜像，控制/数值状态/误差验收分别记录。
+- [x] 24 个 artifact（23 个通过，1 个预期失败）、迟到 child、映射尾块、
+  森林、重用、树中 abort/reset、最终因子破坏负面用例、sc_clock 逐拍一致性。
+- [x] 默认 2 组×2 个 PE（可配置），最多 2 front、5 slot，复用原有 PE 池。
+- [ ] 下一任务为 T12：真实前代/回代、solution 写回与原方程误差验收。
+
+设计与本轮复现证据：`docs/architecture/T11_真实装配与树形分解集成.md`。
+
+### T10：顶层 GEMM_Schur + PrecisionAdapter + 局部 INT32 [x]
+
+- [x] `GemmController`：K 步屏障（同一步内 tile 并行、本步全部真实写回并提交
+  后才生成下一步）、块起点 `A21(p,0)/A12(0,p)/A22(p,p)`、有效维度 tail
+  （`p=23,u=19` → 8 个任务）、A22 独立版本 key、队列背压增量生成、失败到
+  front 坐标映射；`p=n` 由编译器省略命令，运行期空更新维显式拒绝。
+- [x] 统一 `GemmReq/GemmRsp`（内部契约，不扩展外部 ABI）；`GemmExecutionUnit`
+  接入 T05：KERNEL 形状 `u/u/p`、tile=16、操作数驻留 front 校验、backend 与
+  SCALE_DESC 组合校验、外来 front 引用拒绝。
+- [x] `PrecisionAdapter` + 局部 INT32 GEMM：maxabs/二的幂 AUTO scale、RNE
+  ties-to-even、先检查后 cast、显式范围检查的 INT64 累加、正确舍入反量化、
+  饱和 FAIL/CLAMP_AND_REPORT、溢出 FAIL；数据模型固定为 INT32 storage /
+  30 effective bits / INT64 accumulator（`16·(2^29-1)^2 < 2^62`）。
+- [x] 运行时 SCALE_DESC：DescriptorReader 经 MemoryService 实际读取并解析，
+  畸形 → `BAD_DESCRIPTOR`、不支持 → `POLICY_NOT_SUPPORTED`；FP32 必须
+  `scale_desc_id=NONE`、INT32 必须引用有效 SCALE_DESC。
+- [x] 软件编译模式 `FP32_SYSTEMC` / `FP32_SYSTEMC_INT32_GEMM`（默认 FP32）
+  与 manifest/report 字段；Python/C++ 共享 SCALE_DESC fixture。
+- [x] 测试：`gemm_real_tests` 214 checks（含跨语言 8 checks）（FP32 手算/多 tile/多 K 步/偏移/
+  guard、INT32 内核、scale/舍入/饱和/溢出、失败/abort/reset/背压、分组、
+  artifact 集成、跨语言 INT32 设备目录、STATIC 主元传播）；
+  `trsm_real_tests` 160→162、`panel_lu_real_tests` 215 checks；CTest 21/21
+  （Release 与 ASan+UBSan）；Python 115 passed。
+- [ ] 总体 STATIC 主元失败率仍需后续实验（T11 已完成受控真实树传播）；INT32 RTL/FP8/全局 BFP、
+  跨 K 步流水、lookahead 仍不在 T10 范围。
+
+主要产物：
+
+- docs/architecture/T10_GEMM_Schur与局部INT32设计.md
+- graduation-code/systemc/include/panel_lu/gemm_types.hpp
+- graduation-code/systemc/include/panel_lu/precision_adapter.hpp
+- graduation-code/systemc/include/panel_lu/gemm_controller.hpp
+- graduation-code/systemc/src/panel_lu/gemm_controller.cpp
+- graduation-code/systemc/src/panel_lu/precision_adapter.cpp
+- graduation-code/systemc/src/dataplane/scale_desc.cpp
+- graduation-code/systemc/tests/gemm_real_tests.cpp
+- graduation-code/systemc/tools/t10_fixture_gen.py
+
+### T09：TRSM SystemC Engine（顶层左右 TRSM + 分组 + 带宽 + 完整因子）[x]
+
+- [x] T08 设计文档 `docs/architecture/TRSM架构设计.md`：命令独占 PE 组、
+  组内 tile 并行、2 组×2 PE 实验配置（组数/每组模块数可配置）、左右解
+  数学方向与对角语义、对角 solve 与非对角 GEMM 更新划分、块起点/stride/
+  tail/原地更新/版本 key、统一带宽仲裁、数值/失败/abort/reset、完整 L/U
+  保存、SolveController 复用接口，以及 3 个手算案例。
+- [x] 共享引擎扩展：`IComputeController` 统一 Panel/TRSM controller；
+  PE 组分配/占用/释放与 epoch/取消失效；dispatcher 只向本命令组内 PE 派发；
+  adapter 身份含 kind；`PanelEngineRequest/Response` 携带 compute kind、
+  kernel 形状、锁存的 front 尺度与 threshold product。
+- [x] `TrsmController`：步屏障 + solve 提交后增量更新、tail/块起点偏移、
+  A12/A21 版本 key、失败位置到 front 坐标映射；`TrsmExecutionUnit` 接入
+  T05（严格核对 M/N/K = p/u/p 或 u/p/p、tile=16、FP32 backend）。
+- [x] `OnChipArbiter`：读/写预算域单请求方轮转 grant，覆盖 Panel 扫描、
+  PE 装载/写回、FactorStore 读取与 DMA 片上读写；未获 grant 保留进度。
+- [x] 完整 L/U 保存：L11 单位对角/L21 真实值、U11 mask/U12 真实值，
+  有界 staging + 读预算 + request_id 精确路由，成功字节数 8·n·p。
+- [x] 测试 `trsm_real_tests` 160 checks：手算案例、n=42/p=23/u=19 对独立
+  FP64 oracle（含 FP64 诊断模式与舍入溢出检查）、A11/A22/guard 不变、
+  非零 front_offset（0/4/8）、KERNEL 操作数驻留 front 身份核对、
+  分组与复用、仲裁器单元/低带宽集成、对角失败与非法输入、TRSM 期间
+  abort/reuse；CTest 19/19（Release 与 ASan+UBSan）。
+- [x] 审查修复（第二轮）：DMA beat staging 单次读取（跨周期/DDR 背压不
+  重读、不重建 staging）；TRSM KERNEL 操作数驻留 front 校验；offset
+  只叠加一次；FP64 诊断舍入有限性检查。
+- [x] 审查修复（第三轮）：FP64 诊断舍入溢出的 `LU_DIAG` 失败列使用全局
+  主元坐标 `pivot_base + local`（错误位置与 `pivot_count` 报告修正，
+  n=p=18 第二对角块回归）。
+
+主要产物：
+
+- docs/architecture/TRSM架构设计.md
+- graduation-code/systemc/include/panel_lu/trsm_controller.hpp
+- graduation-code/systemc/src/panel_lu/trsm_controller.cpp
+- graduation-code/systemc/include/dataplane/on_chip_arbiter.hpp
+- graduation-code/systemc/src/dataplane/on_chip_arbiter.cpp
+- graduation-code/systemc/tests/trsm_real_tests.cpp
 
 ### T07：Panel-LU 数值引擎（STATIC FP32 + T05 接入）[x]
 
@@ -382,14 +495,14 @@
   `FactorStoreUnit`（STORE_FACTOR 真实 L 单位对角/U mask 分块转换）、
   `IExecutionUnit::abort_txn` 定向取消、`enable_real_panel` 能力显式声明、
   未绑定 kind 返回 `POLICY_NOT_SUPPORTED` 不落 stub；P-vector 仍走 PostExec。
-- [x] 测试：`panel_lu_real_tests` 206 checks（n=p ∈ {4,15,16,17,23}
+- [x] 测试：`panel_lu_real_tests` 215 checks（n=p ∈ {4,15,16,17,23}
   与 FP64 STATIC 参考对照、n>p 外围块字节不变、零/消元零/阈值/NaN 失败、
   双 front 排他与定向 abort、扫描期 abort、reset、共享读带宽与队列/写回
   背压）、`panel_lu_real_systemc_tests` 10 checks；CTest 18/18
   （Release 与 ASan+UBSan），既有 T04/T05/T06 回归无回退。
-- [ ] 顶层 TRSM_LEFT/TRSM_RIGHT/GEMM_SCHUR 数值执行（T09/T10，复用
-  `kernels` 与同一 dispatcher/PE 池；当前显式拒绝）。
-- [ ] 完整分解/求解闭环、L21/U12 持久化、DYNAMIC_PANEL、INT32、RTL。
+- [x] 顶层 TRSM_LEFT/TRSM_RIGHT（T09）与 GEMM_SCHUR（T10，含局部 INT32）
+  数值执行，复用 `kernels` 与同一 dispatcher/PE 池。
+- [ ] 完整分解/求解闭环、真实 assemble、树形 solve、DYNAMIC_PANEL、RTL。
 
 主要产物：
 
@@ -412,19 +525,23 @@
 
 ### 正式数值 kernel（T07/T09/T10 → T11/T12）[ ]
 
-- [ ] 实现 STATIC 固定顺序 Panel-LU 数值核（含消元后实际主元检查）并接入
-      `IExecutionUnit`（替换 test stub 的对应槽位）。
-- [ ] T07 提供 Panel 所需的最小 tile LU/TRSM/GEMM 原语；T09/T10 复用并接入顶层 TRSM/GEMM controller，共享同一批物理 PE；assemble/solve 后续接入。
-- [ ] 每接入一个 kernel 重新评估其对控制流统计、错误语义与（INT32 路径）
-      `STATIC` 主元触发率的影响。
-- [ ] FP32 全链路数值闭环与 FP64 residual/backward 对照（沿用验证口径）。
+- [x] STATIC 固定顺序 Panel-LU 数值核（含消元后实际主元检查）接入
+      `IExecutionUnit`（T07）；顶层 TRSM（T09）与 GEMM_Schur（T10，含局部
+      INT32）复用同一批物理 PE。
+- [x] T07 提供最小 tile LU/TRSM/GEMM 原语；T09/T10 已接入顶层 controller。
+- [x] T10 完成受控的 INT32 对 `STATIC` 主元影响传播验证（真实设备 update →
+      下一单主元 front；FP32 成功 / INT32 `STATIC_PIVOT_FAILURE`）。
+- [x] T11 真实 assemble/整树分解：验证控制/错误/生命周期统计，以及 INT32
+      经 child DDR update/parent extend-add 对实际 `STATIC` 主元的受控影响。
+- [ ] T12 树形 solve 接入后的 FP32 全链路与 FP64 residual/backward 对照。
 
 ### 后移的 T14、DYNAMIC_PANEL 扩展及 RTL 阶段 [ ]
 
 - [ ] T11/T12 先形成 STATIC FP32 分解—求解闭环，再展开 T14 HPU/ATU SystemC 行为与 RTL 契约统一。
 - [ ] T14 完成后接入动态数值路径，补充 T07/T09/T11/T12 的 DYNAMIC_PANEL 验收；独立 HPU/ATU 测试不代表设备动态路径已完成。
 - [ ] T13/T15 仍依赖 T14；任务编号已重排，原有交付要求不变，T14 保持未完成状态。
-- [ ] T10 可先接入 FP32，再完成局部 INT32；各任务的阶段验收与完整完成状态分开记录。完整依赖以 `docs/项目实现任务说明书.md` 为准。
+- [x] T10 已接入 FP32/局部 INT32，T11 已补齐真实树执行与受控失败传播。
+  总体 STATIC 主元失败率属于后续实验。完整依赖以 `docs/项目实现任务说明书.md` 为准。
 
 ### 后续 kernel/RTL 可直接使用的 T04/T05 接口
 

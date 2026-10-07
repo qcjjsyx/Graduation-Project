@@ -73,6 +73,8 @@ cp::ControlPlaneConfig base_config() {
     config.dma.beat_bytes = 16;
     config.dma.startup_cycles = 1;
     config.dma.beat_interval_cycles = 1;
+    config.panel.compute_group_count = 1;
+    config.panel.pes_per_group = 1;
     config.panel.pe_count = 1;
     return config;
 }

@@ -17,16 +17,26 @@ DeviceMemory、MemoryService、DescriptorReader、BufferManager、DMA Engine、T
 设计权威见 [DataPlane_设计](DataPlane_设计.md)，任务记录见
 [T04_SystemC_数据面设计](T04_SystemC_数据面设计.md)）；T05 双 front 控制面已实现
 （设计权威见 [ControlPlane_设计](ControlPlane_设计.md)，任务记录见
-[T05_SystemC_控制面设计](T05_SystemC_控制面设计.md)），当前仅显式 test stub
-验证控制流。T06 已交付共享多模式 PE 的硬件设计、内部 task 契约与可执行
-时序/资源原型（设计权威见
-[Panel-LU架构设计](../architecture/Panel-LU架构设计.md)，模块在
-`include/panel_lu/`、`src/panel_lu/`），原型使用显式合成负载、标记
-`architecture_prototype=true`、`numerical_validation=not_performed`，**未接入**
-本规范第 8 节的设备执行闭环。正式 Panel-LU/TRSM/GEMM/assemble/solve 数值
-kernel 尚未实现。下一步为 T07 Panel-LU 数值引擎并协调 T08；T14 HPU/ATU
-契约统一后移至 STATIC 数值闭环之后，不阻塞 STATIC 设计、实现与阶段验收。
-本文其余部分描述目标模型规范。
+[T05_SystemC_控制面设计](T05_SystemC_控制面设计.md)），保留显式 test stub
+控制流回归并已接入正式数值后端。T06 交付了共享多模式 PE 的硬件设计、内部 task 契约与可执行时序/资源原型
+（`include/panel_lu/`、`src/panel_lu/`）；T07 完成正式 FP32 STATIC Panel
+数值引擎并接入设备执行闭环；T09 把该引擎扩展为共享计算引擎（顶层左右
+TRSM、`compute_group_count × pes_per_group` 分组、设备级 `OnChipArbiter`
+统一片上带宽仲裁、完整 L/U 因子保存），设计权威见
+[Panel-LU架构设计](../architecture/Panel-LU架构设计.md)、
+[T07_Panel_LU数值引擎设计](T07_Panel_LU数值引擎设计.md) 与
+[TRSM架构设计](../architecture/TRSM架构设计.md)。T06 合成原型仍显式标记
+`architecture_prototype=true`、`numerical_validation=not_performed`。
+T10 完成顶层 GEMM_SCHUR 数值执行（FP32 与局部 INT32 行为模型）、统一
+`GemmReq/GemmRsp`、运行时 SCALE_DESC 读取与受控 STATIC 主元传播验证，
+设计权威见
+[../architecture/T10_GEMM_Schur与局部INT32设计.md](../architecture/T10_GEMM_Schur与局部INT32设计.md)。
+T11 已完成真实 FP32 assemble、STATIC 单节点/树/forest 分解与两种后端的
+独立 FP64 L/U/update/P 验收，见
+[T11 集成设计](../architecture/T11_真实装配与树形分解集成.md)。树形 solve 与
+DYNAMIC_PANEL 尚未实现，真实后端显式 `POLICY_NOT_SUPPORTED`/依赖失败。
+下一步为 T12 完整 Ax=b；T14 HPU/ATU 契约统一后移至 STATIC 数值闭环之后，不阻塞
+STATIC 阶段验收。本文其余部分描述目标模型规范。
 
 ## 2. 三种后端
 
@@ -149,6 +159,14 @@ ERROR
 
 ## 5. INT32 GEMM 行为模型
 
+T10 状态：`PrecisionAdapter` 与 `Int32GemmBehavioral` 语义已实现，只作用于
+顶层 `GEMM_SCHUR`（`FP32_SYSTEMC_INT32_GEMM` 编译模式），经真实
+`DescriptorReader`/`MemoryService` 读取 `SCALE_DESC`，与 FP32 后端共享同一
+PE/dispatcher/时序/写回路径。数据模型表述为 **INT32 storage / 30 effective
+quantization bits / INT64 accumulator**；默认对称范围 `[-(2^29-1),+(2^29-1)]`
+且 `16·(2^29-1)^2 < 2^62`。设计见
+[../architecture/T10_GEMM_Schur与局部INT32设计.md](../architecture/T10_GEMM_Schur与局部INT32设计.md)。
+
 `Int32GemmBehavioral` 必须具有与未来 RTL 相同的请求和响应语义：
 
 ```text
@@ -209,7 +227,7 @@ C  = qC × 2^(eA+eB)
   （`PIVOT_NOT_FOUND`）。
 - 当前状态：DYNAMIC_PANEL 仅契约表达 + 参考行为，设备执行未实现；T04 数据面
   对 STATIC/DYNAMIC_PANEL 均可加载、解析和搬运数据；T05 控制面已实现并对
-  DYNAMIC_PANEL 返回 `POLICY_NOT_SUPPORTED`，正式数值 kernel 尚未实现。
+  DYNAMIC_PANEL 返回 `POLICY_NOT_SUPPORTED`，STATIC 正式分解路径已实现。
   后移的 T14 及动态数值路径完成前，STATIC 阶段验收不包含动态数值能力。
 
 ## 8. 设备执行闭环

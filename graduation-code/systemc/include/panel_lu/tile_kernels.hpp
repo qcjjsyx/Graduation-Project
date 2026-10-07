@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <string>
 
+#include "panel_lu/gemm_types.hpp"
 #include "panel_lu/task_types.hpp"
 
 namespace hw::panel_lu::kernels {
@@ -28,6 +29,20 @@ struct KernelOutcome {
     // precompute phase (bad diagonal) rather than during the solve phase.
     bool diagonal_failure{false};
     std::string reason;
+    // T10 INT32 GEMM bookkeeping (zero for every FP32 execution path). The
+    // per-phase cycles describe the model progress of this tile task.
+    GemmPhase gemm_failed_phase{GemmPhase::None};
+    std::uint32_t gemm_failed_local_row{0};
+    std::uint32_t gemm_failed_local_col{0};
+    std::int32_t gemm_exponent_a{0};
+    std::int32_t gemm_exponent_b{0};
+    std::uint64_t saturation_count{0};
+    std::uint64_t overflow_count{0};
+    std::uint64_t local_conversion_bytes{0};
+    std::uint64_t scale_reduction_cycles{0};
+    std::uint64_t quantize_cycles{0};
+    std::uint64_t integer_compute_cycles{0};
+    std::uint64_t dequantize_cycles{0};
 };
 
 // Static packed LU of one diagonal tile (row stride = stride_floats).
@@ -53,13 +68,19 @@ KernelOutcome run_trsm_left(
 
 // X = A * U^-1 with upper triangular U (k x k, non-unit diagonal) packed in
 // `u`, and `rhs` (m x k) modified in place.
+// `threshold_product` is the front's latched
+// threshold_ratio * front_pre_elimination_max_abs (0 = no threshold check).
+// The non-unit U diagonal is checked against it: zero -> STATIC_PIVOT_FAILURE,
+// non-finite (input or reciprocal overflow) -> NON_FINITE_VALUE, and
+// |diag| <= threshold_product -> PIVOT_UNSTABLE, each at its own column.
 KernelOutcome run_trsm_right(
     float* rhs,
     std::uint32_t rhs_stride,
     std::uint32_t m,
     std::uint32_t k,
     const float* u,
-    std::uint32_t u_stride);
+    std::uint32_t u_stride,
+    double threshold_product = 0.0);
 
 // dst (m x n) -= lhs (m x k) * rhs (k x n) using fused multiply-add.
 KernelOutcome run_gemm_update(
@@ -100,7 +121,8 @@ KernelOutcome run_trsm_right(
     std::uint32_t m,
     std::uint32_t k,
     const double* u,
-    std::uint32_t u_stride);
+    std::uint32_t u_stride,
+    double threshold_product = 0.0);
 
 KernelOutcome run_gemm_update(
     double* dst,

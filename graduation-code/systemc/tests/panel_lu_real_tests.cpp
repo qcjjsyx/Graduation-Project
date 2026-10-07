@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -94,6 +95,8 @@ cp::ControlPlaneConfig base_config(std::uint32_t pe_count = 1) {
     config.dma.beat_bytes = 16;
     config.dma.startup_cycles = 1;
     config.dma.beat_interval_cycles = 1;
+    config.panel.compute_group_count = pe_count;
+    config.panel.pes_per_group = 1;
     config.panel.pe_count = pe_count;
     config.panel.task_slots_per_pe = 4;
     config.panel.dispatcher_queue_depth = 32;
@@ -449,16 +452,26 @@ void test_n_gt_p_outer_blocks_unchanged() {
         "n>p: PANEL_LU succeeds on A11");
     expect(
         run.status.at(command_index(artifact, cmd::Opcode::TrsmLeft)) ==
-            cmd::StatusCode::PolicyNotSupported,
-        "n>p: top-level TRSM_LEFT is explicitly refused (not stubbed)");
+            cmd::StatusCode::Ok,
+        "n>p: top-level TRSM_LEFT now executes on the shared engine (T09)");
+    expect(
+        run.status.at(command_index(artifact, cmd::Opcode::TrsmRight)) ==
+            cmd::StatusCode::Ok,
+        "n>p: top-level TRSM_RIGHT now executes on the shared engine (T09)");
     expect(
         run.status.at(command_index(artifact, cmd::Opcode::GemmSchur)) ==
-            cmd::StatusCode::DependencyFailed,
-        "n>p: GEMM depends on the refused TRSM and fails as dependency");
+            cmd::StatusCode::Ok,
+        "n>p: top-level GEMM_SCHUR now executes on the shared engine (T10)");
+    expect(
+        run.status.at(command_index(artifact, cmd::Opcode::StoreFactor)) ==
+            cmd::StatusCode::Ok,
+        "n>p: STORE_FACTOR saves the full L/U after TRSM (T09)");
+    // SOLVE is not implemented: it must not report success (no full-solve
+    // claim) even though the decomposition chain now reaches node commit.
     expect(
         run.status.at(command_index(artifact, cmd::Opcode::SolveForward)) !=
             cmd::StatusCode::Ok,
-        "n>p: SOLVE cannot succeed, no full factorization claim");
+        "n>p: SOLVE cannot succeed, no full-solve claim");
 
     expect(run.snapshot_taken, "n>p: front snapshot taken while resident");
     const std::vector<float> packed = packed_from_snapshot(run.front_snapshot, n);
@@ -973,10 +986,10 @@ void test_abort_waits_for_engine_drain() {
     expect(
         !device.panel_engine()->unit_busy(0),
         "abort drain: engine context drained before batch completion");
-    for (std::size_t index = 0; index < config.panel.pe_count; ++index) {
+    for (std::size_t index = 0; index < config.panel.compute_group_count; ++index) {
         expect(
-            !device.panel_engine()->unit_busy(static_cast<std::uint32_t>(index)),
-            "abort drain: every panel adapter is idle at completion");
+            !device.panel_engine()->group_busy(static_cast<std::uint32_t>(index)),
+            "abort drain: every PE group is released at completion");
     }
 }
 
@@ -1076,6 +1089,83 @@ void test_fp64_diagnostic_mode() {
     }
 }
 
+
+// Rounding-overflow failure positions for LU_DIAG use the global pivot
+// coordinate (pivot_base + local column). The second diagonal tile of an
+// n=p=18 front overflows while rounding the binary64 result back to FP32;
+// the report must carry column 16 and pivot_count 16, not column/pivot 0.
+void test_fp64_diagnostic_rounding_failed_column() {
+    const std::uint32_t n = 18;
+    const float max_float = std::numeric_limits<float>::max();
+    std::vector<float> front(n * n, 0.0f);
+    for (std::uint32_t i = 0; i < 16; ++i) {
+        front[i * n + i] = 1.0f;
+    }
+    front[16 * n + 16] = 0.5f;
+    front[16 * n + 17] = max_float;
+    front[17 * n + 16] = max_float;
+    front[17 * n + 17] = max_float;
+
+    testing::TestNode node;
+    node.node_id = 0;
+    node.parent_id = -1;
+    node.total_dim = n;
+    node.pivot_dim = n;
+    node.front_values = front;
+    testing::TestArtifactOptions options;
+    options.policy = cmd::PivotPolicy::Static;
+    options.tile_size = 16;
+    options.matrix_dim = n;
+    options.threshold_bits = f32_bits(0.0f);
+    testing::TestArtifact artifact =
+        testing::build_test_artifact({node}, options);
+
+    cp::ControlPlaneConfig config = base_config(1);
+    config.panel.numeric_mode = hw::panel_lu::PanelNumericMode::Fp64Diagnostic;
+    cp::CommandDevice device(artifact.artifact, config);
+    std::string error;
+    expect(device.start(&error), "fp64 rounding column: device starts");
+    while (!device.finished() && device.cycle() < 4000000) {
+        device.tick();
+    }
+    const std::uint32_t panel_command =
+        command_index(artifact, cmd::Opcode::PanelLu);
+    expect(
+        device.completion_status().at(panel_command) ==
+            cmd::StatusCode::NonFiniteValue,
+        "fp64 rounding column: overflow -> NON_FINITE_VALUE");
+    std::uint32_t failed_tasks = 0;
+    std::uint32_t failed_column = cmd::NONE;
+    for (const auto& record : device.panel_engine()->task_records()) {
+        // The failing task itself is also flagged cancelled for accounting;
+        // it is identified by the non-Ok status.
+        if (record.task.command_id != panel_command ||
+            record.task.mode != hw::panel_lu::TileMode::LuDiag ||
+            record.status == cmd::StatusCode::Ok) {
+            continue;
+        }
+        ++failed_tasks;
+        failed_column = record.failed_column;
+        expect(
+            record.task.pivot_base == 16,
+            "fp64 rounding column: failing tile is the second diagonal tile");
+    }
+    expect(failed_tasks == 1, "fp64 rounding column: exactly one failed LU_DIAG");
+    expect(
+        failed_column == 16,
+        "fp64 rounding column: failure reported at global column 16");
+    bool pivot_checked = false;
+    for (const auto& stats : device.command_stats()) {
+        if (stats.command_id != panel_command) {
+            continue;
+        }
+        pivot_checked = true;
+        expect(
+            stats.pivot_count == 16,
+            "fp64 rounding column: pivot_count equals the completed pivots");
+    }
+    expect(pivot_checked, "fp64 rounding column: command stats present");
+}
 
 // Factor reuse after an abort between the L and U submit of the same row: the
 // transaction-local partial-row flags must not leak into the next command.
@@ -1307,6 +1397,8 @@ int main(int argc, char** argv) {
          test_operand_load_is_budget_constrained},
         {"test_abort_waits_for_engine_drain", test_abort_waits_for_engine_drain},
         {"test_fp64_diagnostic_mode", test_fp64_diagnostic_mode},
+        {"test_fp64_diagnostic_rounding_failed_column",
+         test_fp64_diagnostic_rounding_failed_column},
         {"test_factor_abort_reuse_clears_partial_row",
          test_factor_abort_reuse_clears_partial_row},
     };

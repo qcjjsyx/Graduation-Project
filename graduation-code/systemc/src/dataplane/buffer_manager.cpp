@@ -527,6 +527,7 @@ hw::command::StatusCode BufferManager::lease_write(
         data.begin(), data.end(),
         slot.storage.begin() + static_cast<std::ptrdiff_t>(offset));
     lease->access_bytes += data.size();
+    total_access_bytes_ += data.size();
     return hw::command::StatusCode::Ok;
 }
 
@@ -564,6 +565,7 @@ hw::command::StatusCode BufferManager::lease_read(
         slot.storage.begin() + static_cast<std::ptrdiff_t>(offset),
         slot.storage.begin() + static_cast<std::ptrdiff_t>(offset + length));
     lease->access_bytes += length;
+    total_access_bytes_ += length;
     return hw::command::StatusCode::Ok;
 }
 
@@ -718,6 +720,7 @@ hw::command::StatusCode BufferManager::finish_writeback(
 }
 
 void BufferManager::reset() {
+    total_access_bytes_ = 0;
     for (std::uint32_t index = 0; index < slots_.size(); ++index) {
         Slot& slot = slots_[index];
         const BufferState previous = slot.state;

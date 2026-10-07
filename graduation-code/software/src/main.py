@@ -7,9 +7,14 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.command_codec import (
+    ScaleDesc,
+    ScaleSaturationPolicy,
+)
 from src.config import (
     CommandCompilerConfig,
     EquilibrationConfig,
+    GemmConfig,
     MatchingConfig,
     MatrixInputConfig,
     OrderingConfig,
@@ -55,6 +60,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ordering", choices=["amd", "rcm", "identity"], default="amd"
     )
+    parser.add_argument(
+        "--gemm-backend",
+        choices=["FP32_SYSTEMC", "FP32_SYSTEMC_INT32_GEMM"],
+        default="FP32_SYSTEMC",
+        help="top-level GEMM_SCHUR backend; INT32 switches only that kernel "
+        "and emits a SCALE_DESC per node (device front/DDR stays FP32)",
+    )
+    parser.add_argument("--factorization-only", action="store_true",
+                        help="emit T11 factorization commands without T12 tree solve")
+    parser.add_argument(
+        "--gemm-effective-bits",
+        type=int,
+        default=30,
+        help="INT32 effective quantization bits (supported range [1, 30])",
+    )
+    parser.add_argument(
+        "--gemm-saturation",
+        choices=["FAIL", "CLAMP_AND_REPORT"],
+        default="FAIL",
+        help="SCALE_DESC saturation policy (default FAIL)",
+    )
     return parser.parse_args()
 
 
@@ -85,6 +111,16 @@ def main() -> None:
                 tile_size=args.tile_size,
                 max_front_size=args.max_front_size,
                 max_wait_tokens=args.max_wait_tokens,
+                emit_solve_commands=not args.factorization_only,
+            ),
+            gemm=GemmConfig(
+                backend=args.gemm_backend,
+                effective_bits=args.gemm_effective_bits,
+                scale_desc=ScaleDesc(
+                    saturation=ScaleSaturationPolicy[
+                        args.gemm_saturation
+                    ],
+                ),
             ),
             solve=SolveInputConfig(rhs_path=args.rhs, seed=args.rhs_seed),
             reference_check=args.reference_check,
@@ -106,6 +142,11 @@ def main() -> None:
         f"nodes: {outputs.node_count}, commands: {outputs.command_count}, "
         f"descriptors: {outputs.descriptor_count}, "
         f"max_front: {outputs.max_front_size}"
+    )
+    print(
+        f"gemm_backend: {'SYSTEMC_INT32_GEMM_MODEL' if args.gemm_backend != 'FP32_SYSTEMC' else 'SYSTEMC_FP32_DEVICE_MODEL'}"
+        f" (effective_bits={args.gemm_effective_bits}, "
+        f"saturation={args.gemm_saturation})"
     )
     print(f"out_dir: {outputs.out_dir}")
 

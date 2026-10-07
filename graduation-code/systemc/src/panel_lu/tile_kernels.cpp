@@ -97,7 +97,8 @@ KernelOutcome run_trsm_right(
     std::uint32_t m,
     std::uint32_t k,
     const float* u,
-    std::uint32_t u_stride) {
+    std::uint32_t u_stride,
+    double threshold_product) {
     KernelOutcome outcome;
     // Phase 1: reciprocal precompute through the corner divide/reciprocal path
     // (pipelined, one issue per cycle). All U[j][j] are available before the
@@ -119,6 +120,14 @@ KernelOutcome run_trsm_right(
             outcome.status = StatusCode::NonFiniteValue;
             outcome.failed_column = j;
             outcome.reason = "non-finite diagonal in TRSM_RIGHT reciprocal precompute";
+            outcome.diagonal_failure = true;
+            return outcome;
+        }
+        if (std::fabs(static_cast<double>(diagonal)) <= threshold_product) {
+            outcome.status = StatusCode::PivotUnstable;
+            outcome.failed_column = j;
+            outcome.reason =
+                "U diagonal at or below threshold * front_pre_elimination_max_abs";
             outcome.diagonal_failure = true;
             return outcome;
         }
@@ -289,7 +298,8 @@ KernelOutcome run_trsm_right(
     std::uint32_t m,
     std::uint32_t k,
     const double* u,
-    std::uint32_t u_stride) {
+    std::uint32_t u_stride,
+    double threshold_product) {
     KernelOutcome outcome;
     std::vector<double> reciprocal(k, 0.0);
     for (std::uint32_t j = 0; j < k; ++j) {
@@ -307,6 +317,14 @@ KernelOutcome run_trsm_right(
             outcome.failed_column = j;
             outcome.reason =
                 "non-finite diagonal in TRSM_RIGHT precompute (fp64 diagnostic)";
+            outcome.diagonal_failure = true;
+            return outcome;
+        }
+        if (std::fabs(diagonal) <= threshold_product) {
+            outcome.status = StatusCode::PivotUnstable;
+            outcome.failed_column = j;
+            outcome.reason =
+                "U diagonal at or below threshold (fp64 diagnostic)";
             outcome.diagonal_failure = true;
             return outcome;
         }

@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "dataplane/on_chip_arbiter.hpp"
 #include "panel_lu/task_types.hpp"
 #include "panel_lu/tile_store.hpp"
 
@@ -71,8 +72,7 @@ public:
     // reservation are owned by the prototype.
     void tick(
         std::uint64_t cycle,
-        PortBudget& load_budget,
-        PortBudget& store_write_budget,
+        hw::dataplane::OnChipArbiter& arbiter,
         WritebackReservation& writeback_reservation,
         TileAccess& access);
 
@@ -139,6 +139,20 @@ private:
         std::uint64_t bytes_read{0};
         std::uint64_t bytes_written{0};
         std::uint64_t response_ready_cycle{0};
+        // T10 INT32 GEMM bookkeeping carried into the task response.
+        GemmBackend gemm_backend{GemmBackend::Fp32Device};
+        GemmPhase gemm_failed_phase{GemmPhase::None};
+        std::uint32_t gemm_failed_local_row{0};
+        std::uint32_t gemm_failed_local_col{0};
+        std::int32_t gemm_exponent_a{0};
+        std::int32_t gemm_exponent_b{0};
+        std::uint64_t saturation_count{0};
+        std::uint64_t overflow_count{0};
+        std::uint64_t local_conversion_bytes{0};
+        std::uint64_t scale_reduction_cycles{0};
+        std::uint64_t quantize_cycles{0};
+        std::uint64_t integer_compute_cycles{0};
+        std::uint64_t dequantize_cycles{0};
     };
 
     Slot* find_slot(std::uint64_t task_id);

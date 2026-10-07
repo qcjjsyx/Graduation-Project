@@ -14,6 +14,7 @@ from src.command_codec import (
     NONE,
     PVECTOR_ELEMENT_BYTES,
     PVECTOR_INIT_VALUE,
+    SCALE_AUTO,
     Command,
     Completion,
     DataFormat,
@@ -31,7 +32,7 @@ from src.command_codec import (
     encode_pivot_threshold,
     validate_command_batch,
 )
-from src.config import CommandCompilerConfig, PivotPolicyConfig
+from src.config import CommandCompilerConfig, GemmConfig, PivotPolicyConfig
 from src.dataStruct import MapTableEntry, MemoryRegion, NodeCompileRecord
 from src.memory.planner import plan_regions
 from src.scheduler.task_queue import sibling_friendly_order
@@ -104,6 +105,7 @@ def compile_command_artifact(
     rhs: np.ndarray,
     config: CommandCompilerConfig,
     pivot: PivotPolicyConfig,
+    gemm: GemmConfig = GemmConfig(),
 ) -> CompiledCommandArtifact:
     """Compile symbolic/front IR into a self-contained Command schema v2 image."""
 
@@ -114,10 +116,10 @@ def compile_command_artifact(
         ordered_nodes, local_fronts, permutation, rhs, matrix_dim
     )
     descriptor_specs = _build_static_descriptors(
-        ordered_nodes, map_tables, config.tile_size, pivot
+        ordered_nodes, map_tables, config.tile_size, pivot, gemm
     )
     command_specs, node_command_ids, node_tokens = _build_commands(
-        ordered_nodes, map_tables, parent
+        ordered_nodes, map_tables, parent, config.emit_solve_commands
     )
 
     wait_descriptor_names: dict[tuple[int, ...], str] = {}
@@ -222,6 +224,7 @@ def compile_command_artifact(
     manifest = _build_manifest(
         config=config,
         pivot=pivot,
+        gemm=gemm,
         total_bytes=total_bytes,
         regions=regions,
         descriptor_ids=descriptor_ids,
@@ -438,6 +441,7 @@ def _build_static_descriptors(
     map_tables: Sequence[Sequence[MapTableEntry]],
     tile_size: int,
     pivot: PivotPolicyConfig,
+    gemm: GemmConfig = GemmConfig(),
 ) -> list[_DescriptorSpec]:
     descriptors: list[_DescriptorSpec] = []
     policy_word = int(PivotPolicy[pivot.policy])
@@ -516,6 +520,7 @@ def _build_static_descriptors(
             "gemm": (node.update_dim, node.update_dim, node.pivot_dim),
         }
         for kernel_name, (m, n, k) in kernel_shapes.items():
+            int32_gemm = gemm.int32_gemm_enabled and kernel_name == "gemm"
             descriptors.append(
                 _DescriptorSpec(
                     f"{prefix}.kernel.{kernel_name}",
@@ -527,13 +532,35 @@ def _build_static_descriptors(
                         "m": m,
                         "n": n,
                         "k": k,
-                        "backend": KernelBackend.SYSTEMC_FP32_DEVICE_MODEL,
+                        "backend": (
+                            KernelBackend.SYSTEMC_INT32_GEMM_MODEL
+                            if int32_gemm
+                            else KernelBackend.SYSTEMC_FP32_DEVICE_MODEL
+                        ),
                         "format": DataFormat.FP32,
-                        "scale": None,
+                        "scale": (
+                            f"{prefix}.kernel.gemm.scale" if int32_gemm else None
+                        ),
                         "tile_size": tile_size,
                     },
                 )
             )
+            if int32_gemm:
+                # One SCALE_DESC per node GEMM kernel. It never propagates to
+                # the front/DDR data format or to any other kernel.
+                descriptors.append(
+                    _DescriptorSpec(
+                        f"{prefix}.kernel.gemm.scale",
+                        DescriptorType.SCALE_DESC,
+                        {
+                            "exponent_a": gemm.scale_desc.exponent_a,
+                            "exponent_b": gemm.scale_desc.exponent_b,
+                            "rounding": int(gemm.scale_desc.rounding),
+                            "saturation": int(gemm.scale_desc.saturation),
+                            "overflow": int(gemm.scale_desc.overflow),
+                        },
+                    )
+                )
         for direction, label in (
             (SolveDirection.FORWARD, "solve_forward"),
             (SolveDirection.BACKWARD, "solve_backward"),
@@ -713,6 +740,7 @@ def _build_commands(
     nodes: Sequence[NodeCompileRecord],
     map_tables: Sequence[Sequence[MapTableEntry]],
     parent: Sequence[int],
+    emit_solve_commands: bool = True,
 ) -> tuple[list[_CommandSpec], dict[int, list[int]], dict[int, dict[str, int]]]:
     """Emit the command stream.
 
@@ -794,6 +822,9 @@ def _build_commands(
         if template.token_name is not None:
             emitted_refs.add((chosen, template.token_name))
         cursors[chosen] += 1
+
+    if not emit_solve_commands:
+        return commands, node_command_ids, node_tokens
 
     previous: int | None = None
     for node in nodes:
@@ -914,6 +945,22 @@ def _resolve_descriptor(
             0,
             0,
         )
+    elif spec.descriptor_type == DescriptorType.SCALE_DESC:
+        def exponent_word(value: int | None) -> int:
+            return SCALE_AUTO if value is None else value & 0xFFFFFFFF
+
+        body = (
+            exponent_word(fields["exponent_a"]),
+            exponent_word(fields["exponent_b"]),
+            SCALE_AUTO,
+            fields["rounding"],
+            fields["saturation"],
+            fields["overflow"],
+            0,
+            0,
+            0,
+            0,
+        )
     elif spec.descriptor_type == DescriptorType.DEPENDENCY_DESC:
         body = (len(fields["tokens"]),) + (0,) * 9
     else:
@@ -930,6 +977,7 @@ def _build_manifest(
     *,
     config: CommandCompilerConfig,
     pivot: PivotPolicyConfig,
+    gemm: GemmConfig,
     total_bytes: int,
     regions: dict[str, MemoryRegion],
     descriptor_ids: dict[str, int],
@@ -954,10 +1002,49 @@ def _build_manifest(
             "pivot_policy_field": "FRONT_DESC.body_words[8..9]",
         },
         "compiler": {
+            "operation_scope": "factorization_and_solve" if config.emit_solve_commands else "factorization_only",
             "device_format": "FP32",
-            "kernel_backend": "SYSTEMC_FP32_DEVICE_MODEL",
+            "kernel_backend": (
+                "SYSTEMC_INT32_GEMM_MODEL"
+                if gemm.int32_gemm_enabled
+                else "SYSTEMC_FP32_DEVICE_MODEL"
+            ),
             "global_bfp": False,
             **asdict(config),
+        },
+        "gemm": {
+            "backend": gemm.backend,
+            "device_front_format": "FP32",
+            "storage_format": (
+                "INT32" if gemm.int32_gemm_enabled else "FP32"
+            ),
+            "effective_bits": gemm.effective_bits,
+            "accumulator_bits": gemm.accumulator_bits,
+            "k_block_max": gemm.k_block_max,
+            "scale_policy": (
+                "power_of_two_maxabs_auto"
+                if gemm.scale_desc.exponent_a is None
+                and gemm.scale_desc.exponent_b is None
+                else "power_of_two_fixed_or_auto_per_operand"
+            ),
+            "scale_scope": "one_GEMM_SCHUR_call_per_tile",
+            "output_scale": "AUTO (derived from the actual eA+eB)",
+            "rounding_mode": "nearest_ties_even",
+            "saturation_policy": (
+                "CLAMP_AND_REPORT"
+                if int(gemm.scale_desc.saturation) == 2
+                else "FAIL"
+            ),
+            "overflow_policy": "FAIL",
+            "conversion_rate_per_cycle": gemm.conversion_rate,
+            "exponent_range": [-256, 256],
+            "propagates_to_front_or_tree": False,
+            "notes": (
+                "INT32 storage / 30 effective quantization bits / INT64 "
+                "accumulator is the supported range; the default 16-term dot "
+                "product is < 2^62. Panel/TRSM and panel-internal updates "
+                "remain FP32."
+            ),
         },
         "pivot": {
             "policy": pivot.policy,
@@ -1003,7 +1090,7 @@ def _build_manifest(
                 "trsm",
                 "gemm_schur",
                 "assemble_extend_add",
-                "tree_solve",
+                *(["tree_solve"] if config.emit_solve_commands else []),
             ],
             "STATIC": {
                 "panel_lu_fixed_order": True,

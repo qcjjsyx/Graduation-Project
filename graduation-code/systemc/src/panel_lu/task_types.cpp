@@ -2,7 +2,23 @@
 
 #include <algorithm>
 
+#include "panel_lu/precision_adapter.hpp"
+
 namespace hw::panel_lu {
+
+const char* compute_kind_name(ComputeKind kind) {
+    switch (kind) {
+        case ComputeKind::PanelLu:
+            return "PANEL_LU";
+        case ComputeKind::TrsmLeft:
+            return "TRSM_LEFT";
+        case ComputeKind::TrsmRight:
+            return "TRSM_RIGHT";
+        case ComputeKind::GemmSchur:
+            return "GEMM_SCHUR";
+    }
+    return "UNKNOWN";
+}
 
 const char* panel_numeric_mode_name(PanelNumericMode mode) {
     switch (mode) {
@@ -24,6 +40,8 @@ const char* tile_mode_name(TileMode mode) {
             return "TRSM_RIGHT";
         case TileMode::GemmUpdate:
             return "GEMM_UPDATE";
+        case TileMode::GemmSchur:
+            return "GEMM_SCHUR";
     }
     return "UNKNOWN";
 }
@@ -105,8 +123,20 @@ ConfigCheck validate_panel_config(const PanelLuConfig& config) {
     if (config.timing.array_dim != 16 || config.timing.mac_lanes != 256) {
         return fail(StatusCode::BadDescriptor, "PE array must be a 16x16 FMAC array");
     }
-    if (config.pe_count == 0) {
-        return fail(StatusCode::BadDescriptor, "pe_count must be >= 1");
+    if (config.compute_group_count == 0 || config.pes_per_group == 0) {
+        return fail(
+            StatusCode::BadDescriptor,
+            "compute_group_count and pes_per_group must be >= 1");
+    }
+    if (config.total_pe_count() > 64) {
+        return fail(StatusCode::BadDescriptor, "total PE count must be <= 64");
+    }
+    if (config.pe_count != 0 && config.pe_count != config.total_pe_count()) {
+        return fail(
+            StatusCode::BadDescriptor,
+            "conflicting PE counts: pe_count=" + std::to_string(config.pe_count) +
+                " but compute_group_count*pes_per_group=" +
+                std::to_string(config.total_pe_count()));
     }
     if (config.task_slots_per_pe == 0) {
         return fail(StatusCode::BadDescriptor, "task_slots_per_pe must be >= 1");
@@ -122,8 +152,7 @@ ConfigCheck validate_panel_config(const PanelLuConfig& config) {
     if (config.max_front_dim == 0 || config.max_front_dim > 512) {
         return fail(StatusCode::BadDescriptor, "max_front_dim must be in [1, 512]");
     }
-    if (config.load_bytes_per_cycle < 4 || config.writeback_bytes_per_cycle < 4 ||
-        config.scan_bytes_per_cycle < 4) {
+    if (config.load_bytes_per_cycle < 4 || config.writeback_bytes_per_cycle < 4) {
         return fail(
             StatusCode::BadDescriptor,
             "port budgets must move at least one FP32 element per cycle");
@@ -143,6 +172,12 @@ ConfigCheck validate_panel_config(const PanelLuConfig& config) {
         config.timing.drain_row_cycles == 0 || config.timing.lu_update_cycles == 0 ||
         config.timing.lu_pivot_check_cycles == 0) {
         return fail(StatusCode::BadDescriptor, "timing parameters must be >= 1");
+    }
+    // T10 local INT32 GEMM parameters: unsafe/unsupported values are rejected
+    // here instead of being silently ignored at execution time.
+    const ConfigCheck precision_check = validate_precision_config(config.precision);
+    if (!precision_check.ok) {
+        return precision_check;
     }
     return pass();
 }
@@ -186,6 +221,22 @@ ConfigCheck validate_tile_task(const TileTask& task, const PanelLuConfig& config
             }
             break;
         case TileMode::GemmUpdate:
+            break;
+        case TileMode::GemmSchur:
+            // Same GEMM shape rules as the panel-internal update. The INT32
+            // backend adds the K-block and scale-policy checks below.
+            if (task.gemm_backend == GemmBackend::Int32Gemm) {
+                if (task.dims.k > config.precision.k_block_max) {
+                    return fail(
+                        StatusCode::BadDescriptor,
+                        "GEMM_SCHUR INT32 K exceeds the configured K block");
+                }
+                if (!task.gemm_scale.auto_output_scale) {
+                    return fail(
+                        StatusCode::PolicyNotSupported,
+                        "fixed output scale is not supported by this version");
+                }
+            }
             break;
     }
     if (!check_operand(task.dst, task.dims.n * 4, &reason)) {
@@ -252,6 +303,7 @@ std::uint64_t task_load_bytes(const TileTask& task) {
         case TileMode::TrsmRight:
             return (m * k + k * k) * 4;  // A21 tile + diagonal U tile
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             // L21 + U12 + accumulator read of the target tile.
             return (m * k + k * n + m * n) * 4;
     }
@@ -272,6 +324,7 @@ std::uint64_t task_operand_fifo_bytes(const TileTask& task) {
         case TileMode::TrsmRight:
             return (m * k + k * k) * 4;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             return (m * k + k * n) * 4;  // A + B; D lives in the accumulator
     }
     return 0;
@@ -289,6 +342,7 @@ std::uint64_t task_writeback_bytes(const TileTask& task) {
         case TileMode::TrsmRight:
             return m * k * 4;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
             return m * n * 4;
     }
     return 0;
@@ -316,6 +370,11 @@ std::uint64_t task_exec_cycles(const TileTask& task, const PeTimingConfig& timin
             return timing.tsolve_fill_cycles +
                    (timing.div_latency_cycles + (k - 1)) + k + m;
         case TileMode::GemmUpdate:
+        case TileMode::GemmSchur:
+            // FP32 shape of the GEMM dataflow. The INT32 backend adds explicit
+            // conversion phases (see precision_adapter::
+            // int32_gemm_exec_cycles), selected by the PE when the task
+            // declares GemmBackend::Int32Gemm.
             return timing.fill_cycles + k * timing.gemm_k_ii +
                    m * timing.drain_row_cycles;
     }
@@ -332,6 +391,86 @@ std::uint64_t lu_diag_failure_cycles(
     // failure costs lu_pivot_check_cycles.
     return f * (timing.div_latency_cycles + timing.lu_update_cycles) +
            timing.lu_pivot_check_cycles;
+}
+
+GemmReq make_gemm_req(
+    const TileTask& task,
+    std::uint32_t descriptor_id,
+    std::uint32_t front_dim,
+    std::uint32_t pivot_dim) {
+    GemmReq request;
+    request.txn_id = 0;
+    request.task_id = task.task_id;
+    request.epoch = task.epoch;
+    request.command_id = task.command_id;
+    request.node_id = task.node_id;
+    request.descriptor_id = descriptor_id;
+    request.step = task.step;
+    request.tile_row = task.tile_row;
+    request.tile_col = task.tile_col;
+    request.m = task.dims.m;
+    request.n = task.dims.n;
+    request.k = task.dims.k;
+    const auto convert = [](const TileOperand& operand) {
+        GemmOperand out;
+        out.buffer_id = operand.handle.slot;
+        out.offset = operand.offset;
+        out.stride_bytes = operand.stride_bytes;
+        out.version = operand.version;
+        out.version_key = operand.version_key;
+        out.valid = operand.valid;
+        return out;
+    };
+    request.a = convert(task.lhs);
+    request.b = convert(task.rhs);
+    request.c = convert(task.dst);
+    request.backend = task.gemm_backend;
+    request.scale = task.gemm_scale;
+    request.accumulate_mode = GemmAccumulateMode::SubtractProduct;
+    request.front_dim = front_dim;
+    request.pivot_dim = pivot_dim;
+    request.front_row = pivot_dim + task.tile_row * 16;
+    request.front_col = pivot_dim + task.tile_col * 16;
+    return request;
+}
+
+GemmRsp make_gemm_rsp(
+    const TileTask& task,
+    const TileTaskResponse& response,
+    std::uint32_t front_dim,
+    std::uint32_t pivot_dim) {
+    GemmRsp reply;
+    reply.txn_id = 0;
+    reply.task_id = response.task_id;
+    reply.epoch = response.epoch;
+    reply.command_id = response.command_id;
+    reply.node_id = response.node_id;
+    reply.status = response.status;
+    reply.reason = response.reason;
+    reply.output_visible = response.result_visible;
+    reply.output_version = task.dst.version + 1;
+    reply.saturation_count = response.saturation_count;
+    reply.overflow_count = response.overflow_count;
+    reply.saturated = response.saturation_count != 0;
+    reply.overflowed = response.overflow_count != 0;
+    reply.read_bytes = response.bytes_read;
+    reply.write_bytes = response.bytes_written;
+    reply.local_conversion_bytes = response.local_conversion_bytes;
+    reply.scale_reduction_cycles = response.scale_reduction_cycles;
+    reply.quantize_cycles = response.quantize_cycles;
+    reply.integer_compute_cycles = response.integer_compute_cycles;
+    reply.dequantize_cycles = response.dequantize_cycles;
+    reply.exponent_a = response.gemm_exponent_a;
+    reply.exponent_b = response.gemm_exponent_b;
+    reply.failed_phase = response.gemm_failed_phase;
+    reply.failed_tile_row = task.tile_row;
+    reply.failed_tile_col = task.tile_col;
+    reply.failed_step = task.step;
+    reply.failed_front_row = pivot_dim + task.tile_row * 16;
+    reply.failed_front_col = pivot_dim + task.tile_col * 16 +
+                             response.gemm_failed_local_col;
+    (void)front_dim;
+    return reply;
 }
 
 }  // namespace hw::panel_lu

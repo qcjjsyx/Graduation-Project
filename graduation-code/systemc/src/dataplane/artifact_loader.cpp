@@ -532,6 +532,12 @@ void validate_nodes(const json& manifest, const ArtifactProbe& probe) {
     }
     std::set<std::uint32_t> seen_commands;
     std::uint64_t max_front_size = 0;
+    const std::string operation_scope = manifest.at("compiler").contains("operation_scope")
+        ? as_string(manifest.at("compiler").at("operation_scope"), "compiler.operation_scope")
+        : "factorization_and_solve";
+    if (operation_scope != "factorization_only" && operation_scope != "factorization_and_solve") {
+        fail("unknown compiler operation_scope");
+    }
     if (manifest.contains("compiler") && manifest.at("compiler").is_object() &&
         manifest.at("compiler").contains("max_front_size")) {
         max_front_size = as_u64(
@@ -594,6 +600,11 @@ void validate_nodes(const json& manifest, const ArtifactProbe& probe) {
                  cmd::Opcode::SolveForward,
                  cmd::Opcode::SolveBackward,
              }) {
+            const bool solve = required == cmd::Opcode::SolveForward || required == cmd::Opcode::SolveBackward;
+            if (solve && operation_scope == "factorization_only") {
+                if (opcodes.count(required) != 0) fail("factorization-only artifact contains solve commands");
+                continue;
+            }
             if (opcodes.count(required) == 0) {
                 fail("node " + key + " is missing a required opcode");
             }
@@ -743,6 +754,26 @@ LoadedArtifact load_artifact_from_bytes(
     }
 
     DeviceBootConfig config;
+
+    if (manifest.contains("gemm")) {
+        const json& gemm = require_object(manifest, "gemm", "manifest");
+        GemmModelConfig model;
+        model.effective_bits = as_u32(
+            require_key(gemm, "effective_bits", "gemm"), "gemm.effective_bits");
+        model.accumulator_bits = as_u32(
+            require_key(gemm, "accumulator_bits", "gemm"), "gemm.accumulator_bits");
+        model.k_block_max = as_u32(
+            require_key(gemm, "k_block_max", "gemm"), "gemm.k_block_max");
+        model.conversion_rate_per_cycle = as_u32(
+            require_key(gemm, "conversion_rate_per_cycle", "gemm"),
+            "gemm.conversion_rate_per_cycle");
+        if (model.effective_bits < 1 || model.effective_bits > 30 ||
+            model.accumulator_bits != 64 || model.k_block_max < 1 ||
+            model.k_block_max > 16 || model.conversion_rate_per_cycle == 0) {
+            fail("manifest gemm model parameters are outside the supported range");
+        }
+        config.gemm_model = model;
+    }
 
     const json& abi = require_object(manifest, "abi", "manifest");
     if (as_string(require_key(abi, "name", "abi"), "abi.name") != "command_descriptor") {

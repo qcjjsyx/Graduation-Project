@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "panel_lu/precision_adapter.hpp"
+
 namespace hw::panel_lu {
 
 namespace {
@@ -34,9 +36,9 @@ bool PanelEngine::commit(std::uint64_t key, std::uint32_t expected_version) {
 }
 
 void PanelEngine::erase_slot_versions(std::uint32_t slot) {
-    const std::uint64_t prefix = static_cast<std::uint64_t>(slot) << 32;
+    const std::uint64_t prefix = static_cast<std::uint64_t>(slot) << 48;
     auto iterator = versions_.lower_bound(prefix);
-    while (iterator != versions_.end() && (iterator->first >> 32) == slot) {
+    while (iterator != versions_.end() && (iterator->first >> 48) == slot) {
         iterator = versions_.erase(iterator);
     }
 }
@@ -48,15 +50,25 @@ ConfigCheck PanelEngine::configure() {
         return check;
     }
     pes_.clear();
-    pes_.reserve(config_.pe_count);
-    for (std::uint32_t id = 0; id < config_.pe_count; ++id) {
+    pes_.reserve(config_.total_pe_count());
+    for (std::uint32_t id = 0; id < config_.total_pe_count(); ++id) {
         pes_.emplace_back(id, config_);
     }
     writeback_reservation_.configure(config_.writeback_queue_depth);
-    read_budget_.reset(config_.load_bytes_per_cycle);
-    write_budget_.reset(config_.writeback_bytes_per_cycle);
+    fallback_arbiter_.reset();
+    fallback_arbiter_.configure(
+        config_.load_bytes_per_cycle, config_.writeback_bytes_per_cycle);
     contexts_.clear();
-    contexts_.resize(config_.max_resident_commands);
+    contexts_.resize(std::max(config_.max_resident_commands,
+                              config_.compute_group_count));
+    group_busy_.assign(config_.compute_group_count, false);
+    group_commands_.assign(config_.compute_group_count, hw::command::NONE);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    for (std::uint32_t group = 0; group < config_.compute_group_count; ++group) {
+        ranges.emplace_back(
+            group * config_.pes_per_group, config_.pes_per_group);
+    }
+    dispatcher_.set_group_ranges(ranges);
     configured_ = true;
     ConfigCheck result;
     result.ok = true;
@@ -65,7 +77,7 @@ ConfigCheck PanelEngine::configure() {
 
 ConfigCheck PanelEngine::begin_command(
     const PanelEngineRequest& request,
-    std::uint32_t adapter_unit_id,
+    std::uint64_t adapter_key,
     std::uint64_t cycle) {
     ConfigCheck check;
     if (!configured_) {
@@ -84,17 +96,38 @@ ConfigCheck PanelEngine::begin_command(
     if (free_context == nullptr) {
         check.ok = false;
         check.status = StatusCode::BufferFull;
-        check.reason = "no free panel context";
+        check.reason = "no free compute context";
         return check;
     }
+    // One accepted compute command owns one PE group for its whole execution
+    // context (including e.g. the Panel scan): another command cannot share
+    // the group even while it has idle PEs.
+    std::uint32_t group_id = hw::command::NONE;
+    for (std::uint32_t group = 0; group < group_busy_.size(); ++group) {
+        if (!group_busy_[group]) {
+            group_id = group;
+            break;
+        }
+    }
+    if (group_id == hw::command::NONE) {
+        check.ok = false;
+        check.status = StatusCode::BufferFull;
+        check.reason = "no free PE group";
+        return check;
+    }
+    group_busy_[group_id] = true;
+    group_commands_[group_id] = request.command_id;
+    free_context->group_id = group_id;
     free_context->request = request;
-    free_context->adapter_unit_id = adapter_unit_id;
+    free_context->adapter_key = adapter_key;
     free_context->bytes_read = 0;
     free_context->bytes_written = 0;
     free_context->aborting = false;
     free_context->response_ready = false;
     check = build_context(*free_context, cycle);
     if (!check.ok) {
+        group_busy_[group_id] = false;
+        group_commands_[group_id] = hw::command::NONE;
         *free_context = Context{};
         return check;
     }
@@ -107,7 +140,7 @@ ConfigCheck PanelEngine::build_context(Context& context, std::uint64_t cycle) {
     if (request.policy == hw::command::PivotPolicy::DynamicPanel) {
         check.ok = false;
         check.status = StatusCode::PolicyNotSupported;
-        check.reason = "DYNAMIC_PANEL is not supported by the T07 STATIC engine";
+        check.reason = "DYNAMIC_PANEL is not supported by the STATIC engine";
         return check;
     }
     check = check_front_capability(
@@ -118,6 +151,92 @@ ConfigCheck PanelEngine::build_context(Context& context, std::uint64_t cycle) {
         config_);
     if (!check.ok) {
         return check;
+    }
+    if (request.compute_kind == ComputeKind::TrsmLeft ||
+        request.compute_kind == ComputeKind::TrsmRight) {
+        // Strict KERNEL_DESC shape validation against the resident front:
+        //   TRSM_LEFT  M/N/K = p/u/p
+        //   TRSM_RIGHT M/N/K = u/p/p
+        const std::uint32_t update = request.total_dim - request.pivot_dim;
+        const bool shape_ok =
+            request.compute_kind == ComputeKind::TrsmLeft
+                ? (request.kernel_m == request.pivot_dim &&
+                   request.kernel_n == update && request.kernel_k == request.pivot_dim)
+                : (request.kernel_m == update &&
+                   request.kernel_n == request.pivot_dim &&
+                   request.kernel_k == request.pivot_dim);
+        if (!shape_ok) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason = "TRSM kernel shape disagrees with the resident front";
+            return check;
+        }
+        if (request.kernel_tile_size != config_.tile_dim) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason = "TRSM kernel tile_size must be the fixed 16x16 tile";
+            return check;
+        }
+        if (request.kernel_backend != 0x01) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason =
+                "TRSM kernel backend is not the FP32 device model; other "
+                "backends are not implemented";
+            return check;
+        }
+    }
+    if (request.compute_kind == ComputeKind::GemmSchur) {
+        // Strict KERNEL_DESC shape validation against the resident front:
+        //   GEMM_SCHUR M/N/K = u/u/p
+        const std::uint32_t update = request.total_dim - request.pivot_dim;
+        if (request.kernel_m != update || request.kernel_n != update ||
+            request.kernel_k != request.pivot_dim) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason = "GEMM_SCHUR kernel shape disagrees with the resident front";
+            return check;
+        }
+        if (request.kernel_tile_size != config_.tile_dim) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason = "GEMM_SCHUR kernel tile_size must be the fixed 16x16 tile";
+            return check;
+        }
+        const GemmBackend backend = gemm_backend_from_wire(request.kernel_backend);
+        if (request.kernel_backend != gemm_backend_to_wire(GemmBackend::Fp32Device) &&
+            request.kernel_backend != gemm_backend_to_wire(GemmBackend::Int32Gemm)) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason = "GEMM_SCHUR kernel backend code is unknown";
+            return check;
+        }
+        if (backend == GemmBackend::Int32Gemm) {
+            if (!request.kernel_has_scale) {
+                check.ok = false;
+                check.status = StatusCode::BadDescriptor;
+                check.reason = "INT32 GEMM requires a valid SCALE_DESC reference";
+                return check;
+            }
+            if (config_.numeric_mode != PanelNumericMode::Fp32Device) {
+                check.ok = false;
+                check.status = StatusCode::PolicyNotSupported;
+                check.reason =
+                    "INT32 GEMM cannot be combined with the FP64 diagnostic mode";
+                return check;
+            }
+            const ConfigCheck precision = validate_precision_config(config_.precision);
+            if (!precision.ok) {
+                return precision;
+            }
+        } else if (request.kernel_has_scale) {
+            check.ok = false;
+            check.status = StatusCode::BadDescriptor;
+            check.reason =
+                "FP32 GEMM must not reference a SCALE_DESC (scale_desc_id must "
+                "be NONE)";
+            return check;
+        }
     }
     if (request.front_lease.lease_id == 0) {
         check.ok = false;
@@ -154,6 +273,7 @@ ConfigCheck PanelEngine::build_context(Context& context, std::uint64_t cycle) {
     layout.row_stride_bytes = row_stride;
     layout.global_grid = grid;
     layout.total_dim = request.total_dim;
+    layout.group_id = context.group_id;
 
     PanelCommandRequest controller_request;
     controller_request.command_id = request.command_id;
@@ -164,12 +284,26 @@ ConfigCheck PanelEngine::build_context(Context& context, std::uint64_t cycle) {
     controller_request.threshold_bits = request.threshold_bits;
     controller_request.tile_size = request.tile_size;
     controller_request.label = request.label;
+    controller_request.compute_kind = request.compute_kind;
+    controller_request.front_pre_elimination_max_abs = request.front_scale;
+    controller_request.threshold_product = request.threshold_product;
+    controller_request.gemm_backend = gemm_backend_from_wire(request.kernel_backend);
+    controller_request.gemm_scale = request.gemm_scale;
+    controller_request.descriptor_id = request.kernel_descriptor_id;
 
-    context.reader = std::make_unique<LeaseFrontReader>(access_);
-    context.reader->configure(
-        request.front.slot, request.front_offset, row_stride, request.total_dim);
-    context.controller = std::make_unique<PanelController>(
-        config_, &dispatcher_, this, context.reader.get());
+    if (request.compute_kind == ComputeKind::PanelLu) {
+        context.reader = std::make_unique<LeaseFrontReader>(access_);
+        context.reader->configure(
+            request.front.slot, request.front_offset, row_stride, request.total_dim);
+        context.controller = std::make_unique<PanelController>(
+            config_, &dispatcher_, this, context.reader.get());
+    } else if (request.compute_kind == ComputeKind::GemmSchur) {
+        context.controller = std::make_unique<GemmController>(
+            config_, &dispatcher_, this);
+    } else {
+        context.controller = std::make_unique<TrsmController>(
+            config_, &dispatcher_, this);
+    }
     access_.bind(request.front.slot, binding);
     const ConfigCheck started = context.controller->start(
         controller_request, cycle, epoch_, layout, next_task_id_);
@@ -197,12 +331,17 @@ void PanelEngine::tick(std::uint64_t cycle) {
         return;
     }
     cycle_ = cycle;
-    read_budget_.reset(config_.load_bytes_per_cycle);
-    write_budget_.reset(config_.writeback_bytes_per_cycle);
+    hw::dataplane::OnChipArbiter& arbiter =
+        arbiter_ != nullptr ? *arbiter_ : fallback_arbiter_;
+    if (arbiter_ == nullptr) {
+        // Standalone engine (tests without a device owner): own the once-per-
+        // cycle budget initialization here.
+        arbiter.begin_cycle(cycle);
+    }
 
-    // Phase 1: PE progress (shared read/write budgets).
+    // Phase 1: PE progress (shared unified budgets).
     for (MultiModePe& pe : pes_) {
-        pe.tick(cycle, read_budget_, write_budget_, writeback_reservation_, access_);
+        pe.tick(cycle, arbiter, writeback_reservation_, access_);
     }
     // Phase 2: route terminal task responses (commits + controller updates).
     route_pe_responses(cycle);
@@ -211,7 +350,7 @@ void PanelEngine::tick(std::uint64_t cycle) {
     // Phase 4: directed cancellation requested by controllers.
     handle_cancel_requests(cycle);
     // Phase 5: advance contexts (scan/generation), fair rotation.
-    service_contexts(cycle);
+    service_contexts(cycle, arbiter);
     // Phase 6: contexts whose controller and tasks have drained publish their
     // single terminal response.
     finalize_contexts(cycle);
@@ -258,6 +397,7 @@ void PanelEngine::route_pe_responses(std::uint64_t cycle) {
                 record.reason = response.reason;
                 record.failed_column = response.failed_column;
                 record.pe_id = response.pe_id;
+                record.group_id = context != nullptr ? context->group_id : 0;
                 record.committed = committed;
                 record.cancelled = response.status != StatusCode::Ok && !committed;
                 record.enqueue_cycle = response.enqueue_cycle;
@@ -268,6 +408,19 @@ void PanelEngine::route_pe_responses(std::uint64_t cycle) {
                 record.writeback_done_cycle = response.writeback_done_cycle;
                 record.bytes_read = response.bytes_read;
                 record.bytes_written = response.bytes_written;
+                record.gemm_backend = response.gemm_backend;
+                record.gemm_failed_phase = response.gemm_failed_phase;
+                record.gemm_failed_local_row = response.gemm_failed_local_row;
+                record.gemm_failed_local_col = response.gemm_failed_local_col;
+                record.gemm_exponent_a = response.gemm_exponent_a;
+                record.gemm_exponent_b = response.gemm_exponent_b;
+                record.saturation_count = response.saturation_count;
+                record.overflow_count = response.overflow_count;
+                record.local_conversion_bytes = response.local_conversion_bytes;
+                record.scale_reduction_cycles = response.scale_reduction_cycles;
+                record.quantize_cycles = response.quantize_cycles;
+                record.integer_compute_cycles = response.integer_compute_cycles;
+                record.dequantize_cycles = response.dequantize_cycles;
                 if (committed) {
                     ++tasks_committed_;
                 } else if (response.status == StatusCode::Aborted) {
@@ -310,7 +463,9 @@ void PanelEngine::handle_cancel_requests(std::uint64_t cycle) {
     }
 }
 
-void PanelEngine::service_contexts(std::uint64_t cycle) {
+void PanelEngine::service_contexts(
+    std::uint64_t cycle,
+    hw::dataplane::OnChipArbiter& arbiter) {
     const std::size_t count = contexts_.size();
     if (count == 0) {
         return;
@@ -320,7 +475,7 @@ void PanelEngine::service_contexts(std::uint64_t cycle) {
         if (!context.active || !context.controller) {
             continue;
         }
-        context.controller->tick(cycle, read_budget_, write_budget_);
+        context.controller->tick(cycle, arbiter);
     }
     rotation_ = (rotation_ + 1) % count;
 }
@@ -348,18 +503,52 @@ void PanelEngine::finalize_contexts(std::uint64_t cycle) {
         response.bytes_written = context.bytes_written;
         response.tasks_total = controller_response.tasks_generated;
         response.tasks_cancelled = controller_response.tasks_cancelled;
-        if (controller_response.status == StatusCode::Ok) {
-            response.pivot_count = context.request.pivot_dim;
-            response.needs_pvector_write = true;
-            response.pvector_dim = context.request.pivot_dim;
+        response.group_id = context.group_id;
+        response.front_scale = context.request.front_scale;
+        response.threshold_product = context.request.threshold_product;
+        if (context.request.compute_kind == ComputeKind::PanelLu) {
+            if (auto* panel =
+                    dynamic_cast<PanelController*>(context.controller.get());
+                panel != nullptr) {
+                response.front_scale = panel->front_max_abs();
+                response.threshold_product = panel->threshold_product();
+            }
+            if (controller_response.status == StatusCode::Ok) {
+                response.pivot_count = context.request.pivot_dim;
+                response.needs_pvector_write = true;
+                response.pvector_dim = context.request.pivot_dim;
+            }
+        } else if (context.request.compute_kind == ComputeKind::GemmSchur) {
+            // GEMM_SCHUR: no P-vector and no pivots; pivot_count stays 0 even
+            // on failure (the failing front coordinate is not a pivot).
+            response.pivot_count = 0;
+            response.gemm_backend = controller_response.gemm_backend;
+            response.saturation_count = controller_response.saturation_count;
+            response.overflow_count = controller_response.overflow_count;
+            response.local_conversion_bytes =
+                controller_response.local_conversion_bytes;
+            response.scale_reduction_cycles =
+                controller_response.scale_reduction_cycles;
+            response.quantize_cycles = controller_response.quantize_cycles;
+            response.integer_compute_cycles =
+                controller_response.integer_compute_cycles;
+            response.dequantize_cycles = controller_response.dequantize_cycles;
+            response.exponent_a = controller_response.exponent_a;
+            response.exponent_b = controller_response.exponent_b;
+        } else {
+            // TRSM: no P-vector; failure coordinates are front coordinates
+            // mapped by the controller; pivot_count stays 0 on success.
+            response.pivot_count = controller_response.status == StatusCode::Ok
+                                       ? 0
+                                       : controller_response.pivot_count;
         }
         context.response_ready = true;
     }
 }
 
-bool PanelEngine::poll_response(std::uint32_t adapter_unit_id, PanelEngineResponse& out) {
+bool PanelEngine::poll_response(std::uint64_t adapter_key, PanelEngineResponse& out) {
     for (Context& context : contexts_) {
-        if (!context.active || context.adapter_unit_id != adapter_unit_id ||
+        if (!context.active || context.adapter_key != adapter_key ||
             !context.response_ready) {
             continue;
         }
@@ -370,9 +559,9 @@ bool PanelEngine::poll_response(std::uint32_t adapter_unit_id, PanelEngineRespon
     return false;
 }
 
-bool PanelEngine::unit_busy(std::uint32_t adapter_unit_id) const {
+bool PanelEngine::unit_busy(std::uint64_t adapter_key) const {
     for (const Context& context : contexts_) {
-        if (context.active && context.adapter_unit_id == adapter_unit_id) {
+        if (context.active && context.adapter_key == adapter_key) {
             return true;
         }
     }
@@ -403,8 +592,35 @@ void PanelEngine::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     }
 }
 
+bool PanelEngine::group_busy(std::uint32_t group_id) const {
+    return group_id < group_busy_.size() && group_busy_[group_id];
+}
+
+std::uint32_t PanelEngine::group_of_command(std::uint32_t command_id) const {
+    for (const Context& context : contexts_) {
+        if (context.active && context.request.command_id == command_id) {
+            return context.group_id;
+        }
+    }
+    return hw::command::NONE;
+}
+
 void PanelEngine::release_context(Context& context) {
+    if (context.group_id < group_busy_.size()) {
+        group_busy_[context.group_id] = false;
+        group_commands_[context.group_id] = hw::command::NONE;
+    }
     if (context.controller) {
+        // Terminal release: drop this command's committed-task bookkeeping so
+        // long runs do not accumulate task ids forever.
+        dispatcher_.release_command(context.request.command_id);
+        if (auto* gemm = dynamic_cast<GemmController*>(context.controller.get());
+            gemm != nullptr) {
+            EngineGemmLog log;
+            log.requests = gemm->gemm_requests();
+            log.responses = gemm->gemm_responses();
+            gemm_log_.push_back(std::move(log));
+        }
         context.controller->reset();
     }
     if (context.reader) {
@@ -426,10 +642,16 @@ void PanelEngine::reset() {
     for (Context& context : contexts_) {
         context = Context{};
     }
+    for (std::size_t group = 0; group < group_busy_.size(); ++group) {
+        group_busy_[group] = false;
+        group_commands_[group] = hw::command::NONE;
+    }
     writeback_reservation_.reset();
-    read_budget_.reset(config_.load_bytes_per_cycle);
-    write_budget_.reset(config_.writeback_bytes_per_cycle);
+    fallback_arbiter_.reset();
+    fallback_arbiter_.configure(
+        config_.load_bytes_per_cycle, config_.writeback_bytes_per_cycle);
     task_records_.clear();
+    gemm_log_.clear();
     tasks_committed_ = 0;
     tasks_cancelled_ = 0;
     control_fault_ = false;
@@ -449,6 +671,15 @@ PanelEngine::Context* PanelEngine::find_context(std::uint32_t command_id) {
 PanelEngine::Context* PanelEngine::find_context_by_txn(std::uint64_t txn_id) {
     for (Context& context : contexts_) {
         if (context.active && context.request.txn_id == txn_id) {
+            return &context;
+        }
+    }
+    return nullptr;
+}
+
+PanelEngine::Context* PanelEngine::find_context_by_adapter(std::uint64_t adapter_key) {
+    for (Context& context : contexts_) {
+        if (context.active && context.adapter_key == adapter_key) {
             return &context;
         }
     }

@@ -46,6 +46,13 @@ public:
     // Other responses are dropped.
     void set_memory_sink(MemoryClient client, MemoryResponseSink* sink);
 
+    // Unified on-chip bandwidth arbitration for the DMA buffer side (nullptr
+    // keeps the standalone T04 behaviour).
+    void set_on_chip_arbiter(OnChipArbiter* arbiter) {
+        on_chip_arbiter_ = arbiter;
+        dma_.set_on_chip_arbiter(arbiter);
+    }
+
     std::uint64_t cycle() const { return cycle_; }
 
     DeviceMemory& memory() { return memory_; }
@@ -81,6 +88,7 @@ private:
     DmaEngine dma_;
     DescriptorReader reader_;
     std::uint64_t cycle_{0};
+    OnChipArbiter* on_chip_arbiter_{nullptr};
 };
 
 }  // namespace hw::dataplane

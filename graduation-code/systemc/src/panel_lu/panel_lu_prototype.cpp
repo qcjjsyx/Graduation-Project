@@ -95,14 +95,14 @@ ConfigCheck PanelLuPrototype::configure() {
     max_tiles_ = global_grid_ * global_grid_;
     store_.resize(config_.max_resident_commands * max_tiles_);
     pes_.clear();
-    pes_.reserve(config_.pe_count);
-    for (std::uint32_t id = 0; id < config_.pe_count; ++id) {
+    pes_.reserve(config_.total_pe_count());
+    for (std::uint32_t id = 0; id < config_.total_pe_count(); ++id) {
         pes_.emplace_back(id, config_);
     }
     writeback_reservation_.configure(config_.writeback_queue_depth);
-    load_budget_.reset(config_.load_bytes_per_cycle);
-    store_write_budget_.reset(config_.writeback_bytes_per_cycle);
-    scan_budget_.reset(config_.scan_bytes_per_cycle);
+    arbiter_.reset();
+    arbiter_.configure(
+        config_.load_bytes_per_cycle, config_.writeback_bytes_per_cycle);
     controller_slots_.clear();
     controller_slots_.reserve(config_.max_resident_commands);
     for (std::uint32_t i = 0; i < config_.max_resident_commands; ++i) {
@@ -328,18 +328,12 @@ void PanelLuPrototype::tick() {
         return;
     }
     ++cycle_;
-    load_budget_.reset(config_.load_bytes_per_cycle);
-    store_write_budget_.reset(config_.writeback_bytes_per_cycle);
-    scan_budget_.reset(config_.scan_bytes_per_cycle);
+    // One global budget initialization per cycle; every module shares it.
+    arbiter_.begin_cycle(cycle_);
 
     // Phase 1: PE progress. Shared load/writeback budgets are consumed here.
     for (MultiModePe& pe : pes_) {
-        pe.tick(
-            cycle_,
-            load_budget_,
-            store_write_budget_,
-            writeback_reservation_,
-            synthetic_access_);
+        pe.tick(cycle_, arbiter_, writeback_reservation_, synthetic_access_);
     }
     // Phase 2: route terminal task responses (commit visible results).
     route_pe_responses();
@@ -356,7 +350,7 @@ void PanelLuPrototype::tick() {
             ControllerSlot& slot =
                 controller_slots_[(controller_rotation_ + i) % slot_count];
             if (slot.active) {
-                slot.controller->tick(cycle_, scan_budget_, store_write_budget_);
+                slot.controller->tick(cycle_, arbiter_);
             }
         }
         controller_rotation_ = (controller_rotation_ + 1) % slot_count;
@@ -541,7 +535,7 @@ void PanelLuPrototype::drain_command_responses() {
         }
         command_responses_.push_back(response);
         command_history_[response.command_id] = response;
-        command_graphs_[response.command_id] = slot.controller->task_graph();
+        command_graphs_[response.command_id] = slot.controller->task_graph_snapshot();
         dispatcher_.release_command(response.command_id);
         if (slot.controller->task_graph().size() >= kTaskIdStride) {
             control_fault_ = true;
@@ -597,9 +591,9 @@ void PanelLuPrototype::reset() {
         slot.command_id = hw::command::NONE;
     }
     writeback_reservation_.reset();
-    load_budget_.reset(config_.load_bytes_per_cycle);
-    store_write_budget_.reset(config_.writeback_bytes_per_cycle);
-    scan_budget_.reset(config_.scan_bytes_per_cycle);
+    arbiter_.reset();
+    arbiter_.configure(
+        config_.load_bytes_per_cycle, config_.writeback_bytes_per_cycle);
     task_records_.clear();
     events_.clear();
     command_responses_.clear();
@@ -657,7 +651,9 @@ std::string PanelLuPrototype::summary_json() const {
     out << "  \"epoch\": " << epoch_ << ",\n";
     out << "  \"control_fault\": " << (control_fault_ ? "true" : "false") << ",\n";
     out << "  \"control_fault_reason\": \"" << json_escape(control_fault_reason_) << "\",\n";
-    out << "  \"pe_count\": " << config_.pe_count << ",\n";
+    out << "  \"compute_group_count\": " << config_.compute_group_count << ",\n";
+    out << "  \"pes_per_group\": " << config_.pes_per_group << ",\n";
+    out << "  \"pe_count\": " << config_.total_pe_count() << ",\n";
     out << "  \"task_slots_per_pe\": " << config_.task_slots_per_pe << ",\n";
     out << "  \"tile_dim\": " << config_.tile_dim << ",\n";
     out << "  \"dispatcher_queue_depth\": " << config_.dispatcher_queue_depth << ",\n";

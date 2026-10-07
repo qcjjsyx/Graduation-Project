@@ -14,6 +14,7 @@
 #include "controlplane/completion_writer.hpp"
 #include "controlplane/dma_arbiter.hpp"
 #include "controlplane/exec_types.hpp"
+#include "controlplane/assembly_exec_unit.hpp"
 #include "controlplane/test_stub_unit.hpp"
 #include "controlplane/token_scoreboard.hpp"
 #include "dataplane/dataplane.hpp"
@@ -48,6 +49,7 @@ struct ControlPlaneConfig {
     // FactorStoreUnit to STORE_FACTOR. Explicitly selected, never implicit.
     bool enable_real_panel{false};
     hw::panel_lu::PanelLuConfig panel;
+    AssemblyConfig assembly;
     hw::dataplane::MemoryServiceConfig memory;
     hw::dataplane::DmaConfig dma;
 };
@@ -79,6 +81,16 @@ struct CommandStats {
     std::uint32_t pivot_count{0};
     std::uint32_t overflow_count{0};
     std::uint32_t dma_jobs{0};
+    // T10 GEMM_SCHUR statistics (empty/zero for other opcodes).
+    std::string gemm_backend;
+    std::uint64_t saturation_count{0};
+    std::uint64_t local_conversion_bytes{0};
+    std::uint64_t scale_reduction_cycles{0};
+    std::uint64_t quantize_cycles{0};
+    std::uint64_t integer_compute_cycles{0};
+    std::uint64_t dequantize_cycles{0};
+    std::int32_t exponent_a{0};
+    std::int32_t exponent_b{0};
 };
 
 struct UnitBusyRecord {
@@ -106,6 +118,9 @@ public:
 
     // Shared panel compute subsystem (nullptr when the real backend is off).
     hw::panel_lu::PanelEngine* panel_engine() { return panel_engine_.get(); }
+    // Device-wide unified on-chip bandwidth arbiter.
+    hw::dataplane::OnChipArbiter& on_chip_arbiter() { return on_chip_; }
+    const hw::dataplane::OnChipArbiter& on_chip_arbiter() const { return on_chip_; }
     const hw::panel_lu::PanelEngine* panel_engine() const { return panel_engine_.get(); }
     bool real_panel_enabled() const { return panel_engine_ != nullptr; }
 
@@ -130,6 +145,8 @@ public:
     BatchState state() const { return state_; }
     const std::string& fault_reason() const { return fault_reason_; }
     bool control_flow_pass() const { return state_ == BatchState::Completed; }
+    // Device status is distinct from independent numerical validation.
+    bool numeric_status_pass() const;
 
     void abort_node(std::uint32_t node_id);
     void reset();
@@ -262,6 +279,17 @@ private:
         std::uint64_t admit_cycle{0};
         std::uint64_t start_cycle{0};
         std::uint64_t finish_cycle{0};
+        // T10 GEMM_SCHUR backend statistics of the last executed GEMM command
+        // (kept per command so completion/token statistics are truthful).
+        hw::panel_lu::GemmBackend gemm_backend{hw::panel_lu::GemmBackend::Fp32Device};
+        std::uint64_t gemm_saturation_count{0};
+        std::uint64_t gemm_local_conversion_bytes{0};
+        std::uint64_t gemm_scale_reduction_cycles{0};
+        std::uint64_t gemm_quantize_cycles{0};
+        std::uint64_t gemm_integer_compute_cycles{0};
+        std::uint64_t gemm_dequantize_cycles{0};
+        std::int32_t gemm_exponent_a{0};
+        std::int32_t gemm_exponent_b{0};
     };
 
     struct FrontSlot {
@@ -273,6 +301,11 @@ private:
         hw::dataplane::BufferHandle temp{};
         std::uint64_t occupy_start{0};
         hw::dataplane::FrontView front_view;
+        // Latched PANEL_LU numeric context (front_pre_elimination_max_abs and
+        // its threshold product); consumed by top-level TRSM diagonal checks
+        // and never re-derived from the eliminated front.
+        double front_scale{0.0};
+        double threshold_product{0.0};
     };
 
     void update_phase(std::uint64_t cycle);
@@ -322,8 +355,10 @@ private:
 
     hw::dataplane::LoadedArtifact artifact_;
     ControlPlaneConfig config_;
+    std::string model_config_error_;
     hw::dataplane::DataPlane plane_;
     hw::dataplane::TraceRecorder& trace_;
+    hw::dataplane::OnChipArbiter on_chip_;
 
     CommandFetch fetch_;
     CompletionWriter completion_writer_;

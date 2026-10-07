@@ -188,6 +188,10 @@ public:
     std::uint32_t active_lease_count() const {
         return static_cast<std::uint32_t>(leases_.size());
     }
+    // Test/diagnostic: cumulative bytes moved through lease accesses since
+    // construction/reset (independent measurement of actual on-chip scratchpad
+    // traffic; survives lease release).
+    std::uint64_t total_lease_access_bytes() const { return total_access_bytes_; }
     const BufferConfig& config() const { return config_; }
     std::uint64_t conflicts() const { return conflicts_; }
 
@@ -255,6 +259,7 @@ private:
     std::vector<Lease> leases_;
     std::uint64_t next_lease_id_{1};
     std::uint64_t conflicts_{0};
+    std::uint64_t total_access_bytes_{0};
 };
 
 }  // namespace hw::dataplane

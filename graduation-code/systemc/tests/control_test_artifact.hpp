@@ -56,6 +56,16 @@ struct TestArtifactOptions {
     // Trailing SOLVE commands are skipped when false (real-backend numeric
     // tests of one panel chain do not need solve units).
     bool include_solve{true};
+    // T10 GEMM backend and optional SCALE_DESC body words 0..5. When
+    // gemm_scale_words is non-empty the GEMM KERNEL_DESC references the
+    // generated SCALE_DESC record (INT32 backend); the FP32 backend must keep
+    // it empty (scale_desc_id = NONE).
+    cmd::KernelBackend gemm_backend{cmd::KernelBackend::SystemCFp32DeviceModel};
+    std::vector<std::uint32_t> gemm_scale_words{};
+    // T10 padded DDR stride coverage: extra bytes between front/update rows
+    // (0 keeps the historical compact layout).
+    std::uint32_t front_stride_pad_bytes{0};
+    std::uint32_t update_stride_pad_bytes{0};
 };
 
 struct TestArtifact {
@@ -119,6 +129,9 @@ struct RegionSpec {
     std::uint32_t cols;
     cmd::DataFormat format;
     std::vector<std::uint8_t> data;
+    // 0 = compact (cols * 4); otherwise the descriptor row stride and the
+    // placed data are padded to this many bytes per row.
+    std::uint32_t stride_bytes{0};
 };
 
 struct DescriptorSpec {
@@ -307,11 +320,20 @@ inline TestArtifact build_test_artifact(
         const std::uint32_t pivot = node.pivot_dim;
         const std::uint32_t update = total - pivot;
         const std::string prefix = "node." + std::to_string(node.node_id);
-        RegionSpec front{prefix + ".front", total, total, cmd::DataFormat::Fp32, {}};
+        const std::uint32_t front_stride =
+            total * 4 + options.front_stride_pad_bytes;
+        RegionSpec front{
+            prefix + ".front", total, total, cmd::DataFormat::Fp32, {},
+            options.front_stride_pad_bytes == 0 ? 0u : front_stride};
         if (node.front_values.size() == static_cast<std::size_t>(total) * total) {
-            front.data.resize(static_cast<std::size_t>(total) * total * 4);
-            std::memcpy(
-                front.data.data(), node.front_values.data(), front.data.size());
+            front.data.assign(
+                static_cast<std::size_t>(total) * front_stride, 0);
+            for (std::uint32_t row = 0; row < total; ++row) {
+                std::memcpy(
+                    front.data.data() + static_cast<std::size_t>(row) * front_stride,
+                    node.front_values.data() + static_cast<std::size_t>(row) * total,
+                    static_cast<std::size_t>(total) * 4);
+            }
         } else {
             for (std::uint32_t row = 0; row < total; ++row) {
                 for (std::uint32_t col = 0; col < total; ++col) {
@@ -320,11 +342,16 @@ inline TestArtifact build_test_artifact(
                             b == 0 ? detail::front_byte(node.node_id, row, col) : 0);
                     }
                 }
+                front.data.resize(
+                    front.data.size() + options.front_stride_pad_bytes, 0);
             }
         }
         regions.push_back(front);
+        const std::uint32_t update_stride =
+            update * 4 + options.update_stride_pad_bytes;
         RegionSpec update_region{
-            prefix + ".update", update, update, cmd::DataFormat::Fp32, {}};
+            prefix + ".update", update, update, cmd::DataFormat::Fp32, {},
+            options.update_stride_pad_bytes == 0 ? 0u : update_stride};
         for (std::uint32_t row = 0; row < update; ++row) {
             for (std::uint32_t col = 0; col < update; ++col) {
                 for (unsigned b = 0; b < 4; ++b) {
@@ -332,6 +359,8 @@ inline TestArtifact build_test_artifact(
                         b == 0 ? detail::update_byte(node.node_id, row, col) : 0);
                 }
             }
+            update_region.data.resize(
+                update_region.data.size() + options.update_stride_pad_bytes, 0);
         }
         regions.push_back(update_region);
         regions.push_back(
@@ -495,7 +524,9 @@ inline TestArtifact build_test_artifact(
     for (const auto& region : regions) {
         descriptor_specs.push_back(
             {"region:" + region.name, cmd::DescriptorType::Region,
-             {0, 0, 0, 0, region.cols * 4, region.rows, region.cols,
+             {0, 0, 0, 0,
+              region.stride_bytes == 0 ? region.cols * 4 : region.stride_bytes,
+              region.rows, region.cols,
               static_cast<std::uint32_t>(region.format),
               static_cast<std::uint32_t>(cmd::DataLayout::RowMajor), 0},
              {}});
@@ -534,11 +565,17 @@ inline TestArtifact build_test_artifact(
             descriptor_specs.push_back(
                 {prefix + ".kernel.gemm", cmd::DescriptorType::Kernel,
                  {0, 0, 0, update, update, node.pivot_dim,
-                  static_cast<std::uint32_t>(
-                      cmd::KernelBackend::SystemCFp32DeviceModel),
+                  static_cast<std::uint32_t>(options.gemm_backend),
                   static_cast<std::uint32_t>(cmd::DataFormat::Fp32), cmd::NONE,
                   options.tile_size},
                  {}});
+            if (!options.gemm_scale_words.empty()) {
+                std::vector<std::uint32_t> scale_body = options.gemm_scale_words;
+                scale_body.resize(10, 0);
+                descriptor_specs.push_back(
+                    {prefix + ".kernel.gemm.scale",
+                     cmd::DescriptorType::Scale, scale_body, {}});
+            }
         }
         descriptor_specs.push_back(
             {prefix + ".solve_forward", cmd::DescriptorType::Solve,
@@ -629,6 +666,13 @@ inline TestArtifact build_test_artifact(
             spec.body[0] = id_of(prefix + ".front");
             spec.body[1] = id_of(prefix + ".front");
             spec.body[2] = id_of(prefix + ".front");
+            if (spec.name == prefix + ".kernel.gemm" &&
+                !options.gemm_scale_words.empty()) {
+                // Explicit reference whenever SCALE_DESC words are supplied:
+                // an FP32 kernel with a scale reference is a contract
+                // violation the device must refuse (negative test).
+                spec.body[8] = id_of(prefix + ".kernel.gemm.scale");
+            }
         } else if (spec.type == cmd::DescriptorType::Solve) {
             spec.body[0] = id_of(prefix + ".factor");
             spec.body[1] = id_of("region:rhs_data");
@@ -788,7 +832,12 @@ inline TestArtifact build_test_artifact(
     manifest +=
         "  \"compiler\": {\n"
         "    \"device_format\": \"FP32\",\n"
-        "    \"kernel_backend\": \"SYSTEMC_FP32_DEVICE_MODEL\",\n"
+        "    \"kernel_backend\": \"" +
+        std::string(
+            options.gemm_backend == cmd::KernelBackend::SystemCInt32GemmModel
+                ? "SYSTEMC_INT32_GEMM_MODEL"
+                : "SYSTEMC_FP32_DEVICE_MODEL") +
+        "\",\n"
         "    \"global_bfp\": false,\n"
         "    \"alignment\": 64,\n"
         "    \"tile_size\": " + std::to_string(options.tile_size) + ",\n"

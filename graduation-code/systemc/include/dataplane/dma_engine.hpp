@@ -7,6 +7,7 @@
 #include "command_codec.hpp"
 #include "dataplane/buffer_manager.hpp"
 #include "dataplane/memory_service.hpp"
+#include "dataplane/on_chip_arbiter.hpp"
 #include "dataplane/region_view.hpp"
 #include "dataplane/trace.hpp"
 
@@ -103,7 +104,16 @@ public:
     // Routed by DataPlane from MemoryService responses.
     void deliver_memory_response(const MemoryResponse& response);
 
+    // Optional unified on-chip bandwidth arbitration (nullptr = legacy T04
+    // standalone behaviour with no budget gating).
+    void set_on_chip_arbiter(OnChipArbiter* arbiter) { arbiter_ = arbiter; }
+
     void reset();
+
+    // On-chip scratchpad traffic actually moved by this engine (test/diagnostic
+    // instrumentation; one increment per accepted lease access).
+    std::uint64_t scratch_read_bytes() const { return scratch_read_bytes_; }
+    std::uint64_t scratch_write_bytes() const { return scratch_write_bytes_; }
 
     bool busy() const;
     std::uint64_t accepted_count() const { return accepted_count_; }
@@ -143,6 +153,7 @@ private:
     void flush_trace_row();
 
     DmaConfig config_;
+    OnChipArbiter* arbiter_{nullptr};
     MemoryService& memory_;
     BufferManager& buffers_;
     TraceRecorder* trace_{nullptr};
@@ -174,6 +185,16 @@ private:
     std::uint64_t pending_memory_id_{0};
     MemoryResponse pending_memory_response_;
     std::vector<std::uint8_t> beat_buffer_data_;
+    // On-chip budget progress inside one beat: when the per-cycle grant is
+    // smaller than the beat, the beat is split into segments across cycles
+    // (progress preserved, no replayed access).
+    std::uint32_t beat_read_progress_{0};
+    std::uint32_t beat_write_progress_{0};
+    // Staging lifecycle: initialized once when a new beat starts; preserved
+    // across budget waits and DDR backpressure retries.
+    bool beat_staged_{false};
+    std::uint64_t scratch_read_bytes_{0};
+    std::uint64_t scratch_write_bytes_{0};
 
     std::uint64_t memory_wait_cycles_{0};
     std::uint64_t buffer_wait_cycles_{0};

@@ -28,6 +28,7 @@
 #include "controlplane/exec_types.hpp"
 #include "dataplane/buffer_manager.hpp"
 #include "dataplane/memory_service.hpp"
+#include "dataplane/on_chip_arbiter.hpp"
 #include "panel_lu/panel_engine.hpp"
 
 namespace hw::controlplane {
@@ -51,6 +52,64 @@ public:
 
 private:
     std::uint32_t unit_id_{0};
+    std::uint64_t adapter_key_{0};
+    hw::panel_lu::PanelEngine* engine_{nullptr};
+    std::optional<ExecResponse> immediate_;
+    std::uint32_t accepted_count_{0};
+};
+
+// Top-level TRSM adapter over the same shared engine (one group per command).
+class TrsmExecutionUnit : public IExecutionUnit {
+public:
+    TrsmExecutionUnit(std::uint32_t unit_id, hw::panel_lu::PanelEngine* engine);
+
+    UnitKind kind() const override { return UnitKind::Trsm; }
+    std::uint32_t unit_id() const override { return unit_id_; }
+
+    bool submit(const ExecRequest& request, std::uint64_t cycle) override;
+    void tick(std::uint64_t cycle) override;  // no-op: device ticks the engine
+    bool poll_response(ExecResponse& response) override;
+    bool busy() const override;
+    void abort_txn(std::uint64_t txn_id, std::uint64_t cycle) override;
+    void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
+    void reset() override;
+
+    std::uint32_t accepted_count() const { return accepted_count_; }
+
+private:
+    std::uint32_t unit_id_{0};
+    std::uint64_t adapter_key_{0};
+    hw::panel_lu::PanelEngine* engine_{nullptr};
+    std::optional<ExecResponse> immediate_;
+    std::uint32_t accepted_count_{0};
+};
+
+// T10 top-level GEMM_SCHUR adapter over the same shared engine. It validates
+// the KERNEL_DESC shape (M/N/K = u/u/p), the fixed tile, the operand identity
+// and the backend/SCALE_DESC combination before a context is established:
+//   FP32 backend  -> scale_desc_id MUST be NONE,
+//   INT32 backend -> a valid SCALE_DESC policy is REQUIRED (already decoded
+//                    and validated by the runtime DescriptorReader).
+class GemmExecutionUnit : public IExecutionUnit {
+public:
+    GemmExecutionUnit(std::uint32_t unit_id, hw::panel_lu::PanelEngine* engine);
+
+    UnitKind kind() const override { return UnitKind::Gemm; }
+    std::uint32_t unit_id() const override { return unit_id_; }
+
+    bool submit(const ExecRequest& request, std::uint64_t cycle) override;
+    void tick(std::uint64_t cycle) override;  // no-op: device ticks the engine
+    bool poll_response(ExecResponse& response) override;
+    bool busy() const override;
+    void abort_txn(std::uint64_t txn_id, std::uint64_t cycle) override;
+    void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
+    void reset() override;
+
+    std::uint32_t accepted_count() const { return accepted_count_; }
+
+private:
+    std::uint32_t unit_id_{0};
+    std::uint64_t adapter_key_{0};
     hw::panel_lu::PanelEngine* engine_{nullptr};
     std::optional<ExecResponse> immediate_;
     std::uint32_t accepted_count_{0};
@@ -62,6 +121,12 @@ public:
         std::uint32_t unit_id,
         hw::dataplane::BufferManager* buffers,
         hw::dataplane::MemoryService* memory);
+
+    // Unified on-chip read budget for packed-front staging (required for the
+    // real integrated path; nullptr keeps the legacy standalone behaviour).
+    void set_on_chip_arbiter(hw::dataplane::OnChipArbiter* arbiter) {
+        arbiter_ = arbiter;
+    }
 
     UnitKind kind() const override { return UnitKind::Factor; }
     std::uint32_t unit_id() const override { return unit_id_; }
@@ -87,7 +152,10 @@ private:
         Backpressure,
         Error,
     };
-    SubmitOutcome submit_next_chunk(std::uint64_t cycle, std::string* reason);
+    // Full L/U save: stage one packed front row under the unified read budget,
+    // then emit the L row (n x p, L11 unit-lower + L21 raw) and, for r < p,
+    // the U row (p x n, U11 upper + U12 raw) as bounded MemoryService writes.
+    SubmitOutcome stage_row(std::uint64_t cycle, std::string* reason);
     void finish_terminal(hw::command::StatusCode status, const std::string& reason,
                          std::uint64_t cycle);
 
@@ -97,9 +165,12 @@ private:
 
     std::optional<ExecRequest> active_;
     std::optional<ExecResponse> response_;
-    std::uint32_t row_{0};
+    std::uint32_t row_{0};          // current front row 0..total_dim-1
+    std::uint32_t row_read_bytes_{0};
     bool l_submitted_{false};
     bool u_submitted_{false};
+    std::vector<std::uint8_t> front_row_;  // staged packed front row
+    hw::dataplane::OnChipArbiter* arbiter_{nullptr};
     // Precise response routing: only ids in this set belong to the active
     // transaction; unknown/late responses are ignored.
     std::set<std::uint64_t> pending_ids_;

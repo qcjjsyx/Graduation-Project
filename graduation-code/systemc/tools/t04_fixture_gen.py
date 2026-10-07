@@ -27,6 +27,7 @@ if str(SOFTWARE_DIR) not in sys.path:
 from src.config import (  # noqa: E402
     CommandCompilerConfig,
     EquilibrationConfig,
+    GemmConfig,
     MatchingConfig,
     MatrixInputConfig,
     OrderingConfig,
@@ -81,6 +82,7 @@ def build_case(
     pivot_threshold: float = 0.0,
     max_front_size: int = 256,
     tile_size: int = 16,
+    gemm: GemmConfig | None = None,
 ) -> dict:
     staging = out_root / "_staging" / name
     device = out_root / name / "device"
@@ -99,6 +101,7 @@ def build_case(
             equilibration=EquilibrationConfig(mode="pow2-row", max_scale_exponent=60),
             matching=MatchingConfig(method="weighted_matching"),
             pivot=PivotPolicyConfig(policy=pivot_policy, threshold_ratio=pivot_threshold),
+            gemm=gemm or GemmConfig(),
             command=CommandCompilerConfig(
                 tile_size=tile_size,
                 max_front_size=max_front_size,
@@ -128,6 +131,8 @@ def build_case(
         "command_count": outputs.command_count,
         "descriptor_count": outputs.descriptor_count,
         "image_bytes": (device / "memory_image.bin").stat().st_size,
+        "gemm_backend": manifest["gemm"]["backend"],
+        "gemm_storage_format": manifest["gemm"]["storage_format"],
         "rhs_source": manifest["verification"]["rhs_source"],
         "host_reference_performed": manifest["verification"]["host_reference"]["performed"],
     }

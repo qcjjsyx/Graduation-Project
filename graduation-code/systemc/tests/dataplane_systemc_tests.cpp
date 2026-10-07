@@ -328,6 +328,7 @@ private:
     }
 
     void run() {
+        test_dma_on_chip_budget_segmented_staging();
         test_contiguous_and_timing();
         test_2d_strides_and_tail();
         test_bit_patterns_preserved();
@@ -346,6 +347,87 @@ private:
 
         std::cout << checks_ << " checks, " << failures_ << " failures\n";
         sc_core::sc_stop();
+    }
+
+
+    // Regression: BufferToMemory beats are staged exactly once under the
+    // unified read budget. Budget waits and DDR backpressure retries must not
+    // re-read staged bytes or re-zero the staging buffer.
+    void test_dma_on_chip_budget_segmented_staging() {
+        auto artifact = make_artifact();
+        const auto front = region_view(artifact.config, "node.0.front");
+        const auto update = region_view(artifact.config, "node.0.update");
+        const std::vector<std::uint8_t> source = pattern(64, 11);
+        artifact.image.assign(kTotalBytes, 0);
+        std::copy(source.begin(), source.end(), artifact.image.begin() + front.base_addr);
+
+        dp::DataPlaneConfig config = make_config();
+        config.dma.beat_bytes = 16;     // 16B beats: 4 beats over 64B
+        config.memory.max_inflight = 1;  // tight DDR queue -> submit retries
+        dp::DataPlane plane(std::move(artifact), config);
+
+        dp::OnChipArbiter arbiter;
+        arbiter.configure(16, 16);  // 16B/cycle read budget -> 4 grants/64B
+        plane.set_on_chip_arbiter(&arbiter);
+
+
+        auto buffer = plane.buffers().allocate("dma", 64, plane.cycle());
+        check(buffer.ok, "dma budget: buffer allocated");
+        dp::DmaRequest load;
+        load.request_id = 71;
+        load.direction = dp::DmaDirection::MemoryToBuffer;
+        load.ddr_region = front;
+        load.rows = 2;
+        load.cols = 8;
+        load.element_bytes = 4;
+        load.buffer = buffer.handle;
+        dp::DmaResponse response;
+        check(run_dma(plane, load, response), "dma budget: load completes");
+        check(response.status == cmd::StatusCode::Ok, "dma budget: load status");
+
+        // Occupy the single DDR queue slot with a longer transaction so the
+        // writeback's DDR submit retries while the beat is staged.
+        dp::MemoryRequest blocker;
+        blocker.request_id = 900;
+        blocker.client = dp::MemoryClient::Test;
+        blocker.write = false;
+        blocker.address = front.base_addr;
+        blocker.length = 256;
+        blocker.kind = dp::AccessKind::Fp32Data;
+        check(
+            plane.memory_service().submit(blocker, plane.cycle()),
+            "dma budget: DDR blocker accepted");
+        const std::uint64_t access_before =
+            plane.buffers().total_lease_access_bytes();
+        dp::DmaRequest writeback = load;
+        writeback.request_id = 72;
+        writeback.direction = dp::DmaDirection::BufferToMemory;
+        writeback.ddr_region = update;
+        check(run_dma(plane, writeback, response), "dma budget: writeback completes");
+        const std::uint64_t writeback_access =
+            plane.buffers().total_lease_access_bytes() - access_before;
+        check(response.status == cmd::StatusCode::Ok, "dma budget: writeback status");
+
+        check(
+            plane.dma().scratch_read_bytes() == 64,
+            "dma budget: exactly one 64B scratch read (no beat re-read)");
+        check(
+            writeback_access == 64,
+            "dma budget: lease accounting shows exactly one 64B read");
+        const auto& read_stats =
+            arbiter.stats(dp::OnChipDomain::Read, dp::OnChipClientKind::Dma, 0);
+        check(read_stats.bytes == 64, "dma budget: all reads charged to the budget");
+        check(
+            plane.dma().scratch_read_bytes() == read_stats.bytes,
+            "dma budget: total scratch reads equal budgeted reads");
+        check(read_stats.grants == 4, "dma budget: 16B budget -> four grants");
+        check(
+            arbiter.grants(dp::OnChipDomain::Read) <= plane.cycle(),
+            "dma budget: at most one read grant per cycle");
+        std::vector<std::uint8_t> written;
+        plane.memory().read(
+            update.base_addr, 64, dp::AccessKind::Fp32Data, written);
+        check(written == source, "dma budget: staged bytes written exactly once");
     }
 
     void test_contiguous_and_timing() {
@@ -784,8 +866,8 @@ private:
         load.request_id = 71;
         load.direction = dp::DmaDirection::MemoryToBuffer;
         load.ddr_region = front;
-        load.rows = 1;
-        load.cols = 16;
+        load.rows = 2;
+        load.cols = 8;
         load.element_bytes = 4;
         load.buffer = buffer.handle;
         start_dma(plane, load);

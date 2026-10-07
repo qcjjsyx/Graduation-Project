@@ -146,13 +146,35 @@ void TileDispatcher::tick(std::uint64_t cycle) {
     queue_.swap(remaining);
 }
 
+void TileDispatcher::set_group_ranges(
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& ranges) {
+    group_ranges_ = ranges;
+}
+
 bool TileDispatcher::dispatch_one(Queued& item, std::uint64_t cycle) {
     if (pes_ == nullptr || pes_->empty()) {
         return false;
     }
-    // Round-robin PE selection: deterministic and no PE preference by mode.
-    for (std::size_t attempt = 0; attempt < pes_->size(); ++attempt) {
-        const std::size_t pe_index = (pe_cursor_ + attempt) % pes_->size();
+    // The task may only use PEs of its own compute group.
+    std::uint32_t first_pe = 0;
+    std::uint32_t pe_span = static_cast<std::uint32_t>(pes_->size());
+    if (!group_ranges_.empty()) {
+        if (item.task.group_id >= group_ranges_.size()) {
+            return false;
+        }
+        first_pe = group_ranges_[item.task.group_id].first;
+        pe_span = group_ranges_[item.task.group_id].second;
+    }
+    if (pe_span == 0 || first_pe >= pes_->size()) {
+        return false;
+    }
+    pe_span = std::min<std::uint32_t>(
+        pe_span, static_cast<std::uint32_t>(pes_->size()) - first_pe);
+    // Round-robin PE selection inside the group: deterministic and no PE
+    // preference by mode.
+    for (std::uint32_t attempt = 0; attempt < pe_span; ++attempt) {
+        const std::size_t pe_index =
+            first_pe + (pe_cursor_ + attempt) % pe_span;
         MultiModePe& pe = (*pes_)[pe_index];
         if (!pe.has_free_slot()) {
             continue;
@@ -168,7 +190,7 @@ bool TileDispatcher::dispatch_one(Queued& item, std::uint64_t cycle) {
         uncommitted_writers_[item.task.dst.version_key].insert(item.task.task_id);
         known_.erase(item.task.task_id);
         ++dispatched_;
-        pe_cursor_ = (pe_index + 1) % pes_->size();
+        pe_cursor_ = (pe_index + 1 - first_pe) % pe_span;
         return true;
     }
     return false;
