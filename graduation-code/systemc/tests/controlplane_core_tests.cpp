@@ -277,6 +277,26 @@ void test_stub_unit() {
     unit.abort_epoch(0, 9);
     unit.tick(11);
     expect(!unit.poll_response(response), "stub: aborted txn leaves no response");
+
+    // B01 regression: abort_txn must not delete a pending terminal either. A
+    // response held for backpressure (or already finished) is converted in
+    // place into the same txn's ABORTED terminal and consumed exactly once.
+    request.txn_id = 10;
+    request.command_id = 6;
+    expect(unit.submit(request, 12), "stub: txn for pending-terminal abort");
+    unit.tick(14);  // execution done; the response is held for backpressure
+    expect(!unit.poll_response(response), "stub: response held before the abort");
+    unit.abort_txn(10, 15);
+    expect(unit.poll_response(response), "stub: abort keeps the pending terminal");
+    expect(response.status == cmd::StatusCode::Aborted && response.txn_id == 10 &&
+               response.command_id == 6,
+           "stub: pending terminal becomes ABORTED with identity");
+    expect(!unit.poll_response(response), "stub: terminal consumed exactly once");
+    expect(!unit.busy(), "stub: unit idle after the terminal");
+    unit.abort_txn(10, 16);
+    expect(!unit.poll_response(response), "stub: repeated abort is idempotent");
+    unit.abort_txn(11, 16);
+    expect(!unit.poll_response(response), "stub: abort of a foreign txn is a no-op");
 }
 
 void test_fetch_faults() {

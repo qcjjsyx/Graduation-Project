@@ -2104,6 +2104,88 @@ void test_foreign_front_reference() {
         "foreign: no engine context/group was consumed");
 }
 
+// B01 regression (adapter level): the immediate terminal of an accepted GEMM
+// request survives abort_txn. See the TRSM variant for the shared contract.
+void test_immediate_terminal_survives_abort() {
+    const std::uint32_t n = 4;
+    const std::uint32_t p = 2;
+    pl::PanelLuConfig config = base_panel_config(1, 1);
+    pl::PanelEngine engine(config);
+    expect(engine.configure().ok, "gemm immediate abort: engine configured");
+    cp::GemmExecutionUnit unit(0, &engine);
+
+    const auto make_request = [&]() {
+        cp::ExecRequest request;
+        request.txn_id = 31;
+        request.command_id = 1;
+        request.node_id = 0;
+        request.opcode = cmd::Opcode::GemmSchur;
+        request.unit_id = 0;
+        request.total_dim = n;
+        request.front.pivot_dim = p;
+        request.front.front.descriptor_id = 5;
+        request.front.front.base_addr = 0x1000;
+        request.front.front.byte_size = 64;
+        request.kernel.a = request.front.front;
+        request.kernel.b = request.front.front;
+        request.kernel.c = request.front.front;
+        request.kernel.m = n - p;
+        request.kernel.n = n - p;
+        request.kernel.k = p;
+        request.kernel.tile_size = 16;
+        request.kernel.backend = cmd::KernelBackend::SystemCFp32DeviceModel;
+        request.front_slot.slot = 0;
+        return request;
+    };
+
+    // Case 1: an abort of a different txn leaves the pending terminal intact.
+    {
+        cp::ExecRequest request = make_request();
+        request.command_id = 2;
+        request.kernel.m = 3;  // shape error: u/u/p violated
+        expect(unit.submit(request, 10), "gemm immediate abort: shape refusal accepted");
+        unit.abort_txn(request.txn_id + 100, 11);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "gemm immediate abort: unrelated abort keeps the terminal");
+        expect(response.status == StatusCode::BadDescriptor,
+               "gemm immediate abort: unrelated abort does not rewrite the status");
+        expect(response.txn_id == request.txn_id &&
+                   response.command_id == request.command_id,
+               "gemm immediate abort: terminal keeps identity");
+        expect(!unit.poll_response(response), "gemm immediate abort: one terminal only");
+    }
+
+    // Case 2: abort of the same txn converts the pending terminal to ABORTED.
+    {
+        cp::ExecRequest request = make_request();
+        request.txn_id = 32;
+        request.command_id = 3;
+        request.kernel.a.descriptor_id = 99;  // foreign KERNEL operand
+        expect(unit.submit(request, 20), "gemm immediate abort: operand refusal accepted");
+        expect(unit.busy(), "gemm immediate abort: unit busy while the terminal is pending");
+        unit.abort_txn(request.txn_id, 21);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "gemm immediate abort: exactly one terminal survives the abort");
+        expect(response.status == StatusCode::Aborted,
+               "gemm immediate abort: pending terminal becomes ABORTED");
+        expect(response.txn_id == request.txn_id &&
+                   response.command_id == request.command_id &&
+                   response.node_id == request.node_id &&
+                   response.unit_id == unit.unit_id(),
+               "gemm immediate abort: terminal keeps txn/command/node identity");
+        expect(!unit.poll_response(response),
+               "gemm immediate abort: terminal is consumed exactly once");
+        expect(!unit.busy(), "gemm immediate abort: unit is idle after the terminal");
+        unit.abort_txn(request.txn_id, 22);
+        expect(!unit.poll_response(response),
+               "gemm immediate abort: repeated abort is idempotent");
+    }
+    expect(!engine.group_busy(0),
+           "gemm immediate abort: refused requests never consumed an engine group");
+}
+
 // ---------------------------------------------------------------------------
 // F. STATIC pivot propagation from the device-generated update
 // ---------------------------------------------------------------------------
@@ -2476,6 +2558,7 @@ int main(int argc, char** argv) {
     test_artifact_fp32_pipeline();
     test_artifact_int32_pipeline();
     test_foreign_front_reference();
+    test_immediate_terminal_survives_abort();
     test_static_pivot_propagation();
     if (!cross_language_dir.empty()) {
         test_cross_language_int32_artifact(cross_language_dir);

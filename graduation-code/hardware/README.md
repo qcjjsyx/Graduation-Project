@@ -1,6 +1,6 @@
 # RTL 硬件模块说明
 
-状态：当前主线说明
+状态：当前主线说明（2026-10-07 按实际实现同步；区分当前能力与后续接口目标）
 
 硬件目录保存关键模块的 SystemVerilog 原型。当前项目不以完整流片级硬件为目标，而是以“SystemC 全系统架构模型 + 关键 RTL 模块”为交付边界。
 
@@ -8,7 +8,7 @@
 
 | 模块 | 主要职责 | 当前定位 |
 |---|---|---|
-| `GCU/` | command fetch、依赖 token、资源和完成控制 | 优先完成 RTL 原型 |
+| `GCU/` | 旧 task 取指、child 计数、buffer 与 micro-scheduler 原型 | `gcu_top` 空壳；尚未实现 schema v2 command/token/completion 闭环 |
 | `ATU/` | logical row 到 physical row 的 P-vector 映射和 swap | RTL 原型 |
 | `HPU/` | pivot candidate 接收、最大绝对值归约和 tie-break | RTL 原型 |
 | `QAU/` | 精度适配或量化边界的候选模块 | 重新定义，不再默认承担全局 front BFP 装配 |
@@ -17,17 +17,21 @@
 ## 2. 与 SystemC 的关系
 
 ```text
-SystemC
-  ├─ 完整 GCU/Buffer/Assembly/Panel-LU/TRSM/GEMM/Solve 模型
-  ├─ FP32/FP64 浮点主设备路径
-  └─ Int32GemmBehavioral
+当前 SystemC/C++ 设备
+  ├─ CommandDevice / DataPlane / 真实 Assembly / Panel-LU / TRSM / GEMM
+  ├─ FP32_SYSTEMC 或 FP32_SYSTEMC_INT32_GEMM
+  └─ L/U/P/update 写回；真实 Solve 尚未接入（T12）
 
-RTL
-  ├─ GCU/HPU/ATU/片上存储接口原型
-  └─ 未来可选 Int32GemmRtlWrapper
+独立 FP64 reference / checker
+  └─ 分解、参考 solve 与设备输出检查，不向设备注入黄金数据
+
+当前 RTL
+  └─ GCU/HPU/ATU 独立原型，未接入 schema v2 全链
+后续目标
+  └─ 契约统一、RTL 联调及可选 INT32 GEMM RTL 替换
 ```
 
-RTL 不需要与 SystemC 共享实现代码，但必须共享：
+以下是后续 RTL 接入 SystemC 设备契约时必须对齐的要求，当前旧 GCU 原型尚未全部满足：
 
 - command schema；
 - descriptor 语义；
@@ -38,7 +42,10 @@ RTL 不需要与 SystemC 共享实现代码，但必须共享：
 
 ## 3. INT32 GEMM 处理原则
 
-当前没有 INT32 GEMM RTL。SystemC 先实现 `Int32GemmBehavioral`，模拟：
+当前没有 INT32 GEMM RTL。T10 的局部 INT32 行为计算已由
+[`precision_adapter.cpp`](../systemc/src/panel_lu/precision_adapter.cpp) 实现，
+`MultiModePe` 调用 `run_int32_gemm_update`。`PrecisionAdapter` / `Int32GemmBehavioral`
+是设计职责名称，不是现存同名 C++ 类。仅顶层 `GEMM_SCHUR` 使用该路径：
 
 ```text
 FP tile → quantize → INT32 multiply/accumulate → dequantize → FP tile
@@ -57,11 +64,18 @@ GCU 的长期输入是 command ring 和 descriptor table，而不是软件内部
 - 产生 completion 和 error；
 - 记录 cycle、bytes、stall、pivot 和 retry。
 
-当前 `gcu_top.sv` 和部分 micro-scheduler 仍是原型或占位逻辑，不能在文档中表述为完整设备。
+当前代码事实：
+
+- [`gcu_top.sv`](GCU/gcu_top.sv) 只有 clk/rstn 端口，无执行逻辑。
+- [`gcu_task_fetch.sv`](GCU/gcu_task_fetch.sv) 默认读取 128bit/16B 旧 task，不是 32B schema v2 Command。
+- [`gcu_dep_scoreboard.sv`](GCU/gcu_dep_scoreboard.sv) 维护 child 计数，不是控制面 TokenScoreboard。
+- [`gcu_micro_scheduler.sv`](GCU/gcu_micro_scheduler.sv) 默认 TILE_SIZE=32，F12/F21/Schur 阶段仍占位；不能当作主线 16×16 PE 调度器。
+
+因此这里的 GCU 是独立 RTL 原型，不能视为 `CommandDevice` 的已完成 RTL 对应实现。
 
 ## 5. HPU
 
-首版只实现确定性的最大绝对值归约：
+以下为 HPU 首版的目标契约；现有比较树/top 为独立原型，尚未接入主线动态执行：
 
 - 输入 `(value, logical_row, valid)`；
 - 支持 last 或显式 candidate count；
@@ -69,7 +83,7 @@ GCU 的长期输入是 command ring 和 descriptor table，而不是软件内部
 - 输出 pivot row、pivot value、valid 和 failure；
 - 支持 backpressure、reset 和空候选测试。
 
-CALU、threshold、rook 和复杂 tournament 不作为首版必需模式。
+当前比较节点相等时选输入 a；top 的重复输出握手缺陷 B02 尚未修复，不能把背压等目标要求视为已完整验证。证据见[当前审查报告](../../docs/当前实现审查与验证报告.md)。CALU、threshold、rook 和复杂 tournament 不作为首版必需模式。
 
 ## 6. ATU
 
@@ -80,6 +94,8 @@ logical_row → physical_row
 ```
 
 pivot swap 只修改映射，不搬移整个 front。Panel、TRSM 和写回必须使用同一映射语义。当前最大 front/pivot 的位宽必须由 descriptor/config 显式限制，不能由不同 RTL 文件各自硬编码。
+
+当前 ATU 是独立原型，尚未接入动态整树；cfg/pivot 同拍接受后丢 cfg 写的 B03 尚未修复，见[审查报告](../../docs/当前实现审查与验证报告.md)。
 
 ## 7. QAU / Precision Adapter
 

@@ -183,10 +183,17 @@ bool TestStubUnit::poll_response(ExecResponse& response) {
 
 void TestStubUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     // Contract: exactly one terminal response per accepted transaction. A
-    // dropped success response is replaced by an explicit ABORTED terminal.
+    // pending response is never deleted (the transaction may have finished, or
+    // be held for response backpressure, when the abort lands): it is
+    // converted in place into the explicit ABORTED terminal of the same
+    // transaction and taken immediately by the consumer.
     if (response_.has_value() && response_->txn_id == txn_id) {
-        response_.reset();
-        response_visible_ = false;
+        response_->status = cmd::StatusCode::Aborted;
+        response_->reason = "transaction aborted before response consumption";
+        response_->needs_pvector_write = false;
+        response_ready_cycle_ = cycle;
+        response_visible_ = true;
+        return;
     }
     if (!active_.has_value() || active_->txn_id != txn_id) {
         return;

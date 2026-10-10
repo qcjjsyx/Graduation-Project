@@ -6,6 +6,13 @@ PrecisionAdapter、INT32 GEMM 行为模型、SCALE_DESC 运行时读取、控制
 [T11 集成设计](T11_真实装配与树形分解集成.md)。树形 solve（T12）、
 DYNAMIC_PANEL、INT32 RTL、FP8 与全局 BFP 仍属后续任务。
 
+实现名称核对（2026-10-07）：本文的 `PrecisionAdapter` 和 `Int32GemmBehavioral`
+表示职责，不是现存同名类。实际接口位于
+[`precision_adapter.hpp`](../../graduation-code/systemc/include/panel_lu/precision_adapter.hpp)，
+算法位于 [`precision_adapter.cpp`](../../graduation-code/systemc/src/panel_lu/precision_adapter.cpp)；
+[`MultiModePe`](../../graduation-code/systemc/src/panel_lu/pe_model.cpp) 调用
+`run_int32_gemm_update`，并由共享 engine/dispatcher 管理时序及写回。
+
 本文是 T10 的设计与实现权威，按“架构与交互 → 数据/接口契约 → 实现机制与
 时序 → 数值策略 → 失败/abort/reset → 验收与边界”组织。
 

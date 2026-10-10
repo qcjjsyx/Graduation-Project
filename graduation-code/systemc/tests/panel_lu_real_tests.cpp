@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "controlplane/control_plane.hpp"
+#include "controlplane/panel_exec_unit.hpp"
 #include "control_test_artifact.hpp"
+#include "dataplane/device_memory.hpp"
 #include "fp64_reference.hpp"
 
 namespace {
@@ -33,6 +35,7 @@ namespace {
 namespace cmd = hw::command;
 namespace cp = hw::controlplane;
 namespace dp = hw::dataplane;
+namespace pl = hw::panel_lu;
 namespace testing = hw::testing;
 namespace ref = hw::reference_fp64;
 
@@ -1372,6 +1375,132 @@ void test_engine_capability_refusals() {
     }
 }
 
+// B01 regression (adapter level): a pending terminal response of the Panel and
+// Factor adapters survives abort_txn. Shared contract with the TRSM/GEMM
+// variants: every accepted request has exactly one consumable terminal; an
+// abort converts it into the same txn's ABORTED terminal (identity preserved)
+// instead of deleting it, and is idempotent afterwards.
+void test_immediate_terminal_survives_abort() {
+    // --- PanelExecutionUnit: an engine refusal is an immediate terminal. ---
+    pl::PanelLuConfig panel_config;
+    panel_config.compute_group_count = 1;
+    panel_config.pes_per_group = 1;
+    panel_config.pe_count = 1;
+    pl::PanelEngine engine(panel_config);
+    expect(engine.configure().ok, "panel immediate abort: engine configured");
+    cp::PanelExecutionUnit unit(0, &engine);
+
+    const auto make_panel_request = [](std::uint64_t txn, std::uint32_t command) {
+        cp::ExecRequest request;
+        request.txn_id = txn;
+        request.epoch = 2;
+        request.command_id = command;
+        request.node_id = 3;
+        request.opcode = cmd::Opcode::PanelLu;
+        request.unit_id = 0;
+        request.total_dim = 16;
+        request.front.pivot_dim = 16;
+        request.front.tile_size = 16;
+        request.policy = cmd::PivotPolicy::DynamicPanel;  // STATIC engine refuses
+        return request;
+    };
+    {
+        cp::ExecRequest request = make_panel_request(41, 6);
+        expect(unit.submit(request, 10), "panel immediate abort: refusal accepted");
+        unit.abort_txn(request.txn_id + 100, 11);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "panel immediate abort: unrelated abort keeps the terminal");
+        expect(response.status == cmd::StatusCode::PolicyNotSupported,
+               "panel immediate abort: unrelated abort keeps the status");
+        expect(!unit.poll_response(response), "panel immediate abort: one terminal only");
+    }
+    {
+        cp::ExecRequest request = make_panel_request(42, 7);
+        expect(unit.submit(request, 20), "panel immediate abort: second refusal accepted");
+        expect(unit.busy(), "panel immediate abort: unit busy while terminal pending");
+        unit.abort_txn(request.txn_id, 21);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "panel immediate abort: exactly one terminal survives the abort");
+        expect(response.status == cmd::StatusCode::Aborted,
+               "panel immediate abort: pending terminal becomes ABORTED");
+        expect(response.txn_id == request.txn_id &&
+                   response.command_id == request.command_id &&
+                   response.node_id == request.node_id &&
+                   response.epoch == request.epoch &&
+                   response.unit_id == unit.unit_id(),
+               "panel immediate abort: terminal keeps txn/command/node/epoch identity");
+        expect(!unit.poll_response(response) && !unit.busy(),
+               "panel immediate abort: consumed exactly once and unit idle");
+        unit.abort_txn(request.txn_id, 22);
+        expect(!unit.poll_response(response),
+               "panel immediate abort: repeated abort is idempotent");
+    }
+    expect(!engine.group_busy(0),
+           "panel immediate abort: refused requests never consumed an engine group");
+
+    // --- FactorStoreUnit: submit refusal terminal. ---
+    {
+        cp::FactorStoreUnit factor(0, nullptr, nullptr);
+        cp::ExecRequest request;
+        request.txn_id = 51;
+        request.command_id = 8;
+        request.node_id = 3;
+        request.opcode = cmd::Opcode::StoreFactor;
+        request.unit_id = 0;
+        request.has_front_lease = false;  // refusal: no authorized front lease
+        expect(factor.submit(request, 30), "factor immediate abort: refusal accepted");
+        factor.abort_txn(request.txn_id + 100, 31);
+        cp::ExecResponse response;
+        expect(factor.poll_response(response),
+               "factor immediate abort: unrelated abort keeps the terminal");
+        expect(response.status == cmd::StatusCode::BadDescriptor,
+               "factor immediate abort: unrelated abort keeps the status");
+        expect(!factor.poll_response(response) && !factor.busy(),
+               "factor immediate abort: one terminal only and unit idle");
+    }
+
+    // --- FactorStoreUnit: a terminal produced by real unit work is not
+    // deleted when the abort lands before the consumer polls it. ---
+    {
+        dp::BufferManager buffers(dp::BufferConfig{2, 64 * 1024, 2, 1});
+        dp::DeviceMemory memory;
+        dp::MemoryService service(memory, dp::MemoryServiceConfig{});
+        cp::FactorStoreUnit factor(1, &buffers, &service);
+        cp::ExecRequest request;
+        request.txn_id = 52;
+        request.command_id = 9;
+        request.node_id = 3;
+        request.opcode = cmd::Opcode::StoreFactor;
+        request.unit_id = 1;
+        request.total_dim = 2;
+        request.factor.pivot_dim = 1;
+        request.factor.l.rows = 2;
+        request.factor.l.cols = 1;
+        request.factor.u.rows = 1;
+        request.factor.u.cols = 2;
+        request.has_front_lease = true;
+        request.front_lease.lease_id = 0xDEAD;  // stale lease: the row read fails
+        expect(factor.submit(request, 40), "factor terminal abort: accepted");
+        factor.tick(41);              // produces the terminal response
+        factor.abort_txn(request.txn_id, 42);  // abort before consumption
+        cp::ExecResponse response;
+        expect(factor.poll_response(response),
+               "factor terminal abort: exactly one terminal survives the abort");
+        expect(response.status == cmd::StatusCode::Aborted,
+               "factor terminal abort: produced terminal becomes ABORTED");
+        expect(response.txn_id == request.txn_id &&
+                   response.command_id == request.command_id,
+               "factor terminal abort: terminal keeps identity");
+        expect(!factor.poll_response(response) && !factor.busy(),
+               "factor terminal abort: consumed exactly once and unit idle");
+        factor.abort_txn(request.txn_id, 43);
+        expect(!factor.poll_response(response),
+               "factor terminal abort: repeated abort is idempotent");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1401,6 +1530,8 @@ int main(int argc, char** argv) {
          test_fp64_diagnostic_rounding_failed_column},
         {"test_factor_abort_reuse_clears_partial_row",
          test_factor_abort_reuse_clears_partial_row},
+        {"test_immediate_terminal_survives_abort",
+         test_immediate_terminal_survives_abort},
     };
     for (const auto& [name, function] : tests) {
         try {

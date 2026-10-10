@@ -24,6 +24,39 @@ namespace {
 constexpr std::uint32_t kEngineKindPanel = 1;
 constexpr std::uint32_t kEngineKindTrsm = 2;
 constexpr std::uint32_t kEngineKindGemm = 3;
+
+// Accepted -> exactly one consumable terminal response (IExecutionUnit
+// contract). A directed abort must never DELETE a terminal the consumer has
+// not taken yet: the request never entered the engine (or is already finished),
+// so no replacement response can ever appear and the device would wait for it
+// forever. The pending response is converted in place into the ABORTED
+// terminal of the SAME transaction, keeping identity and statistics. This is
+// the same terminal semantics as AssemblyExecutionUnit::abort_txn and the one
+// the device applies to aborted transactions.
+void abort_pending_terminal(ExecResponse& response) {
+    response.status = cmd::StatusCode::Aborted;
+    response.reason = "transaction aborted before response consumption";
+    response.needs_pvector_write = false;
+}
+
+// Diagnostics: the accepted-but-not-yet-consumed transaction of an adapter.
+void note_inflight(
+    std::uint32_t& command_slot,
+    std::uint64_t& txn_slot,
+    const ExecRequest& request) {
+    command_slot = request.command_id;
+    txn_slot = request.txn_id;
+}
+
+void clear_inflight(
+    std::uint32_t& command_slot,
+    std::uint64_t& txn_slot,
+    std::uint64_t txn_id) {
+    if (txn_slot != 0 && txn_slot == txn_id) {
+        command_slot = hw::command::NONE;
+        txn_slot = 0;
+    }
+}
 }  // namespace
 
 PanelExecutionUnit::PanelExecutionUnit(
@@ -58,6 +91,7 @@ bool PanelExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle)
     const hw::panel_lu::ConfigCheck check =
         engine_->begin_command(engine_request, adapter_key_, cycle);
     if (check.ok) {
+        note_inflight(active_command_id_, active_txn_id_, request);
         ++accepted_count_;
         return true;
     }
@@ -78,6 +112,7 @@ bool PanelExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle)
     failure.start_cycle = cycle;
     failure.finish_cycle = cycle;
     immediate_ = failure;
+    note_inflight(active_command_id_, active_txn_id_, request);
     ++accepted_count_;
     return true;
 }
@@ -91,6 +126,7 @@ bool PanelExecutionUnit::poll_response(ExecResponse& response) {
     if (immediate_.has_value()) {
         response = *immediate_;
         immediate_.reset();
+        clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
         return true;
     }
     if (engine_ == nullptr) {
@@ -117,6 +153,7 @@ bool PanelExecutionUnit::poll_response(ExecResponse& response) {
     response.pvector_dim = engine_response.pvector_dim;
     response.front_scale = engine_response.front_scale;
     response.threshold_product = engine_response.threshold_product;
+    clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
     return true;
 }
 
@@ -129,7 +166,9 @@ bool PanelExecutionUnit::busy() const {
 
 void PanelExecutionUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     if (immediate_.has_value() && immediate_->txn_id == txn_id) {
-        immediate_.reset();
+        // Never delete the unconsumed terminal: it becomes the ABORTED
+        // terminal of the same transaction (exactly one response survives).
+        abort_pending_terminal(*immediate_);
     }
     if (engine_ != nullptr) {
         engine_->abort_txn(txn_id, cycle);
@@ -145,6 +184,8 @@ void PanelExecutionUnit::abort_epoch(std::uint64_t epoch, std::uint64_t cycle) {
 
 void PanelExecutionUnit::reset() {
     immediate_.reset();
+    active_command_id_ = hw::command::NONE;
+    active_txn_id_ = 0;
 }
 
 
@@ -206,6 +247,7 @@ bool TrsmExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle) 
         failure.start_cycle = cycle;
         failure.finish_cycle = cycle;
         immediate_ = failure;
+        note_inflight(active_command_id_, active_txn_id_, request);
         ++accepted_count_;
         return true;
     }
@@ -237,6 +279,7 @@ bool TrsmExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle) 
     const hw::panel_lu::ConfigCheck check =
         engine_->begin_command(engine_request, adapter_key_, cycle);
     if (check.ok) {
+        note_inflight(active_command_id_, active_txn_id_, request);
         ++accepted_count_;
         return true;
     }
@@ -254,6 +297,7 @@ bool TrsmExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle) 
     failure.start_cycle = cycle;
     failure.finish_cycle = cycle;
     immediate_ = failure;
+    note_inflight(active_command_id_, active_txn_id_, request);
     ++accepted_count_;
     return true;
 }
@@ -266,6 +310,7 @@ bool TrsmExecutionUnit::poll_response(ExecResponse& response) {
     if (immediate_.has_value()) {
         response = *immediate_;
         immediate_.reset();
+        clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
         return true;
     }
     if (engine_ == nullptr) {
@@ -291,6 +336,7 @@ bool TrsmExecutionUnit::poll_response(ExecResponse& response) {
     response.needs_pvector_write = false;
     response.front_scale = engine_response.front_scale;
     response.threshold_product = engine_response.threshold_product;
+    clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
     return true;
 }
 
@@ -303,7 +349,9 @@ bool TrsmExecutionUnit::busy() const {
 
 void TrsmExecutionUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     if (immediate_.has_value() && immediate_->txn_id == txn_id) {
-        immediate_.reset();
+        // Never delete the unconsumed terminal: it becomes the ABORTED
+        // terminal of the same transaction (exactly one response survives).
+        abort_pending_terminal(*immediate_);
     }
     if (engine_ != nullptr) {
         engine_->abort_txn(txn_id, cycle);
@@ -317,6 +365,8 @@ void TrsmExecutionUnit::abort_epoch(std::uint64_t epoch, std::uint64_t cycle) {
 
 void TrsmExecutionUnit::reset() {
     immediate_.reset();
+    active_command_id_ = hw::command::NONE;
+    active_txn_id_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +398,7 @@ bool GemmExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle) 
         failure.start_cycle = cycle;
         failure.finish_cycle = cycle;
         immediate_ = failure;
+        note_inflight(active_command_id_, active_txn_id_, request);
         ++accepted_count_;
         return true;
     };
@@ -439,6 +490,7 @@ bool GemmExecutionUnit::submit(const ExecRequest& request, std::uint64_t cycle) 
     const hw::panel_lu::ConfigCheck check =
         engine_->begin_command(engine_request, adapter_key_, cycle);
     if (check.ok) {
+        note_inflight(active_command_id_, active_txn_id_, request);
         ++accepted_count_;
         return true;
     }
@@ -456,6 +508,7 @@ bool GemmExecutionUnit::poll_response(ExecResponse& response) {
     if (immediate_.has_value()) {
         response = *immediate_;
         immediate_.reset();
+        clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
         return true;
     }
     if (engine_ == nullptr) {
@@ -492,6 +545,7 @@ bool GemmExecutionUnit::poll_response(ExecResponse& response) {
     response.dequantize_cycles = engine_response.dequantize_cycles;
     response.exponent_a = engine_response.exponent_a;
     response.exponent_b = engine_response.exponent_b;
+    clear_inflight(active_command_id_, active_txn_id_, response.txn_id);
     return true;
 }
 
@@ -504,7 +558,9 @@ bool GemmExecutionUnit::busy() const {
 
 void GemmExecutionUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     if (immediate_.has_value() && immediate_->txn_id == txn_id) {
-        immediate_.reset();
+        // Never delete the unconsumed terminal: it becomes the ABORTED
+        // terminal of the same transaction (exactly one response survives).
+        abort_pending_terminal(*immediate_);
     }
     if (engine_ != nullptr) {
         engine_->abort_txn(txn_id, cycle);
@@ -518,6 +574,8 @@ void GemmExecutionUnit::abort_epoch(std::uint64_t epoch, std::uint64_t cycle) {
 
 void GemmExecutionUnit::reset() {
     immediate_.reset();
+    active_command_id_ = hw::command::NONE;
+    active_txn_id_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -834,7 +892,11 @@ bool FactorStoreUnit::busy() const {
 
 void FactorStoreUnit::abort_txn(std::uint64_t txn_id, std::uint64_t cycle) {
     if (response_.has_value() && response_->txn_id == txn_id) {
-        response_.reset();
+        // Never delete the unconsumed terminal (submit refusal or a terminal
+        // produced before the abort landed): it becomes the ABORTED terminal
+        // of the same transaction and is still consumed exactly once.
+        abort_pending_terminal(*response_);
+        return;
     }
     if (!active_.has_value() || active_->txn_id != txn_id) {
         return;

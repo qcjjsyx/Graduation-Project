@@ -57,7 +57,7 @@ pivot-block 置换范围。host 侧 Python front-tree 参考只用于显式开�
 
 ### 2.2 `FP32_SYSTEMC`
 
-主硬件架构路径。所有算子都通过 SystemC 模块、buffer 和状态机执行，数值计算使用 FP32 或 FP64 行为运算，具体精度由配置决定。
+主硬件架构路径。当前已接入的分解算子通过 buffer、状态机和真实 FP32 数据运算执行；普通 C++ tick 与 sc_clock 驱动同一模型。独立 FP64 reference 与局部 FP64 diagnostic 不属于该正式后端；真实设备 solve 尚未接入。
 
 必须具备（T04 已实现数据面部分，命令执行部分属于 T05）：
 
@@ -73,15 +73,20 @@ pivot-block 置换范围。host 侧 Python front-tree 参考只用于显式开�
 
 ### 2.3 `FP32_SYSTEMC_INT32_GEMM`
 
-在 `FP32_SYSTEMC` 基础上，只将 GEMM tile 经过：
+在 `FP32_SYSTEMC` 基础上，只将顶层 `GEMM_SCHUR` 的 tile/K 分块经过（Panel/TRSM 内部 GEMM_UPDATE 仍为 FP32）：
 
 ```text
 FP tile → quantize → INT32 GEMM behavior → dequantize → FP tile
 ```
 
-该模式用于模拟现有 INT32 GEMM 约束。没有 Verilog GEMM 时，使用 `Int32GemmBehavioral`；将来有 RTL 后，使用相同 transaction 接口替换。
+该模式用于模拟 INT32 GEMM 约束。`Int32GemmBehavioral` 与 `PrecisionAdapter` 为设计职责名称，当前由
+[`precision_adapter.cpp`](../../graduation-code/systemc/src/panel_lu/precision_adapter.cpp)
+函数集合实现，`MultiModePe` 调用 `run_int32_gemm_update`，并非两个独立 C++ 类。
+将来有 RTL 后，应保持相同 transaction 契约。
 
-## 3. 模块层次
+## 3. 目标模块层次与当前实现映射
+
+以下是职责层次示意，不是当前 C++ 类的逐项清单。GoldenChecker 为设备外部参考；HPU/ATU 动态路径和 SolveController 属于后续接入。
 
 ```text
 SystemC top
@@ -98,16 +103,15 @@ SystemC top
  ├─ Panel / TRSM / GEMM Controllers
  ├─ Tile Task Queue / Scoreboard / Dispatcher
  ├─ 多模式 PE 池（16×16 tile，LU/TRSM/GEMM 模式）
- ├─ Int32GemmBehavioral（后续）
- ├─ PrecisionAdapter
+ ├─ 局部 INT32 GEMM / Precision Adapter（函数实现，T10 已接入）
  ├─ ResultWriter
- ├─ SolveController
- └─ GoldenChecker
+ └─ SolveController（后续 T12）
+设备外：GoldenChecker（独立 FP64 reference/checker）
 ```
 
 STATIC 路径不需要 HPU/ATU，运行时旁路其动态映射事务（旁路与综合时裁剪是两种不同
-能力）；DYNAMIC_PANEL 路径在当前 pivot block 内使用 HPU 搜索主元、ATU 维护逻辑→物理
-行映射。
+能力）；后续 DYNAMIC_PANEL 路径要求在当前 pivot block 内使用 HPU 搜索主元、ATU 维护逻辑→物理
+行映射，当前正式设备尚未实现该路径。
 
 ## 4. 计算模块的真实性标准
 

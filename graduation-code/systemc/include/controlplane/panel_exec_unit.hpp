@@ -9,9 +9,10 @@
 // FactorStoreUnit performs the real packed-LU -> persistent L/U conversion for
 // STORE_FACTOR: L gets the strict lower triangle plus an explicit unit
 // diagonal and zeros above; U gets the upper triangle including the diagonal
-// and zeros below. Only the p x p panel block is written; L21/U12 belong to
-// the top-level TRSM commands and are left untouched. Conversion is chunked
-// through the front read lease and MemoryService writes (no full-front copy).
+// and zeros below within U11. The complete L (n x p) and U (p x n) are
+// written, including L21/U12 computed by the top-level TRSM commands.
+// Conversion stages one front row through the front read lease and submits
+// L/U row writes via MemoryService (no full-front copy).
 //
 // These units never fake success: unimplemented data or missing resources end
 // in an explicit terminal status.
@@ -48,6 +49,10 @@ public:
     void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
     void reset() override;
 
+    // Command id of the accepted-but-not-yet-consumed transaction (NONE when
+    // idle), whether it runs in the engine or holds an immediate terminal.
+    std::uint32_t active_command_id() const override { return active_command_id_; }
+
     std::uint32_t accepted_count() const { return accepted_count_; }
 
 private:
@@ -56,6 +61,8 @@ private:
     hw::panel_lu::PanelEngine* engine_{nullptr};
     std::optional<ExecResponse> immediate_;
     std::uint32_t accepted_count_{0};
+    std::uint32_t active_command_id_{hw::command::NONE};
+    std::uint64_t active_txn_id_{0};
 };
 
 // Top-level TRSM adapter over the same shared engine (one group per command).
@@ -74,6 +81,10 @@ public:
     void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
     void reset() override;
 
+    // Command id of the accepted-but-not-yet-consumed transaction (NONE when
+    // idle), whether it runs in the engine or holds an immediate terminal.
+    std::uint32_t active_command_id() const override { return active_command_id_; }
+
     std::uint32_t accepted_count() const { return accepted_count_; }
 
 private:
@@ -82,6 +93,8 @@ private:
     hw::panel_lu::PanelEngine* engine_{nullptr};
     std::optional<ExecResponse> immediate_;
     std::uint32_t accepted_count_{0};
+    std::uint32_t active_command_id_{hw::command::NONE};
+    std::uint64_t active_txn_id_{0};
 };
 
 // T10 top-level GEMM_SCHUR adapter over the same shared engine. It validates
@@ -105,6 +118,10 @@ public:
     void abort_epoch(std::uint64_t epoch, std::uint64_t cycle) override;
     void reset() override;
 
+    // Command id of the accepted-but-not-yet-consumed transaction (NONE when
+    // idle), whether it runs in the engine or holds an immediate terminal.
+    std::uint32_t active_command_id() const override { return active_command_id_; }
+
     std::uint32_t accepted_count() const { return accepted_count_; }
 
 private:
@@ -113,6 +130,8 @@ private:
     hw::panel_lu::PanelEngine* engine_{nullptr};
     std::optional<ExecResponse> immediate_;
     std::uint32_t accepted_count_{0};
+    std::uint32_t active_command_id_{hw::command::NONE};
+    std::uint64_t active_txn_id_{0};
 };
 
 class FactorStoreUnit : public IExecutionUnit {

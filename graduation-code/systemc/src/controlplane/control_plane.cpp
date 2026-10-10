@@ -159,7 +159,8 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
           config.completion_queue_depth,
           &trace_),
       dma_arbiter_(plane_.dma(), config.dma_queue_depth),
-      total_commands_(plane_.boot().command_count) {
+      total_commands_(plane_.boot().command_count)
+{
     plane_.set_memory_sink(dp::MemoryClient::CommandFetch, &fetch_);
     plane_.set_memory_sink(dp::MemoryClient::CompletionWriter, &completion_writer_);
     plane_.set_memory_sink(dp::MemoryClient::ExecUnit, this);
@@ -248,7 +249,7 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
 
 CommandDevice::~CommandDevice() = default;
 
-bool CommandDevice::start(std::string* error) {
+bool CommandDevice::start(std::string* error) { //合法性检查
     if (!model_config_error_.empty()) {
         if (error != nullptr) {
             *error = model_config_error_;
@@ -359,7 +360,7 @@ void CommandDevice::tick() {
     }
     const std::uint64_t cycle = plane_.begin_tick();
     // Exactly one global budget initialization per cycle.
-    on_chip_.begin_cycle(cycle);
+    on_chip_.begin_cycle(cycle); //初始化带宽预算
     plane_.tick_memory_and_route();
     update_phase(cycle);
     if (state_ == BatchState::Running) {

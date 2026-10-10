@@ -1,6 +1,6 @@
 # 多前沿稀疏 LU 求解器软硬件协同架构
 
-状态：当前项目入口
+状态：当前项目入口（2026-10-07 按当前代码同步；STATIC 分解已推进至 T11）
 
 本项目研究使用多前沿方法组织稀疏方阵求解，并通过软件编译器、SystemC 硬件架构模型和关键 RTL 原型验证软硬件协同方案。
 
@@ -15,17 +15,15 @@ Ax = b
 ## 当前架构结论
 
 ```text
-FP64 C++ reference
-        ↓
-FP32/FP64 SystemC hardware architecture model
-        ↓
-selected RTL prototypes
+软件编译器 → schema v2 artifact → FP32 SystemC/C++ 设备模型 → 最终 DDR image + reports
+                                     （可选局部 INT32 GEMM）              ↓
+初始 artifact ─────────────────────────────────────────────→ 独立 FP64 checker
 ```
 
-- FP64 C++：数学黄金参考，不进行硬件时序仿真；
-- FP32/FP64 SystemC：主硬件架构模型，模拟命令、buffer、依赖、算子状态和周期；
-- INT32 GEMM：只在 GEMM 调用边界做局部量化/反量化；当前没有 RTL 时，使用 SystemC `Int32GemmBehavioral`；
-- RTL：优先实现 GCU、HPU、ATU、片上存储接口和关键控制原型，不强行把整个求解器改成全局 INT32/BFP。
+- FP64 Python/C++：独立数学参考与外部 checker，不向设备注入参考 front、因子、预选主元或解；
+- 正式设备后端：`FP32_SYSTEMC` 和 `FP32_SYSTEMC_INT32_GEMM`，模拟命令、buffer、依赖、真实数据运算与周期；FP64 局部诊断不等同于正式 FP64 设备后端；
+- 局部 INT32：仅用于顶层 `GEMM_SCHUR` 的 tile/K 分块，front、因子、update、装配、Panel 和 TRSM 保持 FP32；`Int32GemmBehavioral` 是设计职责名称，当前由 `precision_adapter.cpp` 函数集合实现，并由 `MultiModePe` 调用；
+- RTL：GCU/HPU/ATU 等独立原型尚未形成 schema v2 设备闭环，不能用 SystemC 通过记录宣称 RTL 已完成。
 
 ## 软件、SystemC 与硬件的职责
 
@@ -33,19 +31,26 @@ selected RTL prototypes
 稀疏矩阵 A、RHS b
   → 均衡、加权匹配行置换、ordering、fill、消除森林
   → supernode、front、map
-  → command ring、descriptor table、data image
-  → SystemC 或 RTL device executor
-  → L/U/P、update、solution、status
-  → residual、backward error、周期和访存报告
+  → command buffer、descriptor table、memory image
+  → SystemC/C++ STATIC 分解设备
+  → 持久 L/U/P、update、status 和周期/访存报告
+  → 独立 FP64 因子/update/P 验收
+
+后续 T12：真实树形前代/回代 → solution 写回 → 原方程 Ax=b 验收
 ```
 
-软件负责全局结构分析和命令编译。设备侧不负责 ordering、fill 或 supernode 构造，只执行已经编译的命令。
+软件负责全局结构分析和命令编译；设备执行已编译命令。当前分解入口是
+[`tree_factor_device`](graduation-code/systemc/src/tree_factor_device.cpp)，
+外部验收入口是 [`tree_factor_check`](graduation-code/systemc/reference/tools/tree_factor_check.cpp)。
+分配 RHS/solution 区域或存在参考 solve 不表示设备已完成求解。
 
-当前 artifact 是 Command/Descriptor schema v2：32B command、64B descriptor、64B completion 和同一 `memory_image.bin` 中的显式数据区域。`FRONT_DESC` 显式携带主元策略：默认 `STATIC`（软件数值预处理 + 硬件固定主元顺序，旁路 HPU/ATU 动态映射），`DYNAMIC_PANEL` 为显式可选能力（仅限 pivot block 内选主元）。旧 `NodeTask` ABI v2 已归档，与 schema v2 无关，不参与当前构建。
+当前 artifact 是 Command/Descriptor schema v2：32B Command、64B Descriptor、64B Completion，数据位于同一 `memory_image.bin` 的显式区域。`FRONT_DESC` 携带主元策略；正式设备支持 `STATIC`，局部 P-vector 成功后写 identity。`DYNAMIC_PANEL` 已有接口与独立参考语义，但真实设备尚未实现，显式拒绝。旧 `NodeTask` ABI v2 已归档，与 schema v2 无关。
 
-当前推进顺序：T00–T05 已实现，T05 仅验证 test stub 控制流；下一步先完成 T06 STATIC Panel-LU 设计并协调 T08，再推进正式数值 kernel 与 T11/T12 STATIC 闭环。T14 HPU/ATU 契约统一后移至该闭环之后，按新编号执行，原有交付要求保留；T13/T15 仍依赖 T14。详见 [任务说明书](docs/项目实现任务说明书.md) 和 [当前任务状态](todo.md)。
+当前进度：T00–T11 的 STATIC 分解链已实现，包含真实 Panel-LU、左右 TRSM、GEMM_Schur、extend-add、完整因子与 update 写回、单节点/树/森林执行。T05 test stub 仅用于显式控制流测试；T06 合成原型不替代正式数值验收。T12 树形 solve 与完整 Ax=b 尚未完成；T14 HPU/ATU 契约统一后移，动态路径依赖该工作。详见[任务说明书](docs/项目实现任务说明书.md)和[当前任务状态](todo.md)。
 
-2026-09-28 已确认的下一阶段架构：Panel/TRSM/GEMM 共用多模式 PE 池，采用 16×16 tile 和任务粒度模拟，保留全 front 扫描及主元冻结语义。详见 [计算架构基线](docs/architecture/多模式PE与16x16分块计算基线.md)。T06 交付硬件设计与可编译接口/时序原型；当前代码尚未迁移。
+共享计算架构已落地：Panel/TRSM/GEMM 命令共用一个 PE 池，实验配置为 **2 组×每组 2 个完整 16×16 PE**；每条计算命令独占一组，组内按依赖处理 tile。统一片上读/写预算各方向每拍只授予一个 requester，余量不转授。`*_unit_count` 是命令执行单元实例数，PE 数量由 `compute_group_count × pes_per_group` 决定。见[计算架构基线](docs/architecture/多模式PE与16x16分块计算基线.md)。
+
+新人入口：[当前实现技术导读](docs/当前实现技术导读.md)。当前缺陷与复现见[审查报告](docs/当前实现审查与验证报告.md)：B01 abort 响应丢失已修复；独立 RTL 的 B02/B03 尚未修复。
 
 ## 当前代码目录
 

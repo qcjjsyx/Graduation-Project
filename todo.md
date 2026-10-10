@@ -502,7 +502,10 @@
   （Release 与 ASan+UBSan），既有 T04/T05/T06 回归无回退。
 - [x] 顶层 TRSM_LEFT/TRSM_RIGHT（T09）与 GEMM_SCHUR（T10，含局部 INT32）
   数值执行，复用 `kernels` 与同一 dispatcher/PE 池。
-- [ ] 完整分解/求解闭环、真实 assemble、树形 solve、DYNAMIC_PANEL、RTL。
+- [x] 真实 assemble 与 STATIC 单节点/树/森林分解（T11），完整 L/U/update/P 已由独立 checker 验收。
+- [ ] 树形 solve、solution 写回与完整 Ax=b 闭环（T12）；DYNAMIC_PANEL 与完整 RTL 仍属后续任务。
+
+以上进度于 2026-10-07 按当前代码同步；本小节的 215 checks、18/18 等数字保留为 T07 阶段历史记录，不作为当前测试规模。
 
 主要产物：
 

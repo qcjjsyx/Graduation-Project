@@ -38,18 +38,19 @@ int main(int argc, char** argv) {
         if (directory.empty() || output.empty()) throw std::runtime_error("device-dir and out are required");
         if (backend != "FP32_SYSTEMC" && backend != "FP32_SYSTEMC_INT32_GEMM")
             throw std::runtime_error("unsupported device backend");
+
         std::ifstream stream(directory + "/manifest.json");
         nlohmann::json manifest;
         stream >> manifest;
-        if (manifest.at("compiler").value("operation_scope", "") != "factorization_only")
+        if (manifest.at("compiler").value("operation_scope", "") != "factorization_only") //只执行分解阶段
             throw std::runtime_error("T11 entry requires a factorization-only artifact");
-        if (manifest.at("gemm").at("backend") != backend)
+        if (manifest.at("gemm").at("backend") != backend) //编译时GEMM后端和实际执行时GEMM后端要一致
             throw std::runtime_error("requested backend disagrees with artifact; compile the selected mode first");
         auto artifact = hw::dataplane::load_artifact(directory);
         for (std::uint32_t i = 0; i < artifact.config.command_count; ++i) {
             const auto command = hw::command::CommandCodec::decode(
                 artifact.image.data() + artifact.config.command_table_addr + i * 32ull, 32);
-            if (command.opcode != hw::command::Opcode::GemmSchur) continue;
+            if (command.opcode != hw::command::Opcode::GemmSchur) continue; // 检查一下每条GEMM的后端是否与设定的一致
             const auto kernel = hw::command::DescriptorCodec::decode(
                 artifact.image.data() + artifact.config.descriptor_table_addr + command.descriptor_id * 64ull,
                 64, artifact.image.size());
@@ -62,7 +63,7 @@ int main(int argc, char** argv) {
         hw::controlplane::CommandDevice device(std::move(artifact), config);
         std::string error;
         if (!device.start(&error)) throw std::runtime_error(error);
-        device.run(limit);
+        device.run(limit); //启动
         device.write_reports(output);
         std::cout << "backend=" << backend << " control_flow_pass=" << device.control_flow_pass()
                   << " numeric_status_pass=" << device.numeric_status_pass()

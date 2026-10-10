@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "controlplane/control_plane.hpp"
+#include "controlplane/panel_exec_unit.hpp"
 #include "control_test_artifact.hpp"
 #include "dataplane/on_chip_arbiter.hpp"
 #include "panel_lu/tile_kernels.hpp"
@@ -1500,6 +1501,120 @@ void test_abort_trsm_and_reuse() {
     expect(reused, "abort trsm: the released group is reused by the other front");
 }
 
+// ---------------------------------------------------------------------------
+// B01 regression (adapter level): the immediate terminal of an accepted
+// request survives abort_txn
+// ---------------------------------------------------------------------------
+
+// An accepted request whose runtime shape/operands are illegal produces an
+// immediate terminal response without ever entering the engine. An abort that
+// lands before the consumer polls must not delete that unique terminal: it is
+// converted into the same txn's ABORTED terminal (identity and statistics
+// preserved) and consumed exactly once.
+void test_immediate_terminal_survives_abort() {
+    pl::PanelLuConfig config;
+    config.compute_group_count = 1;
+    config.pes_per_group = 1;
+    config.pe_count = 1;
+    pl::PanelEngine engine(config);
+    expect(engine.configure().ok, "immediate abort: engine configured");
+    cp::TrsmExecutionUnit unit(0, &engine);
+
+    const auto make_request = [](std::uint64_t txn, std::uint32_t command) {
+        cp::ExecRequest request;
+        request.txn_id = txn;
+        request.epoch = 4;
+        request.command_id = command;
+        request.node_id = 7;
+        request.opcode = cmd::Opcode::TrsmLeft;
+        request.unit_id = 0;
+        // Two-element front with p=1: u=1.
+        request.total_dim = 2;
+        request.front.pivot_dim = 1;
+        request.front.tile_size = 16;
+        request.front.front.descriptor_id = 5;
+        request.front.front.base_addr = 0x1000;
+        request.front.front.byte_size = 64;
+        request.kernel.a = request.front.front;
+        request.kernel.b = request.front.front;
+        request.kernel.c = request.front.front;
+        request.kernel.m = 1;  // TRSM_LEFT M must equal p
+        request.kernel.n = 1;
+        request.kernel.k = 1;
+        request.kernel.tile_size = 16;
+        request.kernel.backend = cmd::KernelBackend::SystemCFp32DeviceModel;
+        return request;
+    };
+    const auto check_identity = [&](const cp::ExecResponse& response,
+                                    const cp::ExecRequest& request,
+                                    const char* label) {
+        expect(response.txn_id == request.txn_id &&
+                   response.command_id == request.command_id &&
+                   response.node_id == request.node_id &&
+                   response.epoch == request.epoch &&
+                   response.unit_id == unit.unit_id(),
+               std::string(label) + ": terminal keeps txn/command/node/epoch identity");
+    };
+
+    // Case 1: abort of a DIFFERENT txn must not delete or modify the pending
+    // terminal of this transaction.
+    {
+        cp::ExecRequest request = make_request(21, 3);
+        request.kernel.m = 2;  // runtime shape error: engine refuses it
+        expect(unit.submit(request, 10), "immediate abort: shape refusal accepted");
+        expect(unit.busy(), "immediate abort: accepted refusal keeps the unit busy");
+        unit.abort_txn(request.txn_id + 100, 11);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "immediate abort: unrelated abort keeps the terminal");
+        expect(response.status == cmd::StatusCode::BadDescriptor,
+               "immediate abort: unrelated abort does not rewrite the status");
+        check_identity(response, request, "immediate abort");
+        expect(!unit.poll_response(response), "immediate abort: one terminal only");
+    }
+
+    // Case 2: the B01 window. The request is accepted with an immediate error
+    // terminal; abort of the same txn converts (never drops) that terminal.
+    {
+        cp::ExecRequest request = make_request(22, 4);
+        request.kernel.m = 2;  // the malformed TRSM shape of the B01 repro
+        expect(unit.submit(request, 20), "immediate abort: malformed shape accepted");
+        unit.abort_txn(request.txn_id, 21);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "immediate abort: exactly one terminal survives the abort");
+        expect(response.status == cmd::StatusCode::Aborted,
+               "immediate abort: pending terminal becomes ABORTED");
+        check_identity(response, request, "immediate abort");
+        expect(!unit.poll_response(response),
+               "immediate abort: terminal is consumed exactly once");
+        expect(!unit.busy(), "immediate abort: unit is idle after the terminal");
+        unit.abort_txn(request.txn_id, 22);
+        unit.abort_txn(request.txn_id, 23);
+        expect(!unit.poll_response(response),
+               "immediate abort: repeated abort is idempotent");
+    }
+
+    // Case 3: the adapter's own operand refusal shares the same immediate
+    // terminal path and the same lifecycle contract.
+    {
+        cp::ExecRequest request = make_request(23, 5);
+        request.kernel.a.descriptor_id = 99;  // foreign KERNEL operand
+        expect(unit.submit(request, 30), "immediate abort: operand refusal accepted");
+        unit.abort_txn(request.txn_id, 31);
+        cp::ExecResponse response;
+        expect(unit.poll_response(response),
+               "immediate abort: operand-refusal terminal survives the abort");
+        expect(response.status == cmd::StatusCode::Aborted,
+               "immediate abort: operand-refusal terminal becomes ABORTED");
+        check_identity(response, request, "immediate abort");
+        expect(!unit.poll_response(response) && !unit.busy(),
+               "immediate abort: operand-refusal txn is terminal exactly once");
+    }
+    expect(!engine.group_busy(0),
+           "immediate abort: refused requests never consumed an engine group");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1516,6 +1631,7 @@ int main(int argc, char** argv) {
     test_arbiter_unit();
     test_bandwidth_integration_low_budget();
     test_abort_trsm_and_reuse();
+    test_immediate_terminal_survives_abort();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

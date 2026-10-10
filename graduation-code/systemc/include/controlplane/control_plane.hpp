@@ -25,7 +25,7 @@ namespace hw::controlplane {
 struct ControlPlaneConfig {
     // Residency: at most this many fronts may hold scratch slots at once.
     std::uint32_t max_resident_fronts{2};
-    // Shared execution unit pools (both fronts draw from the same pools).
+    // Shared execution unit pools (both fronts draw from the same pools). 每个表明一个执行单元
     std::uint32_t panel_unit_count{1};
     std::uint32_t trsm_unit_count{2};
     std::uint32_t gemm_unit_count{1};
@@ -44,7 +44,7 @@ struct ControlPlaneConfig {
     std::uint32_t dma_queue_depth{8};
     ExecBackend backend{ExecBackend::TestStub};
     bool enable_test_stub{false};
-    StubConfig stub;
+    StubConfig stub; //测试桩执行单元，不执行真实数值算法，只模拟行为
     // T07 real backend: binds the shared PanelEngine to Panel slots and the
     // FactorStoreUnit to STORE_FACTOR. Explicitly selected, never implicit.
     bool enable_real_panel{false};
@@ -59,38 +59,38 @@ enum class BatchState { Idle, Running, Completed, Faulted };
 const char* batch_state_name(BatchState state);
 
 struct CommandStats {
-    std::uint32_t command_id{0};
-    std::uint32_t node_id{0};
-    std::string opcode;
-    std::string unit_kind;
-    std::int32_t unit_id{-1};
-    std::uint64_t fetch_cycle{0};
-    std::uint64_t admit_cycle{0};
-    std::uint64_t start_cycle{0};
-    std::uint64_t finish_cycle{0};
-    std::uint64_t completion_cycle{0};
-    std::string status;
-    std::string reason;
-    std::uint64_t bytes_read{0};
-    std::uint64_t bytes_written{0};
-    std::uint64_t stall_window{0};
-    std::uint64_t stall_dep{0};
-    std::uint64_t stall_resource{0};
-    std::uint64_t stall_dma{0};
-    std::uint64_t stall_cycles{0};
-    std::uint32_t pivot_count{0};
-    std::uint32_t overflow_count{0};
-    std::uint32_t dma_jobs{0};
+    std::uint32_t command_id{0};       // 命令在当前 batch 中的唯一编号
+    std::uint32_t node_id{0};          // 命令所属的计算节点编号
+    std::string opcode;                // 命令操作码名称
+    std::string unit_kind;             // 执行该命令的执行单元类型
+    std::int32_t unit_id{-1};          // 执行单元编号，-1 表示尚未分配或不适用
+    std::uint64_t fetch_cycle{0};      // 从 command buffer 取出命令的周期
+    std::uint64_t admit_cycle{0};      // 命令通过调度准入的周期
+    std::uint64_t start_cycle{0};      // 执行单元开始执行命令的周期
+    std::uint64_t finish_cycle{0};     // 执行单元完成命令执行的周期
+    std::uint64_t completion_cycle{0}; // 完成记录写回并完成收尾的周期
+    std::string status;                // 命令最终状态
+    std::string reason;                // 失败或特殊状态的原因
+    std::uint64_t bytes_read{0};       // 命令从设备内存读取的字节数
+    std::uint64_t bytes_written{0};    // 命令向设备内存写入的字节数
+    std::uint64_t stall_window{0};     // 因调度窗口已满而等待的周期数
+    std::uint64_t stall_dep{0};        // 因依赖 token 未满足而等待的周期数
+    std::uint64_t stall_resource{0};   // 因执行单元或 buffer 资源不足而等待的周期数
+    std::uint64_t stall_dma{0};        // 因 DMA 队列或 DMA 资源而等待的周期数
+    std::uint64_t stall_cycles{0};     // 命令累计等待周期数
+    std::uint32_t pivot_count{0};      // 已完成的主元数，失败时表示首个失败列号
+    std::uint32_t overflow_count{0};   // 检测到的数值溢出次数
+    std::uint32_t dma_jobs{0};         // 命令关联或提交的 DMA 作业数量
     // T10 GEMM_SCHUR statistics (empty/zero for other opcodes).
-    std::string gemm_backend;
-    std::uint64_t saturation_count{0};
-    std::uint64_t local_conversion_bytes{0};
-    std::uint64_t scale_reduction_cycles{0};
-    std::uint64_t quantize_cycles{0};
-    std::uint64_t integer_compute_cycles{0};
-    std::uint64_t dequantize_cycles{0};
-    std::int32_t exponent_a{0};
-    std::int32_t exponent_b{0};
+    std::string gemm_backend;           // GEMM 使用的数值计算后端
+    std::uint64_t saturation_count{0};  // GEMM 局部量化发生饱和的次数
+    std::uint64_t local_conversion_bytes{0}; // FP/INT 局部转换涉及的字节数
+    std::uint64_t scale_reduction_cycles{0}; // 计算输入 scale 所消耗的周期数
+    std::uint64_t quantize_cycles{0};        // 输入量化所消耗的周期数
+    std::uint64_t integer_compute_cycles{0}; // INT GEMM 核心计算所消耗的周期数
+    std::uint64_t dequantize_cycles{0};      // 输出反量化所消耗的周期数
+    std::int32_t exponent_a{0};              // 矩阵 A 使用的量化指数
+    std::int32_t exponent_b{0};              // 矩阵 B 使用的量化指数
 };
 
 struct UnitBusyRecord {
@@ -200,13 +200,13 @@ private:
         // InWindow (raw) -> Resolving (descriptor reads) -> Waiting (deps or
         // resources) -> Running -> PostExec -> Completing -> Done.
         enum class Phase {
-            InWindow,
-            Resolving,
-            Waiting,
-            Running,
-            PostExec,
-            Completing,
-            Done
+            InWindow,   // 已进入调度窗口，尚未开始解析
+            Resolving,  // 正在读取并解析 descriptor
+            Waiting,    // 等待依赖 token 或执行资源
+            Running,    // 已获得资源，正在执行命令
+            PostExec,   // 执行结束，正在处理后续结果或资源释放
+            Completing, // 正在写入 completion 并发布结果 token
+            Done        // 命令已完成，不再参与调度
         };
         Phase phase{Phase::InWindow};
 

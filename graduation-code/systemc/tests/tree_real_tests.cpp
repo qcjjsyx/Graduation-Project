@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
+#include <set>
 #include "nlohmann/json.hpp"
 #include "controlplane/control_plane.hpp"
 #include "tree_artifact_check.hpp"
@@ -154,12 +157,127 @@ void abort_reset(const std::string& directory) {
     }
 }
 
+// B01 regression (device level): an accepted TRSM request with an illegal
+// runtime shape forms an immediate error terminal that the engine can never
+// replace. Aborting node 0 in the window where that terminal is not yet polled
+// must not lose it: the batch drains in finite cycles, every command gets
+// exactly one completion, and the front/leases/scratch are released.
+void abort_immediate_error(const std::string& directory) {
+    for (const bool abort : {false, true}) {
+        const std::string label = abort ? "b01 abort" : "b01 plain";
+        // Mutate the artifact in memory only: the TRSM_LEFT descriptor of
+        // node 0 keeps its identity but declares M=2 while the fixture's
+        // pivot_dim is 1, so static loading accepts it and the runtime shape
+        // check must refuse it.
+        auto artifact = dp::load_artifact(directory);
+        std::uint32_t target = cmd::NONE;
+        std::uint32_t target_token = cmd::NONE;
+        std::uint32_t target_descriptor = cmd::NONE;
+        for (std::uint32_t index = 0; index < artifact.config.command_count; ++index) {
+            const cmd::Command command = cmd::CommandCodec::decode(
+                artifact.image.data() + artifact.config.command_table_addr +
+                    static_cast<std::uint64_t>(index) * cmd::COMMAND_RECORD_BYTES,
+                cmd::COMMAND_RECORD_BYTES);
+            if (command.node_id == 0 && command.opcode == cmd::Opcode::TrsmLeft) {
+                target = command.command_id;
+                target_token = command.signal_token;
+                target_descriptor = command.descriptor_id;
+            }
+        }
+        expect(target != cmd::NONE, label + ": TRSM_LEFT command of node 0 exists");
+        const std::uint64_t address =
+            artifact.config.descriptor_table_addr +
+            static_cast<std::uint64_t>(target_descriptor) * cmd::DESCRIPTOR_RECORD_BYTES;
+        auto descriptor = cmd::DescriptorCodec::decode(
+            artifact.image.data() + address, cmd::DESCRIPTOR_RECORD_BYTES,
+            artifact.image.size());
+        descriptor.body_words[3] = 2;  // kernel M
+        const auto record = cmd::DescriptorCodec::encode(descriptor);
+        std::copy(record.begin(), record.end(), artifact.image.begin() + address);
+        std::ifstream in(directory + "/manifest.json");
+        const std::string manifest{std::istreambuf_iterator<char>(in), {}};
+        artifact = dp::load_artifact_from_bytes(manifest, artifact.image);
+
+        cp::CommandDevice device(artifact, config());
+        std::string error;
+        expect(device.start(&error), label + ": starts " + error);
+        bool issued = false;
+        std::uint64_t abort_cycle = 0;
+        while (!device.finished() && device.cycle() < 200000) {
+            device.tick();
+            if (abort && !issued) {
+                for (std::uint32_t unit = 0;
+                     unit < config().trsm_unit_count && !issued; ++unit) {
+                    if (device.unit_active_command_id(cp::UnitKind::Trsm, unit) ==
+                        target) {
+                        issued = true;
+                        abort_cycle = device.cycle();
+                        device.abort_node(0);
+                        device.abort_node(0);  // repeated abort stays idempotent
+                    }
+                }
+            }
+        }
+        if (abort) {
+            expect(issued, "b01 abort: abort issued in the immediate-error window");
+            expect(abort_cycle > 0, "b01 abort: abort window is observed");
+        }
+        expect(device.control_flow_pass() && !device.batch_faulted(),
+               label + ": batch drains in finite cycles (no timeout fault)");
+        expect(device.completion_written() == device.boot().command_count,
+               label + ": every command has a completion");
+        std::set<std::uint32_t> completed;
+        for (const auto& stats : device.command_stats()) {
+            completed.insert(stats.command_id);
+        }
+        expect(device.command_stats().size() == device.boot().command_count &&
+                   completed.size() == device.boot().command_count,
+               label + ": exactly one completion per command");
+        expect(device.completion_status().at(target) ==
+                   (abort ? cmd::StatusCode::Aborted : cmd::StatusCode::BadDescriptor),
+               label + ": the refused request keeps its unique terminal semantics");
+        bool parent_ok = false;
+        for (const auto& stats : device.command_stats()) {
+            if (stats.node_id == 1 && stats.status == "OK") {
+                parent_ok = true;
+            }
+            const bool terminal_ok =
+                abort ? (stats.status == "OK" || stats.status == "ABORTED" ||
+                         stats.status == "DEPENDENCY_FAILED")
+                      : (stats.status == "OK" || stats.status == "BAD_DESCRIPTOR" ||
+                         stats.status == "DEPENDENCY_FAILED");
+            expect(terminal_ok,
+                   label + ": command status follows the failure/cancel contract");
+        }
+        expect(!parent_ok, label + ": dependent parent never publishes success");
+        expect(!device.numeric_status_pass(),
+               label + ": a failed/cancelled batch never claims full success");
+        if (abort && target_token != cmd::NONE) {
+            expect(device.scoreboard().state(target_token) ==
+                       cp::TokenScoreboard::State::Failed,
+                   "b01 abort: the cancelled command publishes no success token");
+            expect(abort_cycle > 0, "b01 abort: abort window is observed");
+        }
+        for (std::uint32_t node = 0; node < device.boot().node_count; ++node) {
+            expect(device.front_slot(node).slot == cmd::NONE,
+                   label + ": front of node released");
+        }
+        expect(device.dataplane().buffers().active_lease_count() == 0,
+               label + ": no leaked leases");
+        for (std::uint32_t slot = 0; slot < 5; ++slot) {
+            expect(device.dataplane().buffers().state(slot) == dp::BufferState::Free,
+                   label + ": scratch slots free for reuse");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) return 2;
     std::ifstream file(std::string(argv[1]) + "/cases.json");
     json cases; file >> cases;
     for (const auto& spec : cases) run_case(spec, argv[2]);
     abort_reset(std::string(argv[1]) + "/mapped_tail/fp32/device");
+    abort_immediate_error(std::string(argv[1]) + "/two_level/fp32/device");
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures ? 1 : 0;
 }
