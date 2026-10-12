@@ -207,18 +207,36 @@ class CommandCompilerConfig:
     tile_size: int = 16
     max_front_size: int = 256
     max_wait_tokens: int = 256
-    # T11 emits a complete factorization without unimplemented T12 solve commands.
+    # True: full schema (factorization + SOLVE_FORWARD/SOLVE_BACKWARD chain).
+    # The device executes the chain when ControlPlaneConfig.enable_real_solve is
+    # on (tree_factor_device); the library default stays True because the
+    # compiler/T04/T05/T10 tests check the full command schema, and the T12 CLI
+    # defaults to factorization_and_solve as well (--factorization-only remains
+    # for factorization-only artifacts).
     emit_solve_commands: bool = True
+    # Target device scratchpad slot size.  A front is held in one slot as a
+    # compact FP32 n*n block, so every front must satisfy 4*n*n <= this value
+    # (64 KiB -> n <= 128).  Recorded in the manifest; tree_factor_device sizes
+    # its slots from it.  Checked at compile time so an oversize front fails
+    # here instead of as BUFFER_FULL after a long device run.
+    device_buffer_bytes: int = 64 * 1024
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.device_buffer_bytes, bool)
+            or not isinstance(self.device_buffer_bytes, int)
+            or self.device_buffer_bytes <= 0
+        ):
+            raise ValueError("device_buffer_bytes must be a positive integer")
         if not isinstance(self.emit_solve_commands, bool):
             raise ValueError("emit_solve_commands must be a boolean")
         if self.alignment <= 0 or self.alignment & (self.alignment - 1):
             raise ValueError("alignment must be a positive power of two")
         if self.tile_size <= 0:
             raise ValueError("tile_size must be positive")
-        if self.max_front_size <= 0:
-            raise ValueError("max_front_size must be positive")
+        if not 0 < self.max_front_size <= 512:
+            # The SystemC Panel engine supports front dimensions 1..512.
+            raise ValueError("max_front_size must be in [1, 512]")
         if self.max_wait_tokens <= 0:
             raise ValueError("max_wait_tokens must be positive")
 

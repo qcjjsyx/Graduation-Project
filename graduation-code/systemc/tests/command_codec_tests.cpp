@@ -525,6 +525,55 @@ void test_static_batch_fixtures(const std::string& fixture_dir) {
 
 }  // namespace
 
+void test_solve_descriptor_fixture(const std::string& fixture_dir) {
+    // T12 SOLVE_DESC fixture: the record must decode/validate with its u32
+    // front-variable-indices payload, and the payload fixture must hold the
+    // same indices the Python generator wrote (0, 4, 6).
+    const auto record = read_file(fixture_dir + "/solve_descriptor.bin");
+    auto decoded = cmd::DescriptorCodec::decode(
+        record.data(), record.size(), /*memory_image_bytes=*/0x1000);
+    expect(
+        decoded.descriptor_type == cmd::DescriptorType::Solve,
+        "solve descriptor type mismatch");
+    expect(
+        decoded.payload_bytes == 12 && decoded.payload_offset % 4 == 0,
+        "solve descriptor payload must be a u32-aligned 12-byte table");
+    expect(
+        decoded.body_words[5] == 1 &&
+            decoded.body_words[6] ==
+                static_cast<std::uint32_t>(cmd::SolveDirection::Forward) &&
+            decoded.body_words[7] == static_cast<std::uint32_t>(cmd::DataFormat::Fp32),
+        "solve descriptor direction/rhs_count/format mismatch");
+    const auto payload = read_file(fixture_dir + "/solve_payload.bin");
+    expect(payload.size() == 12, "solve payload fixture size mismatch");
+    std::vector<std::uint32_t> indices;
+    for (std::size_t offset = 0; offset < payload.size(); offset += 4) {
+        indices.push_back(cmd::detail::read_u32(payload.data(), offset));
+    }
+    expect(
+        indices == std::vector<std::uint32_t>({0, 4, 6}),
+        "solve payload fixture indices mismatch");
+
+    // The codec itself refuses a SOLVE_DESC without its variable payload and
+    // a payload with a non-u32-aligned offset.
+    auto missing_payload = record;
+    write_u32(missing_payload, 16, 0);  // payload_bytes = 0
+    expect_throws(
+        [&] {
+            (void)cmd::DescriptorCodec::decode(
+                missing_payload.data(), missing_payload.size(), 0x1000);
+        },
+        "SOLVE_DESC without payload must fail");
+    auto unaligned = record;
+    write_u32(unaligned, 8, 0x101);  // payload_offset = 0x101
+    expect_throws(
+        [&] {
+            (void)cmd::DescriptorCodec::decode(
+                unaligned.data(), unaligned.size(), 0x1000);
+        },
+        "SOLVE_DESC with an unaligned payload must fail");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
@@ -535,6 +584,7 @@ int main(int argc, char** argv) {
         test_command(fixture_dir);
         test_front_descriptor_policy(fixture_dir);
         test_scale_descriptor(fixture_dir);
+        test_solve_descriptor_fixture(fixture_dir);
         test_descriptor(fixture_dir);
         test_completion(fixture_dir);
         test_token_states(fixture_dir);

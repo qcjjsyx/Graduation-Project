@@ -15,12 +15,20 @@ htmlcov/
 venv/
 *.egg-info/
 
-# CMake / SystemC local build products
+# CMake / SystemC local build products (build out of tree, e.g. /tmp/...)
 graduation-code/systemc/build/
+graduation-code/systemc/build-*/
 graduation-code/systemc/cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+
+# Compiler CLI default output directory (python -m src.main --out out)
+out/
+graduation-code/software/out/
+
+# Office lock files
+.~*
 
 # Tool inspection and scratch artifacts
 *.inspect.ndjson

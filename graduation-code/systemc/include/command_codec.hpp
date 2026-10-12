@@ -28,6 +28,12 @@ inline constexpr std::size_t COMMAND_RECORD_BYTES = 32;
 inline constexpr std::size_t DESCRIPTOR_RECORD_BYTES = 64;
 inline constexpr std::size_t COMPLETION_RECORD_BYTES = 64;
 
+//: SOLVE_DESC variable payload (T12): u32 front_indices, one entry per front
+//: row. payload_bytes == 4 * FACTOR_DESC.total_dim; the first pivot_dim values
+//: are the contiguous node range. A SOLVE_DESC without this payload cannot be
+//: executed (the device could not gather/scatter the front variables).
+inline constexpr const char* SOLVE_DESC_PAYLOAD_KIND = "front_variable_indices_u32";
+
 enum class Opcode : std::uint32_t {
     NodeBegin = 0x01,
     LoadFront = 0x02,
@@ -439,6 +445,15 @@ public:
             if (descriptor.payload_bytes != expected) {
                 throw std::runtime_error(
                     "DEPENDENCY_DESC payload_bytes must equal token_count * 4");
+            }
+        } else if (descriptor.descriptor_type == DescriptorType::Solve) {
+            if (descriptor.payload_offset % 4 != 0) {
+                throw std::runtime_error(
+                    "SOLVE_DESC payload_offset must be u32 aligned");
+            }
+            if (descriptor.payload_bytes == 0 || descriptor.payload_bytes % 4 != 0) {
+                throw std::runtime_error(
+                    "SOLVE_DESC must carry its u32 front-variable-indices payload");
             }
         } else if (descriptor.payload_bytes != 0) {
             throw std::runtime_error("descriptor type does not define a v2 variable payload");

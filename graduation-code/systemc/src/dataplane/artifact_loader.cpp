@@ -361,6 +361,16 @@ void validate_descriptor_references(const ArtifactProbe& probe) {
             require_descriptor_type(probe, body[2], cmd::DescriptorType::Region, context + " solution");
             require_mandatory_descriptor_type(probe, body[3], cmd::DescriptorType::Region, context + " P-vector");
             require_descriptor_type(probe, body[4], cmd::DescriptorType::Region, context + " workspace");
+            {
+                const auto factor = descriptor_at(probe, body[0], context + " factor");
+                if (descriptor.payload_bytes !=
+                    4ull * factor.body_words[3]) {
+                    fail(
+                        context +
+                        " SOLVE_DESC payload_bytes must equal "
+                        "4 * FACTOR_DESC.total_dim");
+                }
+            }
             break;
         case cmd::DescriptorType::Dependency:
             break;
@@ -671,6 +681,197 @@ void validate_nodes(const json& manifest, const ArtifactProbe& probe) {
         }
         if (signals.size() != probe.config->token_count) {
             fail("signal tokens are not a dense 0..token_count-1 set");
+        }
+    }
+}
+
+void validate_solve_contract(const ArtifactProbe& probe, const json& manifest) {
+    // T12: the SOLVE_DESC payload, the topological serial solve chain and the
+    // solve scratch capacity must hold in the artifact itself; the runtime
+    // reader re-checks shapes, this loader rejects a static mismatch early.
+    const json& compiler = manifest.at("compiler");
+    const std::string operation_scope = compiler.contains("operation_scope")
+        ? as_string(compiler.at("operation_scope"), "compiler.operation_scope")
+        : "factorization_and_solve";
+    const json& abi = require_object(manifest, "abi", "manifest");
+    const bool solve_commands_present = std::any_of(
+        probe.commands->begin(), probe.commands->end(),
+        [](const cmd::Command& command) {
+            return command.opcode == cmd::Opcode::SolveForward ||
+                   command.opcode == cmd::Opcode::SolveBackward;
+        });
+    if (operation_scope == "factorization_only") {
+        if (abi.contains("solve_desc_payload")) {
+            fail("factorization-only artifacts must not declare abi.solve_desc_payload");
+        }
+        if (solve_commands_present) {
+            fail("factorization-only artifact contains solve commands");
+        }
+        return;
+    }
+    if (!abi.contains("solve_desc_payload") ||
+        as_string(
+            abi.at("solve_desc_payload"), "abi.solve_desc_payload") !=
+            cmd::SOLVE_DESC_PAYLOAD_KIND) {
+        fail(
+            "solve-scope artifacts must declare "
+            "abi.solve_desc_payload = \"front_variable_indices_u32\"");
+    }
+    const json& solve = require_object(manifest, "solve", "manifest");
+    const auto expect_string = [&](const char* key, const char* expected) {
+        if (as_string(require_key(solve, key, "solve"), std::string("solve.") + key) !=
+            expected) {
+            fail(std::string("solve.") + key + " is not the declared contract");
+        }
+    };
+    expect_string("chain", "serial");
+    expect_string("forward_order", "factorization_order");
+    expect_string("backward_order", "reverse_factorization_order");
+    expect_string(
+        "solution_semantics", "zero-initialized accumulator; final = x_hat");
+    expect_string("p_vector_semantics", "gather_within_pivot_block");
+    if (require_key(solve, "rhs_read_only", "solve").get<bool>() != true) {
+        fail("solve.rhs_read_only must be true");
+    }
+    const json& workspace_rows = require_array(solve, "workspace_rows", "solve");
+    if (workspace_rows.size() != 2 ||
+        as_string(workspace_rows.at(0), "solve.workspace_rows") != "forward_z" ||
+        as_string(workspace_rows.at(1), "solve.workspace_rows") != "backward_scratch") {
+        fail("solve.workspace_rows mismatch");
+    }
+    const std::uint32_t depth =
+        as_u32(require_key(solve, "row_buffer_depth", "solve"), "solve.row_buffer_depth");
+    if (depth == 0) {
+        fail("solve.row_buffer_depth must be positive");
+    }
+
+    const json& symbolic = require_object(manifest, "symbolic", "manifest");
+    const json& order_json = require_array(symbolic, "factorization_order", "symbolic");
+    std::vector<std::int64_t> order;
+    order.reserve(order_json.size());
+    for (const auto& value : order_json) {
+        order.push_back(as_i64(value, "factorization_order"));
+    }
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> forwards;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> backwards;
+    for (const auto& command : *probe.commands) {
+        if (command.opcode == cmd::Opcode::SolveForward) {
+            forwards.emplace_back(command.command_id, command.node_id);
+        } else if (command.opcode == cmd::Opcode::SolveBackward) {
+            backwards.emplace_back(command.command_id, command.node_id);
+        }
+    }
+    if (forwards.size() != order.size() || backwards.size() != order.size()) {
+        fail("every node must own exactly one SOLVE_FORWARD and one SOLVE_BACKWARD");
+    }
+    std::sort(forwards.begin(), forwards.end());
+    std::sort(backwards.begin(), backwards.end());
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        if (forwards[index].second != order[index] ||
+            backwards[index].second != order[order.size() - 1 - index]) {
+            fail("solve chain is not in factorization (topological) order");
+        }
+    }
+
+    std::map<std::uint32_t, std::uint32_t> commit_token;
+    for (const auto& command : *probe.commands) {
+        if (command.opcode == cmd::Opcode::NodeCommit) {
+            commit_token[command.node_id] = command.signal_token;
+        }
+    }
+    const auto waits_of = [&](const cmd::Command& command) {
+        std::set<std::uint32_t> waits;
+        if (command.wait_list_id != cmd::NONE) {
+            const auto dependency =
+                descriptor_at(probe, command.wait_list_id, "solve wait list");
+            if (dependency.descriptor_type != cmd::DescriptorType::Dependency) {
+                fail("solve wait_list_id is not a DEPENDENCY_DESC");
+            }
+            const auto tokens = cmd::DescriptorCodec::dependency_tokens(
+                dependency, *probe.image, probe.config->token_count,
+                probe.config->max_wait_tokens);
+            waits.insert(tokens.begin(), tokens.end());
+        }
+        return waits;
+    };
+    // No global solve gate (T12 design doc §2, revised 2026-10-11): every
+    // solve command waits on its own commit plus the previous solve command.
+    std::uint32_t previous = cmd::NONE;
+    for (std::uint32_t index = 0; index < forwards.size(); ++index) {
+        const auto& command = probe.commands->at(forwards[index].first);
+        const auto waits = waits_of(command);
+        if (commit_token.count(command.node_id) == 0 ||
+            waits.count(commit_token[command.node_id]) == 0) {
+            fail("SOLVE_FORWARD must wait for its own node commit");
+        }
+        if (index > 0 && waits.count(previous) == 0) {
+            fail("SOLVE_FORWARD chain is not serial");
+        }
+        previous = command.command_id;
+    }
+    for (std::uint32_t index = 0; index < backwards.size(); ++index) {
+        const auto& command = probe.commands->at(backwards[index].first);
+        const auto waits = waits_of(command);
+        if (commit_token.count(command.node_id) == 0 ||
+            waits.count(commit_token[command.node_id]) == 0) {
+            fail("SOLVE_BACKWARD must wait for its own node commit");
+        }
+        if (waits.count(previous) == 0) {
+            fail("SOLVE_BACKWARD chain is not serial");
+        }
+        previous = command.command_id;
+    }
+
+    const json& nodes = require_object(manifest, "nodes", "manifest");
+    std::optional<std::uint64_t> buffer_bytes;
+    if (compiler.contains("device_buffer_bytes")) {
+        buffer_bytes = as_u64(
+            compiler.at("device_buffer_bytes"), "compiler.device_buffer_bytes");
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> all_solve = forwards;
+    all_solve.insert(all_solve.end(), backwards.begin(), backwards.end());
+    for (const auto& [command_id, node_id] : all_solve) {
+        const auto& command = probe.commands->at(command_id);
+        const auto descriptor =
+            descriptor_at(probe, command.descriptor_id, "solve command");
+        if (descriptor.descriptor_type != cmd::DescriptorType::Solve) {
+            fail("solve command does not use a SOLVE_DESC");
+        }
+        const auto factor =
+            descriptor_at(probe, descriptor.body_words[0], "solve factor");
+        const std::uint32_t total = factor.body_words[3];
+        const std::uint32_t pivot = factor.body_words[4];
+        if (descriptor.payload_bytes != 4ull * total) {
+            fail("SOLVE_DESC payload_bytes must equal 4 * FACTOR_DESC.total_dim");
+        }
+        const std::string key = std::to_string(node_id);
+        if (!nodes.contains(key)) {
+            fail("solve command references an unknown node");
+        }
+        const json& front_indices =
+            require_array(nodes.at(key), "front_indices", key);
+        if (front_indices.size() != total) {
+            fail("SOLVE_DESC payload size does not match manifest front_indices");
+        }
+        for (std::uint32_t index = 0; index < total; ++index) {
+            const std::uint32_t variable = read_u32(
+                *probe.image, descriptor.payload_offset + 4ull * index);
+            if (variable !=
+                as_u32(front_indices.at(index), key + ".front_indices")) {
+                fail("SOLVE_DESC payload does not match manifest front_indices");
+            }
+            if (index < pivot && variable !=
+                    read_u32(*probe.image, descriptor.payload_offset) + index) {
+                fail("SOLVE_DESC payload is not the contiguous node range");
+            }
+        }
+        if (buffer_bytes.has_value()) {
+            const std::uint64_t required =
+                4ull * (depth * total + 2ull * total + pivot);
+            if (required > *buffer_bytes) {
+                fail("node solve scratch exceeds device_buffer_bytes");
+            }
         }
     }
 }
@@ -992,6 +1193,7 @@ LoadedArtifact load_artifact_from_bytes(
     validate_pivot_contract(probe, manifest, config);
     validate_command_semantics(probe, image);
     validate_nodes(manifest, probe);
+    validate_solve_contract(probe, manifest);
     validate_completion_templates(commands, completions);
 
     if (manifest.contains("expected_completions")) {

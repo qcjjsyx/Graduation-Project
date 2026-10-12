@@ -10,8 +10,6 @@ def load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_m
         return generate_random_spd(n=n, density=density, seed=seed)
 
     if path.endswith(".mat"):
-        from src.matrix_compress.compress import read_mat_file
-
         matrix = read_mat_file(path)
     else:
         matrix = sp.csr_matrix(scipy.io.mmread(path))
@@ -24,6 +22,32 @@ def load_matrix(path: str | None, n: int, density: float, seed: int) -> sp.csr_m
     if not np.all(np.isfinite(matrix.data)):
         raise ValueError("matrix contains non-finite values")
     return matrix
+
+
+def read_mat_file(path: str, key: str | None = None) -> sp.csr_matrix:
+    """Load a MATLAB ``.mat`` file and return its matrix as CSR.
+
+    With ``key=None`` the first 2-D dense or sparse entry is used.
+    """
+    data = scipy.io.loadmat(path)
+    if key is not None:
+        if key not in data:
+            raise KeyError(f"key {key!r} not found in {path}")
+        return _matrix_to_csr(data[key])
+    for name, value in data.items():
+        if name.startswith("__"):
+            continue
+        if (sp.issparse(value) or isinstance(value, np.ndarray)) and value.ndim == 2:
+            return _matrix_to_csr(value)
+    raise ValueError(f"no 2-D matrix found in {path}")
+
+
+def _matrix_to_csr(value) -> sp.csr_matrix:
+    if sp.issparse(value):
+        return sp.csr_matrix(value)
+    if isinstance(value, np.ndarray):
+        return sp.csr_matrix(value)
+    raise TypeError("unsupported matrix type in .mat file")
 
 
 def load_vector(path: str, expected_size: int) -> np.ndarray:

@@ -246,6 +246,11 @@ void DescriptorReader::plan_references(Task& task) {
         for (std::size_t index = 0; index < 5; ++index) {
             task.refs.push_back(Ref{body[index]});
         }
+        if (task.record.payload_bytes != 0) {
+            task.payload_pending = true;
+            task.payload_address = task.record.payload_offset;
+            task.payload_length = task.record.payload_bytes;
+        }
         break;
     case ReadKind::Dependency:
         if (task.record.payload_bytes != 0) {
@@ -338,6 +343,13 @@ void DescriptorReader::on_reference(
         ref.descriptor.descriptor_type == cmd::DescriptorType::Front) {
         // Kernel operands are FRONT_DESC; resolve each front region as well.
         task.refs.push_back(Ref{ref.descriptor.body_words[0]});
+    }
+    if (task.kind == ReadKind::Solve &&
+        ref.descriptor.descriptor_type == cmd::DescriptorType::Factor) {
+        // T12: the solve unit reads the L/U rows itself, so the factor's L and
+        // U region descriptors must be resolved into the view as well.
+        task.refs.push_back(Ref{ref.descriptor.body_words[0]});
+        task.refs.push_back(Ref{ref.descriptor.body_words[1]});
     }
     task.refs[task.next_ref] = std::move(ref);
     ++task.next_ref;
@@ -731,6 +743,22 @@ bool DescriptorReader::finalize(
             *reason = "SOLVE_DESC and FACTOR_DESC must reference one P-vector";
             return false;
         }
+        if (task.refs.size() < 7 || !task.refs[5].is_region ||
+            !task.refs[6].is_region) {
+            *reason = "solve factor L/U regions were not resolved";
+            return false;
+        }
+        view.factor.l = task.refs[5].region;
+        view.factor.u = task.refs[6].region;
+        if (!require_fp32(view.factor.l, "solve factor L region", reason)) return false;
+        if (!require_fp32(view.factor.u, "solve factor U region", reason)) return false;
+        if (view.factor.l.rows < view.factor.total_dim ||
+            view.factor.l.cols < view.factor.pivot_dim ||
+            view.factor.u.rows < view.factor.pivot_dim ||
+            view.factor.u.cols < view.factor.total_dim) {
+            *reason = "solve factor L/U regions are smaller than n x p / p x n";
+            return false;
+        }
         if (!require_fp32(view.rhs, "solve RHS region", reason)) return false;
         if (!require_fp32(view.solution, "solve solution region", reason)) return false;
         if (view.rhs.rows < view.rhs_count ||
@@ -752,6 +780,38 @@ bool DescriptorReader::finalize(
             static_cast<std::uint64_t>(2) * view.factor.pivot_dim) {
             *reason = "solve workspace is too small";
             return false;
+        }
+        // T12 payload: one u32 front variable index per front row; the device
+        // gathers/scatters in global variable space with it.
+        if (task.payload.size() !=
+            static_cast<std::size_t>(4) * view.factor.total_dim) {
+            *reason =
+                "SOLVE_DESC payload must hold one u32 front variable index per "
+                "front row (4 * total_dim bytes)";
+            return false;
+        }
+        view.variables = decode_u32_payload(task.payload);
+        const std::uint64_t dimension =
+            std::min<std::uint64_t>(view.rhs.cols, view.solution.cols);
+        std::set<std::uint32_t> seen_variables;
+        for (const auto variable : view.variables) {
+            if (variable >= dimension) {
+                *reason = "SOLVE_DESC front variable is outside the RHS/solution";
+                return false;
+            }
+            if (!seen_variables.insert(variable).second) {
+                *reason = "SOLVE_DESC front variables contain duplicates";
+                return false;
+            }
+        }
+        for (std::uint32_t index = 0; index < view.factor.pivot_dim; ++index) {
+            if (view.variables[index] !=
+                view.variables[0] + index) {
+                *reason =
+                    "SOLVE_DESC pivot prefix must be the contiguous ascending "
+                    "node range";
+                return false;
+            }
         }
         outcome.solve = view;
         return true;

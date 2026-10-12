@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Sequence
@@ -15,6 +16,7 @@ from src.command_codec import (
     PVECTOR_ELEMENT_BYTES,
     PVECTOR_INIT_VALUE,
     SCALE_AUTO,
+    SOLVE_DESC_PAYLOAD_KIND,
     Command,
     Completion,
     DataFormat,
@@ -46,6 +48,22 @@ class CommandCompileError(ValueError):
 # dual-front device: two independent fronts alternate command-by-command, and
 # wider forests are emitted pair by pair (documented command-order constraint).
 INTERLEAVE_WIDTH = 2
+
+# Solve row-buffer depth assumed by the compile-time solve-scratch check. It
+# mirrors the device default (`SolveConfig::row_buffer_depth = 2`). A device
+# configured with a larger depth may still refuse at runtime with BUFFER_FULL;
+# the compiler only guarantees the default configuration fits.
+SOLVE_ROW_BUFFER_DEPTH = 2
+
+
+def solve_scratch_bytes(total_dim: int, pivot_dim: int, depth: int = SOLVE_ROW_BUFFER_DEPTH) -> int:
+    """Upper bound of one node's solve scratch, in bytes (design doc §4.3).
+
+    Row buffer ``depth * total_dim`` + z + x (``2 * pivot_dim``) + c/update
+    (``total_dim``) + P-vector (``pivot_dim``) FP32/INT32 words.
+    """
+
+    return 4 * (depth * total_dim + 2 * total_dim + pivot_dim)
 
 
 @dataclass(frozen=True)
@@ -112,6 +130,8 @@ def compile_command_artifact(
     ordered_nodes, parent, matrix_dim = _validate_inputs(
         nodes, map_tables, local_fronts, permutation, rhs, config
     )
+    if config.emit_solve_commands:
+        _check_solve_capacity(ordered_nodes, config)
     region_specs = _build_data_regions(
         ordered_nodes, local_fronts, permutation, rhs, matrix_dim
     )
@@ -300,6 +320,16 @@ def _validate_inputs(
                 f"node {node.node_id} front size {node.total_dim} exceeds "
                 f"limit {config.max_front_size}"
             )
+        front_bytes = node.total_dim * node.total_dim * 4
+        if front_bytes > config.device_buffer_bytes:
+            largest = math.isqrt(config.device_buffer_bytes // 4)
+            raise CommandCompileError(
+                f"node {node.node_id} front {node.total_dim}x{node.total_dim} "
+                f"needs {front_bytes} B of FP32 scratchpad but the target "
+                f"device slot holds {config.device_buffer_bytes} B (largest "
+                f"front {largest}); try another --ordering or target a device "
+                f"with a larger --device-buffer-bytes"
+            )
         expected_prefix = tuple(range(node.node_range.start, node.node_range.end))
         if node.front_indices[: node.pivot_dim] != expected_prefix:
             raise CommandCompileError(
@@ -346,6 +376,27 @@ def _validate_inputs(
                     f"child {entry.child_id} parent-front map is invalid"
                 )
     return ordered, parent, matrix_dim
+
+
+def _check_solve_capacity(
+    nodes: Sequence[NodeCompileRecord], config: CommandCompilerConfig
+) -> None:
+    """Reject a batch whose solve scratch cannot fit the target device slot.
+
+    Mirrors the device-side requirement (solve unit + design doc §4.3); a
+    runtime BUFFER_FULL after a long factorization would be much worse than a
+    compile-time error here.
+    """
+
+    for node in nodes:
+        required = solve_scratch_bytes(node.total_dim, node.pivot_dim)
+        if required > config.device_buffer_bytes:
+            raise CommandCompileError(
+                f"node {node.node_id} needs {required} B of solve scratch "
+                f"(row buffer depth {SOLVE_ROW_BUFFER_DEPTH}) but the target "
+                f"device slot holds {config.device_buffer_bytes} B; compile "
+                f"with a larger --device-buffer-bytes or a smaller front"
+            )
 
 
 def _build_data_regions(
@@ -579,6 +630,10 @@ def _build_static_descriptors(
                         "direction": direction,
                         "format": DataFormat.FP32,
                     },
+                    # T12: both solve commands carry the node's front variable
+                    # table so the device can gather/scatter in global (Q-order)
+                    # variable space without any host-side mapping.
+                    payload=_pack_u32(node.front_indices),
                 )
             )
 
@@ -826,25 +881,39 @@ def _build_commands(
     if not emit_solve_commands:
         return commands, node_command_ids, node_tokens
 
+    # T12 serial solve chain in factorization (children-before-parents) order:
+    # sibling forwards would read-modify-write the same ancestor variables, so
+    # the chain is serial; backward runs in the exact reverse order.  Every
+    # solve command waits on its own node's commit token plus the previous
+    # solve command (the first forward waits on its own commit only), so no
+    # wait list is longer than 2 and the node count is not bounded by
+    # max_wait_tokens.
+    #
+    # Failure semantics (T12 design doc §2/§4.4, revised 2026-10-11): if the
+    # factorization of node k_j fails, forward(k_j), every later forward and
+    # every backward complete DEPENDENCY_FAILED; forwards before k_j may be OK.
+    # The device exits non-zero, tree_solve_check rejects the run because not
+    # all solve commands are OK, and solution_data is meaningless in that case.
+    solve_order = sibling_friendly_order(list(parent))
     previous: int | None = None
-    for node in nodes:
-        solve_waits = [node_tokens[node.node_id]["commit"]]
+    for node_id in solve_order:
+        solve_waits = [node_tokens[node_id]["commit"]]
         if previous is not None:
             solve_waits.append(previous)
         previous = emit(
             Opcode.SOLVE_FORWARD,
-            node.node_id,
-            f"node.{node.node_id}.solve_forward",
+            node_id,
+            f"node.{node_id}.solve_forward",
             solve_waits,
             "solve_forward",
         )
-    for node in reversed(nodes):
+    for node_id in reversed(solve_order):
         assert previous is not None
         previous = emit(
             Opcode.SOLVE_BACKWARD,
-            node.node_id,
-            f"node.{node.node_id}.solve_backward",
-            (previous, node_tokens[node.node_id]["commit"]),
+            node_id,
+            f"node.{node_id}.solve_backward",
+            (previous, node_tokens[node_id]["commit"]),
             "solve_backward",
         )
     return commands, node_command_ids, node_tokens
@@ -1000,6 +1069,11 @@ def _build_manifest(
             "descriptor_record_bytes": DESCRIPTOR_RECORD_BYTES,
             "completion_record_bytes": COMPLETION_RECORD_BYTES,
             "pivot_policy_field": "FRONT_DESC.body_words[8..9]",
+            **(
+                {"solve_desc_payload": SOLVE_DESC_PAYLOAD_KIND}
+                if config.emit_solve_commands
+                else {}
+            ),
         },
         "compiler": {
             "operation_scope": "factorization_and_solve" if config.emit_solve_commands else "factorization_only",
@@ -1133,6 +1207,37 @@ def _build_manifest(
                 "the device must not infer the elimination forest itself"
             ),
         },
+        **(
+            {
+                "solve": {
+                    "chain": "serial",
+                    "forward_order": "factorization_order",
+                    "backward_order": "reverse_factorization_order",
+                    "solution_semantics": (
+                        "zero-initialized accumulator; final = x_hat"
+                    ),
+                    "rhs_read_only": True,
+                    "workspace_rows": ["forward_z", "backward_scratch"],
+                    "p_vector_semantics": "gather_within_pivot_block",
+                    "row_buffer_depth": SOLVE_ROW_BUFFER_DEPTH,
+                    "scratch_bytes_formula": (
+                        "4 * (depth * total_dim + 2 * total_dim + pivot_dim)"
+                    ),
+                    "scratch_bytes_per_node": {
+                        str(node.node_id): solve_scratch_bytes(
+                            node.total_dim, node.pivot_dim
+                        )
+                        for node in ordered_nodes
+                    },
+                    "max_scratch_bytes": max(
+                        solve_scratch_bytes(node.total_dim, node.pivot_dim)
+                        for node in ordered_nodes
+                    ),
+                },
+            }
+            if config.emit_solve_commands
+            else {}
+        ),
         "descriptor_table": {
             "region": "descriptor_table",
             "payload_region": "descriptor_payload",

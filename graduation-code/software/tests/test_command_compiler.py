@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
@@ -410,3 +411,29 @@ def test_interleaved_stream_keeps_order_invariants():
         for c in commands[first_solve:]
     )
     assert commands[-1].opcode == Opcode.SOLVE_BACKWARD
+
+
+def test_front_must_fit_target_device_scratchpad():
+    # A 2-variable front is 2*2*4 = 16 B of FP32: a 15 B slot cannot hold it.
+    with pytest.raises(CommandCompileError, match="scratchpad"):
+        _tree_fixture(CommandCompilerConfig(device_buffer_bytes=15))
+    artifact = _tree_fixture(CommandCompilerConfig(device_buffer_bytes=16 * 1024))
+    assert artifact.manifest["compiler"]["device_buffer_bytes"] == 16 * 1024
+    with pytest.raises(ValueError):
+        CommandCompilerConfig(device_buffer_bytes=0)
+    with pytest.raises(ValueError):
+        CommandCompilerConfig(max_front_size=513)  # device Panel engine limit
+
+
+def test_manifest_validator_rejects_front_larger_than_device_buffer(tmp_path):
+    from src.verify.manifest import ManifestValidationError, validate_manifest
+
+    artifact = _tree_fixture()
+    largest = max(node["total_dim"] for node in artifact.manifest["nodes"].values())
+    manifest = json.loads(json.dumps(artifact.manifest))
+    manifest["compiler"]["device_buffer_bytes"] = largest * largest * 4 - 1
+    (tmp_path / "memory_image.bin").write_bytes(artifact.image)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ManifestValidationError, match="device_buffer_bytes"):
+        validate_manifest(path)

@@ -213,6 +213,21 @@ def main() -> None:
     )
     write("golden_region_descriptor", region.to_bytes())
 
+    # T12 SOLVE_DESC: the payload carries the node's front variable indices
+    # (u32[total_dim]); the record itself must declare u32 alignment and a
+    # nonzero multiple-of-4 payload. The companion payload fixture holds the
+    # three indices of the same example node.
+    write(
+        "solve_descriptor",
+        Descriptor(
+            descriptor_type=DescriptorType.SOLVE_DESC,
+            payload_offset=0x100,
+            payload_bytes=12,
+            body_words=(5, 6, 7, 8, 9, 1, 1, int(DataFormat.FP32), 0, 0),
+        ).to_bytes(),
+    )
+    write("solve_payload", bytes.fromhex("000000000400000006000000"))
+
 
 if __name__ == "__main__":
     main()

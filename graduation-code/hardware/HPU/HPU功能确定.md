@@ -91,3 +91,14 @@ SystemC HPU 和 RTL HPU 必须共享：
 - reset 和连续两段候选；
 - 非法/溢出数值状态。
 
+
+## 7. 当前 RTL 与本规范的差异（2026-10-10）
+
+| 规范 | 当前 `hpu_top` / `hpu_core_tree` |
+|---|---|
+| 信号名 `candidate_*`、`pivot_logical_row`、`pivot_not_found`、`pivot_unstable` | `in_*`、`pivot_row`、`pivot_fail`；没有 `pivot_unstable`（阈值判定不在 HPU） |
+| tie-break 推荐“较小 logical row” | “最早到达的候选”。候选按行号升序送入时二者等价 |
+| 数值格式 | `DATA_W` 位有符号整数比较；未处理 FP32 / NaN |
+| 空候选 | LOAD 至少收到一个候选才结束，空段不可达；防御性地输出 `valid=1, fail=1` |
+
+握手语义（每个请求恰好一个结果、背压下保持稳定）已由 `tb_code/tb_hpu_handshake.sv` 自检。

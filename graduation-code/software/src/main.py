@@ -25,7 +25,7 @@ from src.config import (
 from src.pipeline import run_pipeline
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sparse-solver Command v2 compiler")
     parser.add_argument("-mtx", "--mtx", type=str, default=None)
     parser.add_argument("--out", type=Path, default=Path("out"))
@@ -47,6 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pivot-threshold", type=float, default=0.0)
     parser.add_argument("--max-supernode-size", type=int, default=256)
     parser.add_argument("--max-front-size", type=int, default=256)
+    parser.add_argument(
+        "--device-buffer-bytes",
+        type=int,
+        default=64 * 1024,
+        help="target device scratchpad slot size in bytes; every FP32 front "
+        "must fit (default 65536 -> front <= 128)",
+    )
     parser.add_argument("--tile-size", type=int, default=16)
     parser.add_argument("--max-wait-tokens", type=int, default=256)
     parser.add_argument(
@@ -67,8 +74,23 @@ def parse_args() -> argparse.Namespace:
         help="top-level GEMM_SCHUR backend; INT32 switches only that kernel "
         "and emits a SCALE_DESC per node (device front/DDR stays FP32)",
     )
-    parser.add_argument("--factorization-only", action="store_true",
-                        help="emit T11 factorization commands without T12 tree solve")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--factorization-only",
+        dest="emit_solve_commands",
+        action="store_false",
+        help="emit factorization commands only; the device entry "
+        "tree_factor_device accepts both scopes, but a factorization-only "
+        "artifact stops before the solve chain",
+    )
+    scope.add_argument(
+        "--emit-solve-commands",
+        dest="emit_solve_commands",
+        action="store_true",
+        help="compatibility alias for the default scope (T12: the device now "
+        "executes SOLVE_FORWARD/SOLVE_BACKWARD)",
+    )
+    parser.set_defaults(emit_solve_commands=True)
     parser.add_argument(
         "--gemm-effective-bits",
         type=int,
@@ -81,11 +103,11 @@ def parse_args() -> argparse.Namespace:
         default="FAIL",
         help="SCALE_DESC saturation policy (default FAIL)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     outputs = run_pipeline(
         PipelineConfig(
             matrix=MatrixInputConfig(
@@ -110,8 +132,9 @@ def main() -> None:
             command=CommandCompilerConfig(
                 tile_size=args.tile_size,
                 max_front_size=args.max_front_size,
+                device_buffer_bytes=args.device_buffer_bytes,
                 max_wait_tokens=args.max_wait_tokens,
-                emit_solve_commands=not args.factorization_only,
+                emit_solve_commands=args.emit_solve_commands,
             ),
             gemm=GemmConfig(
                 backend=args.gemm_backend,
@@ -148,8 +171,22 @@ def main() -> None:
         f" (effective_bits={args.gemm_effective_bits}, "
         f"saturation={args.gemm_saturation})"
     )
+    print(
+        "operation_scope: "
+        + ("factorization_and_solve" if args.emit_solve_commands else "factorization_only")
+    )
     print(f"out_dir: {outputs.out_dir}")
 
 
+def cli() -> int:
+    """Console entry: report compile/validation errors without a traceback."""
+    try:
+        main()
+    except (ValueError, OSError) as exc:  # CommandCompileError etc. are ValueErrors
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(cli())

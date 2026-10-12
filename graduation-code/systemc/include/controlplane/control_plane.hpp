@@ -15,6 +15,7 @@
 #include "controlplane/dma_arbiter.hpp"
 #include "controlplane/exec_types.hpp"
 #include "controlplane/assembly_exec_unit.hpp"
+#include "controlplane/solve_exec_unit.hpp"
 #include "controlplane/test_stub_unit.hpp"
 #include "controlplane/token_scoreboard.hpp"
 #include "dataplane/dataplane.hpp"
@@ -48,7 +49,12 @@ struct ControlPlaneConfig {
     // T07 real backend: binds the shared PanelEngine to Panel slots and the
     // FactorStoreUnit to STORE_FACTOR. Explicitly selected, never implicit.
     bool enable_real_panel{false};
+    // T12: binds SolveExecutionUnit to SOLVE_FORWARD/SOLVE_BACKWARD and routes
+    // them through their own DDR accesses (bypassing the T05 whole-RHS DMA
+    // copy path). Default false keeps the legacy solve semantics of T05/T07.
+    bool enable_real_solve{false};
     hw::panel_lu::PanelLuConfig panel;
+    SolveConfig solve;
     AssemblyConfig assembly;
     hw::dataplane::MemoryServiceConfig memory;
     hw::dataplane::DmaConfig dma;
@@ -320,6 +326,7 @@ private:
     void try_execute(Tracker& tracker, std::uint64_t cycle);
     IExecutionUnit* find_free_unit(UnitKind kind);
     bool unit_bound(UnitKind kind) const;
+    bool try_execute_real_solve(Tracker& tracker, std::uint64_t cycle);
     bool issue_solve_store(Tracker& tracker, std::uint64_t cycle);
     bool submit_pvector_write(Tracker& tracker, std::uint64_t cycle);
     std::uint64_t enqueue_dma_job(
@@ -372,6 +379,11 @@ private:
     std::deque<std::unique_ptr<Tracker>> trackers_;
     std::set<std::uint32_t> aborted_nodes_;
     std::set<std::uint32_t> commit_seen_;
+    // Nodes whose NODE_COMMIT reached a terminal completion (OK or failed).
+    // Solve commands stay parked (not counted against the scheduling window)
+    // until every commit is terminal: a window anti-deadlock measure so that
+    // trailing solve commands cannot starve node commands still to be pulled.
+    std::set<std::uint32_t> commits_finished_;
     std::map<std::uint32_t, hw::command::StatusCode> completion_status_;
 
     // Bookkeeping maps.

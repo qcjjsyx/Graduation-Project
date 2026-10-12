@@ -151,7 +151,7 @@ class PanelEngine : public TileVersionStore {
 public:
     explicit PanelEngine(PanelLuConfig config);
 
-    // TileVersionStore (keys are (slot << 32) | (tile_index + 1)).
+    // TileVersionStore (keys are tile_version_key(slot, view, tile_index)).
     std::uint32_t version(std::uint64_t key) const override;
     bool commit(std::uint64_t key, std::uint32_t expected_version) override;
 

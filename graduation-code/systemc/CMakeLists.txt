@@ -127,6 +127,7 @@ add_library(controlplane STATIC
     src/controlplane/completion_writer.cpp
     src/controlplane/dma_arbiter.cpp
     src/controlplane/panel_exec_unit.cpp
+    src/controlplane/solve_exec_unit.cpp
     src/controlplane/assembly_exec_unit.cpp
     src/controlplane/test_stub_unit.cpp
     src/controlplane/control_plane.cpp
@@ -144,10 +145,21 @@ target_link_libraries(tree_artifact_checker PUBLIC fp64_reference dataplane)
 enable_project_warnings(tree_artifact_checker)
 enable_project_sanitizers(tree_artifact_checker)
 
+add_library(tree_solve_checker STATIC reference/src/tree_solve_check.cpp)
+target_include_directories(tree_solve_checker PUBLIC reference/include PRIVATE third_party)
+target_link_libraries(tree_solve_checker PUBLIC fp64_reference dataplane)
+enable_project_warnings(tree_solve_checker)
+enable_project_sanitizers(tree_solve_checker)
+
 add_executable(tree_factor_check reference/tools/tree_factor_check.cpp)
 target_link_libraries(tree_factor_check PRIVATE tree_artifact_checker)
 enable_project_warnings(tree_factor_check)
 enable_project_sanitizers(tree_factor_check)
+
+add_executable(tree_solve_check reference/tools/tree_solve_check.cpp)
+target_link_libraries(tree_solve_check PRIVATE tree_solve_checker)
+enable_project_warnings(tree_solve_check)
+enable_project_sanitizers(tree_solve_check)
 
 add_executable(tree_factor_device src/tree_factor_device.cpp)
 target_include_directories(tree_factor_device PRIVATE third_party)
@@ -170,6 +182,31 @@ enable_project_warnings(tree_real_systemc_tests)
 enable_project_sanitizers(tree_real_systemc_tests)
 if(SYSTEMC_HOME AND APPLE)
     set_target_properties(tree_real_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
+endif()
+
+add_executable(solve_real_tests tests/solve_real_tests.cpp)
+target_link_libraries(solve_real_tests PRIVATE controlplane fp64_reference)
+enable_project_warnings(solve_real_tests)
+enable_project_sanitizers(solve_real_tests)
+
+add_executable(tree_solve_real_tests tests/tree_solve_real_tests.cpp)
+target_include_directories(tree_solve_real_tests PRIVATE third_party)
+target_link_libraries(tree_solve_real_tests PRIVATE controlplane tree_solve_checker)
+enable_project_warnings(tree_solve_real_tests)
+enable_project_sanitizers(tree_solve_real_tests)
+
+add_executable(tree_solve_check_tests tests/tree_solve_check_tests.cpp)
+target_link_libraries(tree_solve_check_tests PRIVATE tree_solve_checker)
+enable_project_warnings(tree_solve_check_tests)
+enable_project_sanitizers(tree_solve_check_tests)
+
+add_executable(tree_solve_systemc_tests tests/tree_solve_systemc_tests.cpp)
+target_include_directories(tree_solve_systemc_tests PRIVATE third_party)
+target_link_libraries(tree_solve_systemc_tests PRIVATE controlplane tree_solve_checker SystemC::systemc)
+enable_project_warnings(tree_solve_systemc_tests)
+enable_project_sanitizers(tree_solve_systemc_tests)
+if(SYSTEMC_HOME AND APPLE)
+    set_target_properties(tree_solve_systemc_tests PROPERTIES BUILD_RPATH "${SYSTEMC_HOME}/lib")
 endif()
 
 add_executable(controlplane_core_tests tests/controlplane_core_tests.cpp)
@@ -365,6 +402,67 @@ if(BUILD_TESTING)
     add_test(NAME tree_real_systemc_tests COMMAND tree_real_systemc_tests "${T11_FIXTURE_DIR}"
         "${CMAKE_CURRENT_BINARY_DIR}/t11_systemc_output")
     set_tests_properties(tree_real_systemc_tests PROPERTIES DEPENDS t11_generate_fixtures)
+    add_test(NAME solve_real_tests COMMAND solve_real_tests)
+    add_test(NAME tree_solve_check_tests COMMAND tree_solve_check_tests)
+
+    set(T12_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/t12_fixtures")
+    add_test(NAME t12_generate_fixtures COMMAND "${T04_PYTHON}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/t12_fixture_gen.py" --out "${T12_FIXTURE_DIR}")
+    add_test(NAME tree_solve_real_tests COMMAND tree_solve_real_tests "${T12_FIXTURE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/t12_output")
+    set_tests_properties(tree_solve_real_tests PROPERTIES DEPENDS t12_generate_fixtures)
+    add_test(NAME tree_solve_systemc_tests COMMAND tree_solve_systemc_tests "${T12_FIXTURE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/t12_systemc_output")
+    set_tests_properties(tree_solve_systemc_tests PROPERTIES DEPENDS t12_generate_fixtures)
+    foreach(mode fp32 int32)
+        if(mode STREQUAL "fp32")
+            set(T12_BACKEND "FP32_SYSTEMC")
+        else()
+            set(T12_BACKEND "FP32_SYSTEMC_INT32_GEMM")
+        endif()
+        add_test(NAME tree_solve_device_${mode} COMMAND tree_factor_device
+            --device-dir "${T12_FIXTURE_DIR}/three_level/${mode}/solve/device"
+            --out "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/${mode}" --backend "${T12_BACKEND}")
+        set_tests_properties(tree_solve_device_${mode} PROPERTIES DEPENDS t12_generate_fixtures)
+        add_test(NAME tree_solve_cli_check_${mode} COMMAND tree_solve_check
+            "${T12_FIXTURE_DIR}/three_level/${mode}/solve/device"
+            "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/${mode}")
+        set_tests_properties(tree_solve_cli_check_${mode} PROPERTIES DEPENDS tree_solve_device_${mode})
+    endforeach()
+    add_test(NAME tree_solve_device_pivot_failure COMMAND tree_factor_device
+        --device-dir "${T12_FIXTURE_DIR}/pivot_propagation/int32/solve/device"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/pivot_failure"
+        --backend FP32_SYSTEMC_INT32_GEMM)
+    set_tests_properties(tree_solve_device_pivot_failure PROPERTIES
+        DEPENDS t12_generate_fixtures WILL_FAIL TRUE)
+    # More nodes than the default max_wait_tokens (no global solve gate).
+    add_test(NAME tree_solve_device_wide_tree COMMAND tree_factor_device
+        --device-dir "${T12_FIXTURE_DIR}/wide_tree/device"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/wide_tree" --backend FP32_SYSTEMC)
+    set_tests_properties(tree_solve_device_wide_tree PROPERTIES
+        DEPENDS t12_generate_fixtures TIMEOUT 600)
+    add_test(NAME tree_solve_cli_check_wide_tree COMMAND tree_solve_check
+        "${T12_FIXTURE_DIR}/wide_tree/device"
+        "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/wide_tree")
+    set_tests_properties(tree_solve_cli_check_wide_tree PROPERTIES
+        DEPENDS tree_solve_device_wide_tree)
+    # PANEL_LU tile-version key alias regression (2026-10-11): 102-node random
+    # matrix that stalled before the fix; ~45k cycles after it, so a 300k
+    # cycle budget fails fast (batch timeout) on the aliased key.
+    add_test(NAME tree_factor_device_slot_alias COMMAND tree_factor_device
+        --device-dir "${T12_FIXTURE_DIR}/slot_alias/device"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/slot_alias" --backend FP32_SYSTEMC
+        --max-cycles 300000)
+    set_tests_properties(tree_factor_device_slot_alias PROPERTIES
+        DEPENDS t12_generate_fixtures TIMEOUT 120)
+    add_test(NAME tree_factor_check_slot_alias COMMAND tree_factor_check
+        "${T12_FIXTURE_DIR}/slot_alias/device"
+        "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/slot_alias")
+    add_test(NAME tree_solve_cli_check_slot_alias COMMAND tree_solve_check
+        "${T12_FIXTURE_DIR}/slot_alias/device"
+        "${CMAKE_CURRENT_BINARY_DIR}/t12_cli/slot_alias")
+    set_tests_properties(tree_factor_check_slot_alias tree_solve_cli_check_slot_alias
+        PROPERTIES DEPENDS tree_factor_device_slot_alias)
     foreach(mode fp32 int32)
         if(mode STREQUAL "fp32")
             set(T11_BACKEND "FP32_SYSTEMC")

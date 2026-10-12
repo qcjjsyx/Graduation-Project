@@ -519,3 +519,90 @@ def test_pivot_policy_config_shares_the_device_threshold():
     assert encode_pivot_threshold(config.threshold_ratio) == encode_pivot_threshold(0.1)
     with pytest.raises(ValueError, match="underflows to zero"):
         PivotPolicyConfig(policy="STATIC", threshold_ratio=1e-50)
+
+
+def _solve_payload_batch(variables, *, total_dim=3, pivot_dim=2, payload_bytes=None):
+    """A minimal v2 batch with one SOLVE_DESC (payload at 0x100)."""
+
+    payload = struct.pack(f"<{len(variables)}I", *variables)
+    image = bytearray(0x100 + len(payload) + 4)
+    image[0x100 : 0x100 + len(payload)] = payload
+    memory = bytes(image)
+    factor = Descriptor(
+        DescriptorType.FACTOR_DESC,
+        body_words=(0, 1, 2, total_dim, pivot_dim, int(DataFormat.FP32), NONE, 0, 0, 0),
+    )
+    def vector_region() -> Descriptor:
+        body = (0, 0, 16, 0, 12, 1, 3, int(DataFormat.FP32),
+                int(DataLayout.ROW_MAJOR), 0)
+        return Descriptor(DescriptorType.REGION_DESC, body_words=body)
+
+    solve = Descriptor(
+        DescriptorType.SOLVE_DESC,
+        payload_offset=0x100,
+        payload_bytes=len(payload) if payload_bytes is None else payload_bytes,
+        body_words=(0, 1, 2, 3, 4, 1, int(SolveDirection.FORWARD),
+                    int(DataFormat.FP32), 0, 0),
+    )
+    descriptors = [
+        factor,
+        vector_region(),
+        vector_region(),
+        vector_region(),
+        vector_region(),
+        solve,
+    ]
+    commands = [
+        Command(Opcode.SOLVE_FORWARD, 0, 0, node_id=0, descriptor_id=5, signal_token=0)
+    ]
+    return commands, descriptors, memory
+
+
+def test_solve_desc_payload_roundtrip_and_negative_cases():
+    commands, descriptors, memory = _solve_payload_batch((0, 1, 2))
+    validate_command_batch(commands, descriptors, memory, token_count=1)
+    assert descriptors[5].solve_variables(memory) == (0, 1, 2)
+    golden = fixture("solve_descriptor.bin")
+    decoded = Descriptor.from_bytes(golden, memory_image_bytes=0x1000)
+    assert decoded.descriptor_type == DescriptorType.SOLVE_DESC
+    payload_memory = bytearray(0x100 + 12)
+    payload_memory[0x100:0x10C] = fixture("solve_payload.bin")
+    assert decoded.solve_variables(bytes(payload_memory)) == (0, 4, 6)
+
+    # Record-level negatives.
+    with pytest.raises(ValueError, match="u32 aligned"):
+        Descriptor(
+            DescriptorType.SOLVE_DESC,
+            payload_offset=0x102,
+            payload_bytes=12,
+            body_words=(0, 1, 2, 3, 4, 1, 1, int(DataFormat.FP32), 0, 0),
+        ).validate()
+    with pytest.raises(ValueError, match="front-variable-indices payload"):
+        Descriptor(
+            DescriptorType.SOLVE_DESC,
+            payload_offset=0x100,
+            payload_bytes=0,
+            body_words=(0, 1, 2, 3, 4, 1, 1, int(DataFormat.FP32), 0, 0),
+        ).validate()
+    with pytest.raises(ValueError, match="front-variable-indices payload"):
+        Descriptor(
+            DescriptorType.SOLVE_DESC,
+            payload_offset=0x100,
+            payload_bytes=6,
+            body_words=(0, 1, 2, 3, 4, 1, 1, int(DataFormat.FP32), 0, 0),
+        ).validate()
+
+    # Cross-record negatives: length must equal 4 * FACTOR_DESC.total_dim.
+    commands, descriptors, memory = _solve_payload_batch((0, 1, 2), payload_bytes=8)
+    with pytest.raises(ValueError, match="4 \\* FACTOR_DESC.total_dim"):
+        validate_command_batch(commands, descriptors, memory, token_count=1)
+
+    # Value negatives: out of range, duplicate, non-contiguous pivot prefix.
+    for variables, match in (
+        ((0, 1, 3), "out-of-range"),
+        ((0, 1, 1), "duplicate"),
+        ((0, 2, 1), "contiguous"),
+    ):
+        commands, descriptors, memory = _solve_payload_batch(variables)
+        with pytest.raises(ValueError, match=match):
+            validate_command_batch(commands, descriptors, memory, token_count=1)

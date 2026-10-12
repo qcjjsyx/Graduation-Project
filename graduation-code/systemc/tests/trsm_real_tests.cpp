@@ -1303,6 +1303,169 @@ void test_engine_group_exclusion_and_binding() {
     }
 }
 
+// Tile version keys are per front buffer slot: (slot << 48) | (view << 32) |
+// (tile + 1). PANEL_LU used to encode (slot << 32) | (tile + 1), so a panel on
+// buffer slot 2 bumped slot 0's A21 tile versions (2 << 32 == A21 tag) and was
+// never erased on slot reuse. A TRSM_RIGHT on slot 0 then waited forever for
+// its A21 destination version (the n=400 seed-0 device stall, 2026-10-11).
+void test_engine_slot_version_isolation() {
+    pl::PanelLuConfig config;
+    config.compute_group_count = 2;
+    config.pes_per_group = 1;
+    config.pe_count = 2;
+
+    const std::uint32_t n = 32;
+    const std::uint32_t p = 16;
+    // TRSM front: well-conditioned A11 (diag 2), arbitrary A21/A12.
+    std::vector<float> trsm_front(n * n, 0.0f);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        for (std::uint32_t j = 0; j < n; ++j) {
+            trsm_front[i * n + j] =
+                i == j ? 2.0f : 0.125f * static_cast<float>((i + 2 * j) % 5);
+        }
+    }
+    // PANEL front (n = p = 32): strictly diagonally dominant, so STATIC LU
+    // without pivoting succeeds (|off-diagonal row sum| <= 31 * 0.5 < 20).
+    std::vector<float> panel_front(n * n, 0.0f);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        for (std::uint32_t j = 0; j < n; ++j) {
+            panel_front[i * n + j] =
+                i == j ? 20.0f
+                       : 0.125f * static_cast<float>(
+                                      static_cast<int>((i * 7 + j * 13) % 9) - 4);
+        }
+    }
+
+    struct Staged {
+        dp::BufferHandle handle;
+        dp::BufferLease lease;
+    };
+    auto stage = [&](dp::BufferManager& buffers, const std::string& owner,
+                     const std::vector<float>& front, std::uint32_t slot_index) {
+        const auto allocate = buffers.allocate(owner, front.size() * 4, 0);
+        expect(allocate.ok && allocate.handle.slot == slot_index,
+               "slot versions: front staged on the expected buffer slot");
+        const auto lease = buffers.begin_write(
+            allocate.handle, owner, 0, front.size() * 4, 0);
+        std::vector<std::uint8_t> bytes(front.size() * 4);
+        std::memcpy(bytes.data(), front.data(), bytes.size());
+        buffers.lease_write(lease.lease.lease_id, 0, bytes, 1, nullptr);
+        return Staged{allocate.handle, lease.lease};
+    };
+    auto panel_request = [&](const Staged& staged) {
+        pl::PanelEngineRequest request;
+        request.txn_id = 7;
+        request.command_id = 7;
+        request.node_id = 1;
+        request.total_dim = n;
+        request.pivot_dim = n;
+        request.tile_size = 16;
+        request.policy = cmd::PivotPolicy::Static;
+        request.threshold_bits = f32_bits(0.0f);
+        request.compute_kind = pl::ComputeKind::PanelLu;
+        request.front = staged.handle;
+        request.front_lease = staged.lease;
+        return request;
+    };
+    const std::uint64_t panel_key = pl::PanelEngine::adapter_key(1, 0);
+    const std::uint64_t trsm_key = pl::PanelEngine::adapter_key(2, 0);
+    const pl::TileViewTag tags[] = {
+        pl::TileViewTag::FrontGrid, pl::TileViewTag::A12, pl::TileViewTag::A21,
+        pl::TileViewTag::A22};
+
+    // (a) A PANEL_LU on buffer slot 2 publishes its tile versions under slot
+    // 2's FrontGrid view and never touches another slot's key space.
+    {
+        dp::BufferManager buffers(dp::BufferConfig{3, 64 * 1024, 4, 1});
+        pl::PanelEngine engine(config);
+        engine.set_buffers(&buffers);
+        expect(engine.configure().ok, "slot versions: engine configured");
+        stage(buffers, "idle0", trsm_front, 0);
+        stage(buffers, "idle1", trsm_front, 1);
+        const Staged panel = stage(buffers, "panel2", panel_front, 2);
+        expect(engine.begin_command(panel_request(panel), panel_key, 2).ok,
+               "slot versions: panel on slot 2 accepted");
+        bool responded = false;
+        bool own_view_seen = false;
+        bool foreign_touched = false;
+        for (std::uint64_t cycle = 2; cycle < 400000 && !responded; ++cycle) {
+            engine.tick(cycle);
+            own_view_seen =
+                own_view_seen ||
+                engine.version(pl::tile_version_key(2, pl::TileViewTag::FrontGrid, 0)) > 0;
+            for (std::uint32_t slot = 0; slot < 2; ++slot) {
+                for (const auto tag : tags) {
+                    for (std::uint32_t tile = 0; tile < 4; ++tile) {
+                        foreign_touched =
+                            foreign_touched ||
+                            engine.version(pl::tile_version_key(slot, tag, tile)) != 0;
+                    }
+                }
+            }
+            pl::PanelEngineResponse response;
+            if (engine.poll_response(panel_key, response)) {
+                responded = true;
+                expect(response.status == cmd::StatusCode::Ok,
+                       "slot versions: isolated panel Ok");
+            }
+        }
+        expect(responded, "slot versions: isolated panel responded");
+        expect(own_view_seen,
+               "slot versions: panel commits are visible under its slot's FrontGrid key");
+        expect(!foreign_touched,
+               "slot versions: panel on slot 2 never bumps slot 0/1 tile versions");
+        expect(!engine.control_fault(), "slot versions: no engine control fault (a)");
+    }
+
+    // (b) TRSM_RIGHT on slot 0 starts right after the slot-2 panel dispatched
+    // its first tile task (LU_DIAG (0,0), not yet committed). Both must
+    // complete: with the aliased key the panel commit moved slot 0's A21 tile
+    // 0 to version 1 and the TRSM_RIGHT task (expecting 0) never dispatched.
+    {
+        dp::BufferManager buffers(dp::BufferConfig{3, 64 * 1024, 4, 1});
+        pl::PanelEngine engine(config);
+        engine.set_buffers(&buffers);
+        expect(engine.configure().ok, "slot versions: engine configured (b)");
+        const Staged trsm = stage(buffers, "trsm0", trsm_front, 0);
+        stage(buffers, "idle1", trsm_front, 1);
+        const Staged panel = stage(buffers, "panel2", panel_front, 2);
+        auto right = trsm_request(
+            pl::ComputeKind::TrsmRight, n, p, trsm.handle, trsm.lease);
+        right.txn_id = 8;
+        right.command_id = 8;
+        expect(engine.begin_command(panel_request(panel), panel_key, 2).ok,
+               "slot versions: panel on slot 2 accepted (b)");
+        bool trsm_started = false;
+        bool panel_done = false;
+        bool trsm_done = false;
+        for (std::uint64_t cycle = 2; cycle < 400000 && !(panel_done && trsm_done);
+             ++cycle) {
+            engine.tick(cycle);
+            if (!trsm_started && engine.dispatcher().dispatched_count() > 0) {
+                trsm_started = true;
+                expect(engine.task_records().empty(),
+                       "slot versions: TRSM_RIGHT starts before the first panel commit");
+                expect(engine.begin_command(right, trsm_key, cycle).ok,
+                       "slot versions: TRSM_RIGHT on slot 0 accepted");
+            }
+            pl::PanelEngineResponse response;
+            if (!panel_done && engine.poll_response(panel_key, response)) {
+                panel_done = true;
+                expect(response.status == cmd::StatusCode::Ok,
+                       "slot versions: concurrent panel Ok");
+            }
+            if (!trsm_done && engine.poll_response(trsm_key, response)) {
+                trsm_done = true;
+                expect(response.status == cmd::StatusCode::Ok,
+                       "slot versions: concurrent TRSM_RIGHT Ok");
+            }
+        }
+        expect(panel_done && trsm_done,
+               "slot versions: concurrent panel and TRSM_RIGHT both complete");
+        expect(!engine.control_fault(), "slot versions: no engine control fault (b)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified on-chip bandwidth arbitration
 // ---------------------------------------------------------------------------
@@ -1628,6 +1791,7 @@ int main(int argc, char** argv) {
     test_np_factor_chain();
     test_groups_and_reuse();
     test_engine_group_exclusion_and_binding();
+    test_engine_slot_version_isolation();
     test_arbiter_unit();
     test_bandwidth_integration_low_budget();
     test_abort_trsm_and_reuse();

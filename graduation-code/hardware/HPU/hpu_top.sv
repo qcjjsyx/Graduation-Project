@@ -21,7 +21,7 @@ module hpu_top #(
     input  logic                   pivot_ready,
     output logic [ROW_IDX_W-1:0]   pivot_row,
     output logic [DATA_W-1:0]      pivot_value,
-    output logic                   pivot_fail,       // 当前版本: num_elems==0 时为 1
+    output logic                   pivot_fail,       // 与 pivot_valid 同拍有效：无有效候选时为 1
 
 
     input logic clk,
@@ -127,16 +127,21 @@ module hpu_top #(
                 end
 
                 S_SELECT: begin
-                    // 在 SELECT 状态的这个时钟边沿，锁存 core 的结果
+                    // 在 SELECT 状态的这个时钟边沿，锁存 core 的结果。
+                    // 每轮请求恰好产生一个结果：无有效候选时也输出
+                    // valid=1、fail=1，否则 S_OUT 会因 valid=0 永远等待。
                     pivot_row_r    <= core_pivot_row;
                     pivot_value_r  <= core_pivot_value;
-                    pivot_valid_r  <= core_pivot_valid;
-                    pivot_fail_r   <= ~core_pivot_valid;  // 当前版本: 无候选则 fail=1
+                    pivot_valid_r  <= 1'b1;
+                    pivot_fail_r   <= ~core_pivot_valid;
                 end
 
                 S_OUT: begin
+                    // B02 修复：在握手成功的同一时钟沿撤销 valid，
+                    // 避免 ready 持续为 1 时同一结果被下游接受两次。
+                    // ready=0 时保持 valid 与数据稳定。
                     if (pivot_valid_r && pivot_ready) begin
-                        // pivot_valid_r <= 1'b0;
+                        pivot_valid_r <= 1'b0;
                     end
                 end
 

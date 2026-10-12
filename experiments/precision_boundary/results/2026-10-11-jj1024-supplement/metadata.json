@@ -1,0 +1,282 @@
+{
+  "metadata_schema_version": 1,
+  "experiment": "precision_boundary",
+  "batch_role": "supplement_not_in_primary_statistics",
+  "migration_date": "2026-10-11",
+  "original_run": {
+    "date_as_reported": "2026-10-11",
+    "environment_as_reported": "macOS / clang / Release",
+    "commit": null,
+    "exact_environment": null,
+    "device_binary_sha256": null,
+    "max_cycles": null,
+    "jobs": null,
+    "unknown_fields_reason": "Original result.json does not record these fields; migration-time state is not substituted for run provenance."
+  },
+  "method": {
+    "backend": "FP32_SYSTEMC",
+    "pivot_policy": "STATIC",
+    "refinement_initial_solution": "device solution_data",
+    "correction_triangular_solve": "host FP32 LAPACK strtrs using device FP32 factors",
+    "residual_and_accumulation": "FP64",
+    "one_shot_forward_tolerance": 0.001,
+    "refinement_max_steps_as_reported": 10,
+    "refinement_success": "some step satisfies backward_error <= 10*n*u64 and forward_error <= 10*kappa2_DrA*u64"
+  },
+  "evidence": {
+    "original_result_location": "/tmp/pb-main",
+    "case_count": 8,
+    "family_counts": {
+      "F1": 6,
+      "F3": 2
+    },
+    "record_errors": 0,
+    "solve_pass_count": 8,
+    "factor_numeric_pass_count": 6,
+    "archive_integrity_checked": true,
+    "csv_matches_current_flatten": true,
+    "device_rerun_during_migration": false,
+    "scientific_review": "pending; no incorporation into primary report statistics or figures",
+    "input_preservation": "MatrixMarket files (123479367 bytes total across 373 cases), device images and traces were not copied; specifications, seeds and available original matrix hashes are retained. Exact original build provenance is unavailable."
+  },
+  "files_sha256": {
+    "results.csv": "fcdccc9bdf24dc2dce2c71fe33fc08ae11bd94ebca18cb89c1078a3d50e3abf8"
+  },
+  "migration_time_source_snapshot": {
+    "git_head": "57a9df49576c4e25c500989c0a84e258f6928834",
+    "working_tree_dirty": true,
+    "sha256": {
+      "graduation-code/software/tools/precision_boundary/matrices.py": "1574d89de323dc221813c71a871d2949444c949e9d3f744f9329c8a6462e183f",
+      "graduation-code/software/tools/precision_boundary/runner.py": "329f163a70f96b81855b612ad33f6c0d33d26ccbf67dbad7c09b457ceec34d44",
+      "graduation-code/software/tools/precision_boundary/analysis.py": "5c3ed68d38aff1b9424c87185140c7a5dda09182a9e96686293c95dc48d400c9",
+      "graduation-code/software/tools/precision_boundary/__main__.py": "65c1690ce062f5a9b5cdb17b1daa89253cd277eb88deb97130e8ef3389e94464",
+      "graduation-code/software/tools/precision_boundary/__init__.py": "802bb559ddfb5d0ad6e22575b2bdc4781cb044854c289224cab77ba328446a76",
+      "graduation-code/software/tools/precision_boundary/plot.py": "2a82371a52186d23d0ce305566f45af840f53b74f6cb86f95bb3c99d60402f88",
+      "graduation-code/software/tools/numeric_diagnosis.py": "7685d5f7eeb4251426fcd790fe5ffc8e21e59b4fcfd076f7077d39120e955e82",
+      "graduation-code/software/src/pipeline.py": "9e4016ad073c591afcdca0b73c25e659f86e03e3b1cd88461da7a6ac5f8b2d59",
+      "graduation-code/software/src/config.py": "8015a93afc2dff3ec9cfff927ffa5c6977f7685eccf81031e650b5f86a90d4d5",
+      "graduation-code/software/src/scheduler/command_compiler.py": "b9f9f6612095f03d6f496d807119c8c9652d6afeb9ef363dc08e9b073491e443",
+      "graduation-code/systemc/src/tree_factor_device.cpp": "d2f1af45c1217052452bf04b57ca563bc32b8716d62f5e0bd9d9a8407a53bb5a",
+      "graduation-code/systemc/src/controlplane/control_plane.cpp": "b06e9986d8c78f5df47739aeafcb8e3412d33e2099bd33364455acc518cf9198",
+      "graduation-code/systemc/src/controlplane/solve_exec_unit.cpp": "984328cbed8a030295e4a00cf8cad8d28fcb395785ceb2a362b87ffa34f182c0",
+      "graduation-code/systemc/reference/src/tree_solve_check.cpp": "0af63c6bc60c84753e4e599b21274198e0adde65c338d8fc3f7650183619952a",
+      "graduation-code/systemc/reference/src/tree_artifact_check.cpp": "22409588fbf277da813ee0d8b85ef711e3eb6f5f4719e8ee3c73f34b5d4cd670"
+    },
+    "note": "Hashes were taken before documentation-only edits in this migration. This is not the original execution commit or a complete reproducible source snapshot."
+  },
+  "migration_time_matrix_sources_sha256": {
+    "graduation-code/software/example/256X256JJ.mat": "ee05423e6c6b9bf5afb44845e32309e0f41b81309b3eb3ab4b47489847405114",
+    "graduation-code/software/example/576X576JJ.mat": "f4fbf73f6c4df13c5e6a7f6196c6ea29893abcaa43428a4e6c679d9ae5e006f6",
+    "graduation-code/software/example/1024X1024JJ.mat": "2740a169ecc694c6c22387f1abadac18ec0a07c04bdbbfa6fcef4294ee6afb4b"
+  },
+  "cases": [
+    {
+      "case_id": "F1-jj1024-k10.0-s0",
+      "result_file": "cases/F1-jj1024-k10.0-s0/result.json",
+      "result_sha256": "b5de9e5e33690257920e306ed2c6b73b5e774fe02aad107149ed20fe7d58ed0e",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 10000000000.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "aaae3ae086814afc13f2f8e5fc31f8ab2a954b1f49d3e159fd642a76ebe32604",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F1-jj1024-k12.0-s0",
+      "result_file": "cases/F1-jj1024-k12.0-s0/result.json",
+      "result_sha256": "3de62f40ebd46eb282e98224051ae8513f36bb14a7cb0eeb72080ee3509a2045",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 1000000000000.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "d13f172513251a85e6128a0be8c688d7d254a599cc07a6b748a73581643c5815",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F1-jj1024-k2.0-s0",
+      "result_file": "cases/F1-jj1024-k2.0-s0/result.json",
+      "result_sha256": "c17d779f0ffe07b6381af0d8bb38063dc38d3f2b9682bb02d78b618c7028f30e",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 100.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "d26d8c3bf9e7758c4333e1bf75313495cc845101c6dc730a22dbc2e5223bf023",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F1-jj1024-k4.0-s0",
+      "result_file": "cases/F1-jj1024-k4.0-s0/result.json",
+      "result_sha256": "c21d396664217d2d4d4a7b99f108b47edee207ff87a7ec3dcdf20e406167583e",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 10000.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "23546a85d9f6f639a5bc1e99f7e3e7b2c5af122d69cc5d4dc590facd86d3761d",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F1-jj1024-k6.0-s0",
+      "result_file": "cases/F1-jj1024-k6.0-s0/result.json",
+      "result_sha256": "78ef7ae956486a3bd3a2bddc03d1e1c2acb39dc31547368045dbf3872d667839",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 1000000.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "43a54189c81b4c0555c1332bc1e5344d729f6ef55a4e4d1aa66fd12a84870e95",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F1-jj1024-k8.0-s0",
+      "result_file": "cases/F1-jj1024-k8.0-s0/result.json",
+      "result_sha256": "3dafc2cfb165d30ef214ca20cd5bcbb84830856796436c2020584a380c9ecf40",
+      "spec": {
+        "family": "F1",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 100000000.0,
+        "gamma": 0.0,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "6b08a0748005e81529b8f9c53a0e0594182994dccac707339baac97edef64599",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 274,
+        "commands": 3278,
+        "max_front": 272
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F3-jj1024-k4.0-g0.3-s0",
+      "result_file": "cases/F3-jj1024-k4.0-g0.3-s0/result.json",
+      "result_sha256": "8bdadde922253e763bf008b34d9d5944f918a62a1bbbbaad4742e1fea1f0cd83",
+      "spec": {
+        "family": "F3",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 10000.0,
+        "gamma": 0.3,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "98e8e1033d6c4ed4d4e450771d6d34c47d9ce5341127cb71cf15f7d4170db24a",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 300,
+        "device_buffer_bytes": 524288,
+        "nodes": 215,
+        "commands": 2570,
+        "max_front": 300
+      },
+      "ir_history_entries": 11
+    },
+    {
+      "case_id": "F3-jj1024-k8.0-g0.3-s0",
+      "result_file": "cases/F3-jj1024-k8.0-g0.3-s0/result.json",
+      "result_sha256": "5bd8e8daec90c69ebbf01aff0b16691c171a6de5a0e7d06584236d2742726a22",
+      "spec": {
+        "family": "F3",
+        "pattern": "jj1024",
+        "n": null,
+        "density": null,
+        "kappa": 100000000.0,
+        "gamma": 0.3,
+        "seed": 0
+      },
+      "rhs_seed": 1,
+      "input_matrix_sha256": "d51e0aa34d75217dbafc4f6c7d1de0c1f00fe4062983d070d84a1e85abb2351b",
+      "input_matrix_archived": false,
+      "compile": {
+        "ok": true,
+        "max_front_size": 512,
+        "device_buffer_bytes": 1048576,
+        "nodes": 215,
+        "commands": 2570,
+        "max_front": 302
+      },
+      "ir_history_entries": 11
+    }
+  ]
+}

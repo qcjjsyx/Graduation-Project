@@ -1,6 +1,12 @@
 # RTL 硬件模块说明
 
-状态：当前主线说明（2026-10-07 按实际实现同步；区分当前能力与后续接口目标）
+状态：当前主线说明（2026-10-10 更新：B02/B03 已修复，新增自检 testbench）
+
+自检回归（需要 Icarus Verilog ≥ 12）：
+
+```bash
+bash graduation-code/hardware/run_rtl_tests.sh   # HPU_TB PASS / ATU_TB PASS
+```
 
 硬件目录保存关键模块的 SystemVerilog 原型。当前项目不以完整流片级硬件为目标，而是以“SystemC 全系统架构模型 + 关键 RTL 模块”为交付边界。
 
@@ -8,11 +14,11 @@
 
 | 模块 | 主要职责 | 当前定位 |
 |---|---|---|
-| `GCU/` | 旧 task 取指、child 计数、buffer 与 micro-scheduler 原型 | `gcu_top` 空壳；尚未实现 schema v2 command/token/completion 闭环 |
-| `ATU/` | logical row 到 physical row 的 P-vector 映射和 swap | RTL 原型 |
-| `HPU/` | pivot candidate 接收、最大绝对值归约和 tie-break | RTL 原型 |
+| `GCU/` | 旧 task 取指、child 计数、buffer 与 micro-scheduler 原型 | **旧 NodeTask 设计**：`gcu_top` 空壳，读取 16B 旧 task；与 schema v2 不对应，不在回归中 |
+| `ATU/` | logical row 到 physical row 的 P-vector 映射和 swap | RTL 原型；`tb_ATU_collision.sv` 自检 |
+| `HPU/` | pivot candidate 接收、最大绝对值归约和 tie-break | RTL 原型；`tb_code/tb_hpu_handshake.sv` 自检 |
 | `QAU/` | 精度适配或量化边界的候选模块 | 重新定义，不再默认承担全局 front BFP 装配 |
-| `Matrix_Engine/` | 预留计算核接口 | 暂不假设已有可联调 GEMM RTL |
+| `Matrix_Engine/` | 预留（目前为空目录） | 无 GEMM RTL |
 
 ## 2. 与 SystemC 的关系
 
@@ -20,7 +26,7 @@
 当前 SystemC/C++ 设备
   ├─ CommandDevice / DataPlane / 真实 Assembly / Panel-LU / TRSM / GEMM
   ├─ FP32_SYSTEMC 或 FP32_SYSTEMC_INT32_GEMM
-  └─ L/U/P/update 写回；真实 Solve 尚未接入（T12）
+  └─ L/U/P/update 写回；独立 SolveExecutionUnit 执行真实前代/回代
 
 独立 FP64 reference / checker
   └─ 分解、参考 solve 与设备输出检查，不向设备注入黄金数据
@@ -83,7 +89,19 @@ GCU 的长期输入是 command ring 和 descriptor table，而不是软件内部
 - 输出 pivot row、pivot value、valid 和 failure；
 - 支持 backpressure、reset 和空候选测试。
 
-当前比较节点相等时选输入 a；top 的重复输出握手缺陷 B02 尚未修复，不能把背压等目标要求视为已完整验证。证据见[当前审查报告](../../docs/当前实现审查与验证报告.md)。CALU、threshold、rook 和复杂 tournament 不作为首版必需模式。
+当前实现（2026-10-10）：
+
+- `hpu_core_tree` 改为按 heap 下标组织的一维 wire 数组比较树（原为二维 packed
+  struct 数组，Icarus 13 内部断言崩溃，无法仿真完整 HPU）。行为不变：左孩子为较早
+  候选，比较节点相等时选 a，因此 **|value| 相等时最早到达的候选获胜**。
+  `MAX_ELEMS` 必须是 2 的幂。
+- B02 已修复：OUT 状态握手成功的同一时钟沿撤销 `pivot_valid`；`ready=0` 时结果保持稳定。
+- 每轮请求恰好产生一个结果：无有效候选时输出 `valid=1, fail=1`（原实现此时 valid=0，
+  会卡在 OUT 状态）。由于 LOAD 必须收到至少一个候选才离开，该分支目前不可达，仅作防御。
+- `tb_hpu_handshake.sv` 覆盖：ready 常 1 时每次请求只握手一次、正负混合 argmax、
+  首/中/末位置、tie-break、输出背压保持稳定、reset 后连续请求。
+
+CALU、threshold、rook 和复杂 tournament 不作为首版必需模式。
 
 ## 6. ATU
 
@@ -95,7 +113,10 @@ logical_row → physical_row
 
 pivot swap 只修改映射，不搬移整个 front。Panel、TRSM 和写回必须使用同一映射语义。当前最大 front/pivot 的位宽必须由 descriptor/config 显式限制，不能由不同 RTL 文件各自硬编码。
 
-当前 ATU 是独立原型，尚未接入动态整树；cfg/pivot 同拍接受后丢 cfg 写的 B03 尚未修复，见[审查报告](../../docs/当前实现审查与验证报告.md)。
+当前 ATU 是独立原型，尚未接入动态整树。B03 已修复（2026-10-10）：pivot swap 与
+cfg 写共用 Pvec 写口，**swap 优先**；同拍有 swap 请求时 `cfg_ready=0`，调用方按
+valid/ready 约定保持 `cfg_we` 到下一拍，cfg 写只在真正被接受时执行。
+`tb_ATU_collision.sv` 验证同拍请求时两项操作都生效。
 
 ## 7. QAU / Precision Adapter
 

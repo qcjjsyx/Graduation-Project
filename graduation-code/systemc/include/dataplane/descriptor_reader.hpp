@@ -111,6 +111,8 @@ struct SolveView {
     std::uint32_t rhs_count{0};
     hw::command::SolveDirection direction{hw::command::SolveDirection::Forward};
     hw::command::DataFormat format{hw::command::DataFormat::Fp32};
+    // T12 front variable table (global Q-order numbers, one per front row).
+    std::vector<std::uint32_t> variables;
 };
 
 struct DependencyView {

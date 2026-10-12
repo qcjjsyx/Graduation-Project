@@ -1,6 +1,9 @@
 # Precision Adapter：局部量化与反量化
 
-状态：当前主线候选模块规范
+状态：规范（无 RTL）。该职责目前**只在 SystemC 中实现**：
+[`precision_adapter.cpp`](../../systemc/src/panel_lu/precision_adapter.cpp)
+（INT32 存储 / 30 位有效量化 / INT64 累加，见
+[GEMM 与局部 INT32 设计](../../../docs/systemc/GEMM_Schur与局部INT32设计.md)）。本目录没有 Verilog 文件。
 
 ## 1. 重新定位
 

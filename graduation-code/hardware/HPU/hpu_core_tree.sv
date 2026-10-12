@@ -1,77 +1,73 @@
+// hpu_core_tree: purely combinational max-|value| reduction tree.
+//
+// The tree is stored as a heap: node i has children 2i+1 (left, earlier
+// candidates) and 2i+2 (right).  Leaves occupy nodes MAX_ELEMS-1 ..
+// 2*MAX_ELEMS-2 in candidate order, so with MAX_ELEMS a power of two every
+// comparison sees the earlier candidate on input a.  hpu_cmp_node keeps a on
+// equal |value|, which fixes the tie-break to "earliest candidate wins".
+//
+// Plain 1-D wire arrays are used instead of a 2-D array of packed structs:
+// behaviour is identical, and the module now elaborates in Icarus Verilog
+// (the struct-array form hit an internal assertion, elab_expr.cc:2677).
 module hpu_core_tree #(
     parameter DATA_W    = 32,
     parameter ROW_IDX_W = 16,
-    parameter MAX_ELEMS  = 256
+    parameter MAX_ELEMS = 256   // must be a power of two
 )(
     // 候选数组（来自顶层 buffer）
-    input  logic signed [DATA_W-1:0]   cand_val   [0:MAX_ELEMS-1],
+    input  logic signed [DATA_W-1:0]    cand_val  [0:MAX_ELEMS-1],
     input  logic        [ROW_IDX_W-1:0] cand_row  [0:MAX_ELEMS-1],
-    input  logic [$clog2(MAX_ELEMS):0] num_elems, // 本轮有效元素个数 N (<=MAX_ELEMS)
+    input  logic [$clog2(MAX_ELEMS):0]  num_elems, // 本轮有效元素个数 N (<=MAX_ELEMS)
 
     // 输出：winner
-    output logic [ROW_IDX_W-1:0]       pivot_row,
-    output logic signed [DATA_W-1:0]   pivot_value,
-    output logic                       pivot_valid   // num_elems>0 时为 1
+    output logic [ROW_IDX_W-1:0]        pivot_row,
+    output logic signed [DATA_W-1:0]    pivot_value,
+    output logic                        pivot_valid   // num_elems>0 时为 1
 );
 
-    localparam LEVELS = $clog2(MAX_ELEMS);
+    localparam int NODES = 2 * MAX_ELEMS - 1;
+    localparam int FIRST_LEAF = MAX_ELEMS - 1;
 
-  // 每个节点携带 (val, row, valid)
-    typedef struct packed {
-        logic signed [DATA_W-1:0] val;
-        logic [ROW_IDX_W-1:0]     row;
-        logic                     valid;
-    } node_t;
-
-    // level_nodes[l][i]：第 l 层的第 i 个节点
-    // l = 0   : 叶子层（来自 cand_*）
-    // l = ... : 上层
-    node_t level_nodes [0:LEVELS][0:MAX_ELEMS-1];
-
-    integer i;
-
-    // 叶子层：映射 cand_* 到 level 0，并根据 num_elems 设置 valid
-    always_comb begin
-        for (i = 0; i < MAX_ELEMS; i = i + 1) begin
-            level_nodes[0][i].val   = cand_val[i];
-            level_nodes[0][i].row   = cand_row[i];
-            level_nodes[0][i].valid = (i < num_elems) ? 1'b1 : 1'b0;
-        end
+    initial begin
+        if (MAX_ELEMS < 1 || (MAX_ELEMS & (MAX_ELEMS - 1)) != 0)
+            $fatal(1, "hpu_core_tree: MAX_ELEMS (%0d) must be a power of two", MAX_ELEMS);
     end
 
-    // 生成树：每一层通过 hpu_cmp_node 把 2 个子节点合并成 1 个父节点
-    genvar lvl, j;
+    wire signed [DATA_W-1:0]    node_val   [0:NODES-1];
+    wire        [ROW_IDX_W-1:0] node_row   [0:NODES-1];
+    wire                        node_valid [0:NODES-1];
+
+    genvar k, n;
     generate
-        for (lvl = 0; lvl < LEVELS; lvl = lvl + 1) begin : gen_levels
-            localparam int CUR_NODES  = (MAX_ELEMS >> lvl);       // 当前层节点数
-            localparam int NEXT_NODES = (MAX_ELEMS >> (lvl + 1)); // 下一层节点数
+        // 叶子：候选 k 位于 heap 节点 FIRST_LEAF + k，只有 k < num_elems 有效
+        for (k = 0; k < MAX_ELEMS; k = k + 1) begin : gen_leaf
+            assign node_val[FIRST_LEAF + k]   = cand_val[k];
+            assign node_row[FIRST_LEAF + k]   = cand_row[k];
+            assign node_valid[FIRST_LEAF + k] = (k < num_elems);
+        end
 
-            for (j = 0; j < NEXT_NODES; j = j + 1) begin : gen_nodes
-                hpu_cmp_node #(
-                    .DATA_W    (DATA_W),
-                    .ROW_IDX_W (ROW_IDX_W)
-                ) u_cmp (
-                    .val_a   (level_nodes[lvl][2*j].val),
-                    .row_a   (level_nodes[lvl][2*j].row),
-                    .valid_a (level_nodes[lvl][2*j].valid),
-
-                    .val_b   (level_nodes[lvl][2*j+1].val),
-                    .row_b   (level_nodes[lvl][2*j+1].row),
-                    .valid_b (level_nodes[lvl][2*j+1].valid),
-
-                    .val_o   (level_nodes[lvl+1][j].val),
-                    .row_o   (level_nodes[lvl+1][j].row),
-                    .valid_o (level_nodes[lvl+1][j].valid)
-                );
-            end
-
-            // 其余未用节点（若有）默认 invalid（这里 MAX_ELEMS 是 2 的幂，所以不需要额外处理）
+        // 内部节点：两两比较，左孩子（较早候选）接 a 端
+        for (n = 0; n < FIRST_LEAF; n = n + 1) begin : gen_node
+            hpu_cmp_node #(
+                .DATA_W    (DATA_W),
+                .ROW_IDX_W (ROW_IDX_W)
+            ) u_cmp (
+                .val_a   (node_val[2*n + 1]),
+                .row_a   (node_row[2*n + 1]),
+                .valid_a (node_valid[2*n + 1]),
+                .val_b   (node_val[2*n + 2]),
+                .row_b   (node_row[2*n + 2]),
+                .valid_b (node_valid[2*n + 2]),
+                .val_o   (node_val[n]),
+                .row_o   (node_row[n]),
+                .valid_o (node_valid[n])
+            );
         end
     endgenerate
 
     // 根节点就是最终 winner
-    assign pivot_value = level_nodes[LEVELS][0].val;
-    assign pivot_row   = level_nodes[LEVELS][0].row;
-    assign pivot_valid = level_nodes[LEVELS][0].valid;
+    assign pivot_value = node_val[0];
+    assign pivot_row   = node_row[0];
+    assign pivot_valid = node_valid[0];
 
 endmodule

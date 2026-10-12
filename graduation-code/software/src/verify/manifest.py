@@ -14,6 +14,7 @@ from src.command_codec import (
     NONE,
     PVECTOR_ELEMENT_BYTES,
     PVECTOR_INIT_VALUE,
+    SOLVE_DESC_PAYLOAD_KIND,
     DataFormat,
     DescriptorType,
     KernelBackend,
@@ -117,6 +118,7 @@ def validate_manifest(manifest_path: str | Path) -> ManifestValidationResult:
         _validate_admission_dependencies(manifest, commands, descriptors, image)
         _validate_completion_templates(commands, completions)
         node_count = _validate_symbolic_and_nodes(manifest, commands, regions)
+        _validate_solve_contract(manifest, commands, descriptors, image)
         _validate_descriptor_references(descriptors)
         _validate_pivot_contract(manifest, descriptors, image)
         _validate_device_precision(manifest, descriptors)
@@ -155,6 +157,18 @@ def _validate_abi(manifest: dict) -> None:
             raise ManifestValidationError(f"manifest {name} mismatch")
     if abi.get("pivot_policy_field") != "FRONT_DESC.body_words[8..9]":
         raise ManifestValidationError("manifest pivot_policy_field is inconsistent")
+    scope = manifest.get("compiler", {}).get("operation_scope", "factorization_and_solve")
+    marker = abi.get("solve_desc_payload")
+    if scope == "factorization_and_solve":
+        if marker != SOLVE_DESC_PAYLOAD_KIND:
+            raise ManifestValidationError(
+                "solve-scope artifacts must declare "
+                f'abi.solve_desc_payload = "{SOLVE_DESC_PAYLOAD_KIND}"'
+            )
+    elif marker is not None:
+        raise ManifestValidationError(
+            "factorization-only artifacts must not declare abi.solve_desc_payload"
+        )
 
 
 def _validate_completion_templates(commands, completions) -> None:
@@ -282,6 +296,12 @@ def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
 
     seen_commands: set[int] = set()
     max_front = _as_int(manifest["compiler"]["max_front_size"], "max_front_size")
+    # Older manifests have no target scratchpad size; then only max_front applies.
+    buffer_bytes = (
+        _as_int(manifest["compiler"]["device_buffer_bytes"], "device_buffer_bytes")
+        if "device_buffer_bytes" in manifest["compiler"]
+        else None
+    )
     scope = manifest["compiler"].get("operation_scope", "factorization_and_solve")
     if scope not in ("factorization_only", "factorization_and_solve"):
         raise ManifestValidationError("unknown compiler operation_scope")
@@ -295,6 +315,10 @@ def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
         update = _as_int(node["update_dim"], "update_dim")
         if pivot <= 0 or total != pivot + update or total > max_front:
             raise ManifestValidationError(f"node {node_id} dimensions are invalid")
+        if buffer_bytes is not None and total * total * 4 > buffer_bytes:
+            raise ManifestValidationError(
+                f"node {node_id} FP32 front exceeds device_buffer_bytes"
+            )
         for region_name in node["regions"].values():
             if region_name not in regions:
                 raise ManifestValidationError(
@@ -326,6 +350,160 @@ def _validate_symbolic_and_nodes(manifest, commands, regions) -> int:
     if seen_commands != set(range(len(commands))):
         raise ManifestValidationError("manifest does not assign every command to a node")
     return node_count
+
+
+def _validate_solve_contract(manifest, commands, descriptors, image: bytes) -> None:
+    """T12 solve contract: payload tables, topological serial chain, capacity.
+
+    The device only sees the descriptor stream; these invariants must hold in
+    the artifact itself, not by host convention:
+
+    * both SOLVE_DESCs of a node carry that node's ``front_indices`` payload;
+    * the forward chain follows ``symbolic.factorization_order`` and the
+      backward chain its reverse, each serial and waiting on its own commit;
+    * every node's solve scratch fits the declared ``device_buffer_bytes``.
+    """
+
+    compiler = manifest.get("compiler", {})
+    scope = compiler.get("operation_scope", "factorization_and_solve")
+    solve_opcodes = {Opcode.SOLVE_FORWARD, Opcode.SOLVE_BACKWARD}
+    if scope == "factorization_only":
+        if any(command.opcode in solve_opcodes for command in commands):
+            raise ManifestValidationError(
+                "factorization-only artifact contains solve commands"
+            )
+        return
+
+    solve_meta = manifest.get("solve")
+    if not isinstance(solve_meta, dict):
+        raise ManifestValidationError(
+            "solve-scope manifests must describe the solve block"
+        )
+    for key, value in (
+        ("chain", "serial"),
+        ("forward_order", "factorization_order"),
+        ("backward_order", "reverse_factorization_order"),
+        ("solution_semantics", "zero-initialized accumulator; final = x_hat"),
+        ("rhs_read_only", True),
+        ("workspace_rows", ["forward_z", "backward_scratch"]),
+        ("p_vector_semantics", "gather_within_pivot_block"),
+    ):
+        if solve_meta.get(key) != value:
+            raise ManifestValidationError(f"solve.{key} is not the declared contract")
+    depth = _as_int(solve_meta.get("row_buffer_depth", -1), "solve.row_buffer_depth")
+    if depth <= 0:
+        raise ManifestValidationError("solve.row_buffer_depth must be positive")
+
+    symbolic = manifest["symbolic"]
+    order = [
+        _as_int(value, "factorization_order")
+        for value in symbolic["factorization_order"]
+    ]
+    nodes = manifest["nodes"]
+    forwards: list[tuple[int, int]] = []
+    backwards: list[tuple[int, int]] = []
+    for command in commands:
+        if command.opcode == Opcode.SOLVE_FORWARD:
+            forwards.append((command.command_id, command.node_id))
+        elif command.opcode == Opcode.SOLVE_BACKWARD:
+            backwards.append((command.command_id, command.node_id))
+    if len(forwards) != len(order) or len(backwards) != len(order):
+        raise ManifestValidationError(
+            "every node must own exactly one SOLVE_FORWARD and one SOLVE_BACKWARD"
+        )
+    if [node for _, node in sorted(forwards)] != order:
+        raise ManifestValidationError(
+            "SOLVE_FORWARD chain is not in factorization (topological) order"
+        )
+    if [node for _, node in sorted(backwards)] != list(reversed(order)):
+        raise ManifestValidationError(
+            "SOLVE_BACKWARD chain is not in reverse factorization order"
+        )
+
+    commit_token: dict[int, int] = {}
+    for command in commands:
+        if command.opcode == Opcode.NODE_COMMIT:
+            commit_token[command.node_id] = command.signal_token
+
+    def waits_of(command) -> set[int]:
+        if command.wait_list_id == NONE or command.wait_list_id >= len(descriptors):
+            return set()
+        return set(
+            descriptors[command.wait_list_id].dependency_tokens(
+                image, token_count=len(commands)
+            )
+        )
+
+    # Revised 2026-10-11 (T12 design doc §2): there is no global solve gate;
+    # each solve command waits on its own commit plus the previous solve
+    # command, so wait lists stay bounded independent of the node count.
+    previous: int | None = None
+    for command_id, node in sorted(forwards):
+        waits = waits_of(commands[command_id])
+        if commit_token.get(node) not in waits:
+            raise ManifestValidationError(
+                f"SOLVE_FORWARD of node {node} must wait for its own commit"
+            )
+        if previous is not None and previous not in waits:
+            raise ManifestValidationError("SOLVE_FORWARD chain is not serial")
+        previous = command_id
+    assert previous is not None
+    for command_id, node in sorted(backwards):
+        waits = waits_of(commands[command_id])
+        if commit_token.get(node) not in waits:
+            raise ManifestValidationError(
+                f"SOLVE_BACKWARD of node {node} must wait for its own commit"
+            )
+        if previous not in waits:
+            raise ManifestValidationError("SOLVE_BACKWARD chain is not serial")
+        previous = command_id
+
+    buffer_bytes = (
+        _as_int(compiler["device_buffer_bytes"], "device_buffer_bytes")
+        if "device_buffer_bytes" in compiler
+        else None
+    )
+    for command_id, node in sorted(forwards + backwards):
+        command = commands[command_id]
+        if command.descriptor_id == NONE:
+            raise ManifestValidationError("solve command is missing its descriptor")
+        descriptor = descriptors[command.descriptor_id]
+        if DescriptorType(descriptor.descriptor_type) != DescriptorType.SOLVE_DESC:
+            raise ManifestValidationError("solve command does not use a SOLVE_DESC")
+        factor_id = descriptor.body_words[0]
+        if factor_id == NONE or factor_id >= len(descriptors):
+            raise ManifestValidationError("SOLVE_DESC factor reference is unknown")
+        factor = descriptors[factor_id]
+        if DescriptorType(factor.descriptor_type) != DescriptorType.FACTOR_DESC:
+            raise ManifestValidationError("SOLVE_DESC factor reference is not a FACTOR_DESC")
+        total = _as_int(factor.body_words[3], "factor.total_dim")
+        pivot = _as_int(factor.body_words[4], "factor.pivot_dim")
+        if descriptor.payload_bytes != 4 * total:
+            raise ManifestValidationError(
+                "SOLVE_DESC payload_bytes must equal 4 * FACTOR_DESC.total_dim"
+            )
+        node_meta = nodes[str(node)]
+        expected = [
+            _as_int(value, "front_indices") for value in node_meta["front_indices"]
+        ]
+        variables = [int(value) for value in descriptor.solve_variables(image)]
+        if variables != expected:
+            raise ManifestValidationError(
+                f"SOLVE_DESC payload of node {node} does not match front_indices"
+            )
+        row_range = node_meta["range"]
+        start = _as_int(row_range["start"], "node range start")
+        end = _as_int(row_range["end"], "node range end")
+        if end - start != pivot or variables[:pivot] != list(range(start, end)):
+            raise ManifestValidationError(
+                f"SOLVE_DESC payload of node {node} is not the contiguous node range"
+            )
+        if buffer_bytes is not None:
+            required = 4 * (depth * total + 2 * total + pivot)
+            if required > buffer_bytes:
+                raise ManifestValidationError(
+                    f"node {node} solve scratch exceeds device_buffer_bytes"
+                )
 
 
 def _validate_descriptor_references(descriptors) -> None:

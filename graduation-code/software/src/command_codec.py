@@ -35,6 +35,13 @@ COMPLETION_RECORD_BYTES = 64
 PVECTOR_INIT_VALUE = -1
 PVECTOR_ELEMENT_BYTES = 4
 
+#: SOLVE_DESC variable payload (T12): u32 front_indices, one entry per front
+#: row.  ``payload_bytes`` must equal ``4 * FACTOR_DESC.total_dim``; the values
+#: are the node's global (Q-order) variable numbers, the first ``pivot_dim`` of
+#: them forming the contiguous node range.  A SOLVE_DESC without this payload
+#: cannot be executed: the device cannot gather/scatter a front it cannot name.
+SOLVE_DESC_PAYLOAD_KIND = "front_variable_indices_u32"
+
 
 class Opcode(IntEnum):
     NODE_BEGIN = 0x01
@@ -533,6 +540,13 @@ class Descriptor:
                 raise ValueError(
                     "DEPENDENCY_DESC payload_bytes must equal token_count * 4"
                 )
+        elif descriptor_type == DescriptorType.SOLVE_DESC:
+            if self.payload_offset % 4:
+                raise ValueError("SOLVE_DESC payload_offset must be u32 aligned")
+            if self.payload_bytes == 0 or self.payload_bytes % 4:
+                raise ValueError(
+                    "SOLVE_DESC must carry its u32 front-variable-indices payload"
+                )
         elif self.payload_bytes != 0:
             raise ValueError(
                 f"{descriptor_type.name} does not define a v2 variable payload"
@@ -589,6 +603,19 @@ class Descriptor:
             if any(token >= token_count for token in tokens):
                 raise ValueError("dependency token list contains an unknown token")
         return tuple(tokens)
+
+    def solve_variables(self, memory_image: bytes) -> Tuple[int, ...]:
+        """Decode the SOLVE_DESC u32 front-variable-indices payload."""
+
+        self.validate(len(memory_image))
+        if self.descriptor_type != DescriptorType.SOLVE_DESC:
+            raise ValueError("descriptor is not a SOLVE_DESC")
+        begin = self.payload_offset
+        end = begin + self.payload_bytes
+        if end > len(memory_image):
+            raise ValueError("SOLVE_DESC payload exceeds the memory image")
+        count = self.payload_bytes // 4
+        return struct.unpack(f"<{count}I", memory_image[begin:end]) if count else ()
 
 
 @dataclass(frozen=True)
@@ -687,6 +714,39 @@ def decode_token_states(data: bytes) -> Tuple[TokenState, ...]:
     return tuple(result)
 
 
+def validate_solve_variables(
+    variables: Sequence[int],
+    *,
+    total_dim: int,
+    pivot_dim: int,
+    dimension: int,
+) -> None:
+    """Validate one SOLVE_DESC front-variable table (T12 contract).
+
+    ``variables`` is the node's ``front_indices`` (Q-order global variable
+    numbers): exactly ``total_dim`` entries, each below the RHS/solution
+    column count ``dimension``, all distinct, and the first ``pivot_dim``
+    entries forming the contiguous ascending node range.
+    """
+
+    values = tuple(int(value) for value in variables)
+    if total_dim <= 0 or not 0 < pivot_dim <= total_dim:
+        raise ValueError("solve payload dimensions are invalid")
+    if len(values) != total_dim:
+        raise ValueError(
+            f"SOLVE_DESC payload must hold {total_dim} front variable indices"
+        )
+    if any(value < 0 or value >= dimension for value in values):
+        raise ValueError("SOLVE_DESC payload contains an out-of-range variable")
+    if len(set(values)) != len(values):
+        raise ValueError("SOLVE_DESC payload contains duplicate variables")
+    expected_prefix = tuple(range(values[0], values[0] + pivot_dim))
+    if values[:pivot_dim] != expected_prefix:
+        raise ValueError(
+            "SOLVE_DESC pivot prefix must be the contiguous ascending node range"
+        )
+
+
 def validate_command_batch(
     commands: Sequence[Command],
     descriptors: Sequence[Descriptor],
@@ -707,6 +767,45 @@ def validate_command_batch(
     for index, descriptor in enumerate(descriptors):
         try:
             descriptor.validate(len(memory_image))
+        except ValueError as exc:
+            raise ValueError(f"descriptor {index}: {exc}") from exc
+
+    for index, descriptor in enumerate(descriptors):
+        if descriptor.descriptor_type != DescriptorType.SOLVE_DESC:
+            continue
+        body = descriptor.body_words
+        if body[0] == NONE or body[0] >= len(descriptors):
+            raise ValueError(f"descriptor {index}: unknown solve factor reference")
+        factor = descriptors[body[0]]
+        if factor.descriptor_type != DescriptorType.FACTOR_DESC:
+            raise ValueError(f"descriptor {index}: solve factor is not a FACTOR_DESC")
+        total_dim = factor.body_words[3]
+        pivot_dim = factor.body_words[4]
+        if descriptor.payload_bytes != 4 * total_dim:
+            raise ValueError(
+                f"descriptor {index}: SOLVE_DESC payload_bytes must equal "
+                "4 * FACTOR_DESC.total_dim"
+            )
+        dimension = None
+        for reference in (body[1], body[2]):
+            if reference == NONE or reference >= len(descriptors):
+                raise ValueError(f"descriptor {index}: unknown solve region reference")
+            region = descriptors[reference]
+            if region.descriptor_type != DescriptorType.REGION_DESC:
+                raise ValueError(
+                    f"descriptor {index}: solve RHS/solution reference is not "
+                    "a REGION_DESC"
+                )
+            cols = region.body_words[6]
+            dimension = cols if dimension is None else min(dimension, cols)
+        variables = descriptor.solve_variables(memory_image)
+        try:
+            validate_solve_variables(
+                variables,
+                total_dim=total_dim,
+                pivot_dim=pivot_dim,
+                dimension=dimension,
+            )
         except ValueError as exc:
             raise ValueError(f"descriptor {index}: {exc}") from exc
 

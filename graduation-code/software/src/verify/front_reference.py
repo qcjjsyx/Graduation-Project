@@ -391,3 +391,94 @@ def solve_front_tree_reference(
         x_hat=x_hat,
         order=tuple(sibling_friendly_order(list(parent))),
     )
+
+
+def solve_front_tree_accumulator(
+    nodes: Sequence[NodeCompileRecord],
+    local_fronts: Sequence[np.ndarray],
+    map_tables: Sequence[Sequence[MapTableEntry]],
+    parent: Sequence[int],
+    rhs_hat: np.ndarray,
+    config: PivotPolicyConfig,
+) -> np.ndarray:
+    """FP64 host reference of the device solve algorithm (design doc §1.3).
+
+    This mirrors the device data convention exactly instead of reusing the
+    array-based ``solve_front_tree``:
+
+    * ``solution_data`` is a zero-initialized accumulator ``w`` (here fed with
+      ``rhs_hat``; the device starts from zero and adds the RHS on the fly);
+    * forward per node in topological order: gather
+      ``r_i = b_hat[g[p[i]]] + w[g[p[i]]]`` (P-vector gather inside the pivot
+      block), solve ``L11 z = r``, scatter ``w[g[p+t]] -= L21 z``, store z into
+      ``w[g[i]]`` and the node workspace;
+    * backward in reverse topological order: ``c_i = w[g[i]] - U12 w[g[p+t]]``,
+      solve ``U11 x = c`` (zero/non-finite diagonal rejected), store
+      ``w[g[i]] = x_i``.
+
+    The summation order matches ``solve_front_tree`` step for step, so the two
+    FP64 references agree on the same IR (verified by the tests).
+    """
+
+    factors = factor_front_tree(nodes, local_fronts, map_tables, config)
+    by_node = {factor.node_id: factor for factor in factors}
+    order = sibling_friendly_order(list(parent))
+    rhs = np.asarray(rhs_hat, dtype=np.float64).reshape(-1)
+    if rhs.size == 0 or not np.all(np.isfinite(rhs)):
+        raise ValueError("RHS must be non-empty and finite")
+
+    work = rhs.copy()  # solution_data accumulator w
+    for node_id in order:
+        node = nodes[node_id]
+        factor = by_node[node_id]
+        variables = np.asarray(node.front_indices, dtype=np.int64)
+        pivot_dim = factor.pivot_dim
+        total_dim = factor.l.shape[0]
+        if variables.size != total_dim or factor.p_local.shape != (pivot_dim,):
+            raise ValueError("front factor dimensions are invalid")
+        # Step 1: P-vector gather of b_hat + w inside the pivot block.
+        pivot_rhs = np.empty(pivot_dim, dtype=np.float64)
+        for row in range(pivot_dim):
+            variable = variables[int(factor.p_local[row])]
+            pivot_rhs[row] = work[variable]
+        # Step 2: unit-lower forward substitution for the pivot block.
+        z = np.empty(pivot_dim, dtype=np.float64)
+        for row in range(pivot_dim):
+            value = pivot_rhs[row]
+            for col in range(row):
+                value -= factor.l[row, col] * z[col]
+            z[row] = value
+        # Step 3: read-modify-write the update segment for ancestor nodes.
+        for row in range(pivot_dim, total_dim):
+            value = work[variables[row]]
+            for col in range(pivot_dim):
+                value -= factor.l[row, col] * z[col]
+            work[variables[row]] = value
+        # Step 4: pivot variables now hold z (this is also workspace row 0).
+        work[variables[:pivot_dim]] = z
+
+    for node_id in reversed(order):
+        node = nodes[node_id]
+        factor = by_node[node_id]
+        variables = np.asarray(node.front_indices, dtype=np.int64)
+        pivot_dim = factor.pivot_dim
+        total_dim = factor.l.shape[0]
+        x = np.empty(pivot_dim, dtype=np.float64)
+        for reverse_row in range(pivot_dim, 0, -1):
+            row = reverse_row - 1
+            value = work[variables[row]]
+            for col in range(row + 1, pivot_dim):
+                value -= factor.u[row, col] * x[col]
+            for col in range(pivot_dim, total_dim):
+                value -= factor.u[row, col] * work[variables[col]]
+            diagonal = factor.u[row, row]
+            if diagonal == 0.0 or not np.isfinite(diagonal):
+                raise PivotFailureError(
+                    PivotFailureKind.ZERO_PIVOT,
+                    node_id=node_id,
+                    column=row,
+                    detail="backward solve met a zero or non-finite diagonal",
+                )
+            x[row] = value / diagonal
+        work[variables[:pivot_dim]] = x
+    return work

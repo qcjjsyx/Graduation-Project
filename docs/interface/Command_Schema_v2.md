@@ -19,6 +19,7 @@ NodeTask ABI v2 是退役的旧执行链；本文描述的是 Command/Descriptor
 | `PANEL_LU` 的 descriptor | `KERNEL_DESC` | `FRONT_DESC`（policy 所在记录） |
 | P-vector 初始化 | 未定义 | INT32 哨兵 `-1`，由 `PANEL_LU` 改写 |
 | 状态码 | 无 policy/静态失败专用码 | 新增 `POLICY_NOT_SUPPORTED`、`STATIC_PIVOT_FAILURE`、`NON_FINITE_VALUE` |
+| `SOLVE_DESC` payload | 无 | T12：`front_indices`（u32[total_dim]）变量表 |
 
 v1 的 `FRONT_DESC` 将 word 8–9 置 0；v2 把 0 解释为**非法策略**并拒绝
 该记录。因此 v1 产物不会被 v2 悄悄接受，也不存在“根据 P-vector 是否为
@@ -40,9 +41,15 @@ manifest（JSON）声明：
   "command_record_bytes": 32,
   "descriptor_record_bytes": 64,
   "completion_record_bytes": 64,
-  "pivot_policy_field": "FRONT_DESC.body_words[8..9]"
+  "pivot_policy_field": "FRONT_DESC.body_words[8..9]",
+  "solve_desc_payload": "front_variable_indices_u32"
 }
 ```
+
+`solve_desc_payload` 只在 scope 为 `factorization_and_solve` 的产物中出现，
+标记 `SOLVE_DESC` 的变量 payload（§3.2.2）；`factorization_only` 产物必须
+不带该标记，也不得含任何 `SOLVE_FORWARD`/`SOLVE_BACKWARD` 命令。设备 loader
+与 manifest 校验器都按此拒绝不一致产物。
 
 ## 2. Command record（32B，布局与 v1 相同）
 
@@ -119,6 +126,37 @@ word9  pivot_threshold        IEEE-754 binary32 位型，[0, 1)
   `row_count`/`col_count` 个 u32）。当前主线 `row_map` 恒为
   `0..update_dim-1`，装配语义为
   `target[col_map[i], col_map[j]] += source[i, j]`。
+
+#### 3.2.2 `SOLVE_DESC`（type 0x06，T12 冻结 payload）
+
+body 布局与 v1 相同：
+
+```text
+word0  factor_desc_id       FACTOR_DESC 引用（必须有效）
+word1  rhs_region_id        REGION_DESC 引用（FP32）
+word2  solution_region_id   REGION_DESC 引用（FP32，solve 累加器 w）
+word3  p_vector_region_id   REGION_DESC 引用（必须与 FACTOR_DESC.word2 同一 region）
+word4  workspace_region_id  REGION_DESC 引用（FP32，≥ 2×pivot_dim）
+word5  rhs_count            本版必须为 1
+word6  direction            0x01 FORWARD / 0x02 BACKWARD
+word7  format               0x02 FP32
+word8-9                     保留，必须为 0
+```
+
+payload（T12 新增，**必须存在**）：`u32[total_dim]`，即节点的
+`front_indices`（Q 序全局变量号），`payload_offset` 4 字节对齐，
+`payload_bytes == 4 × FACTOR_DESC.total_dim`。校验规则：
+
+- 每个值 `< rhs/solution 的列数 N`，值互不重复；
+- 前 `pivot_dim` 个值必须是连续递增的 node range（与 manifest
+  `nodes[k].range` 一致），并与 manifest `front_indices` 完全相等；
+- 缺失 payload、长度不符、越界、重复、前缀不连续 → `BAD_DESCRIPTOR`
+  （loader 静态拒绝或 descriptor reader 运行期拒绝）。
+
+`SOLVE_FORWARD`/`SOLVE_BACKWARD` 是唯一使用 `SOLVE_DESC` 的命令；两个
+方向各自携带自己节点的同一份变量表。设备在求解中**只读** `rhs_data`
+（`REGION_DESC` 角色为只读输入），结果写入 `solution_data` 与
+`*.solve_workspace`。
 
 #### 3.2.1 KERNEL_DESC 与 SCALE_DESC（T10 冻结）
 
@@ -244,7 +282,8 @@ manifest 一致、P-vector region 为哨兵初值、置换数组互为一致组�
 ## 9. Fixture
 
 共享 golden fixture 见 `graduation-code/fixtures/command_schema_v2/`
-（Python 与 C++ codec 测试共同消费；含 `static_front_descriptor` 与
-`dynamic_front_descriptor`）。历史 v1 fixture 保留在
+（Python 与 C++ codec 测试共同消费；含 `static_front_descriptor`、
+`dynamic_front_descriptor`、T12 的 `solve_descriptor` 与 `solve_payload`）。
+历史 v1 fixture 保留在
 `graduation-code/fixtures/command_schema_v1/`，仅用于追溯与负面测试
 （v2 codec 必须拒绝 v1 `FRONT_DESC`）。

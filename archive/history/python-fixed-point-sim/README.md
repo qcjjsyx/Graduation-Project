@@ -1,6 +1,7 @@
 # Python 行为模型与历史实验
 
-状态：辅助验证和历史实验目录
+状态：**已归档**（2026-10-10 由 `graduation-code/sim/` 移入 `archive/history/python-fixed-point-sim/`）。
+这是早期全局定点路线的行为模型，不被当前编译器或 SystemC 设备调用。
 
 本目录不是 SystemC，也不是 RTL。它用于快速验证数学想法、生成小规模实验和检查某些硬件策略的趋势。
 
@@ -29,10 +30,10 @@ RTL
 
 Python 结果可以作为算法和量化的早期参考，但不能替代 SystemC 的硬件数据流，也不能替代 RTL testbench。
 
-## 3. 当前主线使用方式
+## 3. 运行方式（历史）
 
 ```bash
-python graduation-code/sim/hardware.py \
+python archive/history/python-fixed-point-sim/hardware.py \
   --n 32 \
   --mode stable \
   --seed 42 \

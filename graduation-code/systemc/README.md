@@ -1,5 +1,8 @@
 # SystemC 当前主线
 
+> 项目全貌与当前进度见 [项目主线梳理](../../项目主线梳理.md)，完成证据统一见 [当前进度](../../当前进度.md)。正式入口是
+> `tree_factor_device`（设备分解）+ `tree_factor_check`（独立 FP64 验收）。
+
 当前目录保留与 Command/Descriptor schema v2 主线一致的模块：
 
 - `include/command_codec.hpp`：schema v2 固定记录 codec（含主元策略字段）；
@@ -19,17 +22,28 @@
   顶层 GEMM_Schur（`gemm_controller`、`gemm_types` 统一
   `GemmReq/GemmRsp`、`precision_adapter` 局部 INT32 量化/INT64 累加），通过
   `controlplane/panel_exec_unit` 接入 `CommandDevice` 真实 front lease，
-  设计见 `docs/systemc/T07_Panel_LU数值引擎设计.md`、
-  `docs/architecture/TRSM架构设计.md` 与
-  `docs/architecture/T10_GEMM_Schur与局部INT32设计.md`；
+  设计见 `docs/systemc/Panel-LU模块设计.md`、
+  `docs/systemc/TRSM模块设计.md` 与
+  `docs/systemc/GEMM_Schur与局部INT32设计.md`；
 - `controlplane/assembly_exec_unit`：T11 真实 FP32 extend-add，child update
   DDR→DMA temp→运行时 map→parent front 累加，12 B 数值 staging，共用统一
   读/写预算；双 front/树依赖/abort/reset 沿用 CommandDevice；
-- `src/tree_factor_device.cpp` / `reference/tools/tree_factor_check.cpp`：
-  严格真实后端 artifact 分解入口和独立 FP64 因子/update checker；
-- `tools/t11_fixture_gen.py` / `tests/assembly_real_tests.cpp` /
-  `tests/tree_real_tests.cpp` / `tests/tree_real_systemc_tests.cpp`：两种设备后端
-  的单节点/树/forest/映射/尾块/失败与 sc_clock 回归；
+- `controlplane/solve_exec_unit`：T12 专用树形求解单元（`SOLVE_FORWARD`/
+  `SOLVE_BACKWARD`），自己向 `MemoryService` 发有界读/写（P-vector、
+  RHS/累加器、L/U 行、UPDATE 段 RMW），行缓冲/计算经统一 OnChipArbiter；
+  `SolveConfig`（lanes/reduce_latency/div_latency/row_buffer_depth）写入
+  summary；`ControlPlaneConfig.enable_real_solve` 默认 false（T05 占位路径
+  原样保留）；
+- `src/tree_factor_device.cpp` / `reference/tools/tree_factor_check.cpp` /
+  `reference/tools/tree_solve_check.cpp`：严格真实后端 artifact 入口、独立
+  FP64 因子/update checker 与 T12 独立求解 checker（η_f/η_b、变换后系统
+  残差、FP64 参考解、原方程指标、solve 命令状态门）；
+- `tools/t11_fixture_gen.py` / `tools/t12_fixture_gen.py` /
+  `tests/assembly_real_tests.cpp` / `tests/tree_real_tests.cpp` /
+  `tests/tree_real_systemc_tests.cpp` / `tests/solve_real_tests.cpp` /
+  `tests/tree_solve_real_tests.cpp` / `tests/tree_solve_systemc_tests.cpp`：
+  两种设备后端的单节点/树/forest/映射/尾块/失败、求解单元手算/负面/abort、
+  24 个求解 artifact 集成与 sc_clock 回归；
 - `reference/`：独立 FP64 数学参考（`PivotPolicy`/`PivotFailure`、
   `panel_lu_policy` 与通用 `panel_lu` 分离；`tools/fp64_reference_smoke`
   为数值冒烟入口）；
@@ -96,7 +110,7 @@ PYTHONDONTWRITEBYTECODE=1 ASAN_OPTIONS=detect_leaks=0 \
 ```
 
 CTest 会先运行 `t04_generate_fixtures`（默认使用仓库根 `.venv/bin/python`，
-可用 `-DT04_PYTHON=...` 覆盖），用当前软件编译器生成单节点/多节点/多根/
+可用 `-DT04_PYTHON=$(which python3)` 等覆盖；该 Python 需要 numpy、scipy），用当前软件编译器生成单节点/多节点/多根/
 DYNAMIC_PANEL/256 阶设备运行目录，然后运行：
 
 - `dataplane_core_tests`：schema v2 加载、非法 artifact、u64 溢出/重叠/对齐、
@@ -121,8 +135,13 @@ DYNAMIC_PANEL/256 阶设备运行目录，然后运行：
   （`panel.numeric_mode=fp64_diagnostic`，默认 FP32，summary 标记；
   与 INT32 GEMM 组合显式拒绝）。
 - T11 新增 fixture、装配、树、时钟、两模式 CLI/checker 与 CLI 失败退出
-  测试。当前完整 CTest **32 项**，Release 与 ASan+UBSan 均通过。macOS
-  sanitizer 关闭平台不支持的 leak detector，不影响 Address/Undefined 检查。
+  测试；T12 新增求解单元手算/负面/abort 测试、24 个求解 artifact 集成与
+  sc_clock 一致性、两模式 solve CLI/checker。当前完整 CTest **41 项**，
+  Release 与 ASan+UBSan 均通过（macOS/Clang；Linux/GCC 13 + SystemC 3.0.2
+  同样通过）。sanitizer 运行时设 `ASAN_OPTIONS=detect_leaks=0`，不作泄漏结论。
+- 2026-10-10 修复：`tests/control_test_artifact.hpp` 中
+  `place(name, data.size(), std::move(data))` 依赖未规定的参数求值顺序，GCC
+  先 move 后取 size，导致后续 memcpy 越界，Linux 上 6 项测试崩溃。
 
 ## T11 真实树形分解
 
@@ -150,11 +169,12 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
   /tmp/t11-fixtures/three_level/int32/device /tmp/t11-output/int32
 ```
 
-完整软件编译 CLI 也支持分解模式。从 `graduation-code/software` 目录运行：
+完整软件编译 CLI 默认生成分解与求解（`factorization_and_solve`）artifact。从
+`graduation-code/software` 目录运行：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 ../../.venv/bin/python -m src.main \
-  --n 24 --density 0.16 --max-supernode-size 4 --factorization-only \
+  --n 24 --density 0.16 --max-supernode-size 4 \
   --gemm-backend FP32_SYSTEMC --out /tmp/t11-compiled
 /tmp/t04-build/tree_factor_device --device-dir /tmp/t11-compiled \
   --out /tmp/t11-compiled-report --backend FP32_SYSTEMC
@@ -163,8 +183,22 @@ PYTHONDONTWRITEBYTECODE=1 ../../.venv/bin/python -m src.main \
 
 真实矩阵输入可用 `--mtx PATH` 代替 `--n/--density`。局部 INT32 则将编译与
 运行两个 `--backend` 对应参数都选为 `FP32_SYSTEMC_INT32_GEMM`。编译默认
-不执行 host reference；默认省略 `--factorization-only` 时仍会生成 solve 链，
-真实 solve 待 T12，T11 入口显式拒绝该 scope。
+不执行 host reference；CLI 默认 scope 是 `factorization_and_solve`
+（`--factorization-only` 生成纯分解 artifact，`--emit-solve-commands` 保留为
+兼容别名）。
+
+**设备容量与编译一致：** 每个 front 在设备上占一个 scratchpad 槽（紧凑 FP32
+n×n）。编译器用 `--device-buffer-bytes`（默认 65536，即 front ≤ 128）检查所有
+front，并把该值写入 `manifest.compiler.device_buffer_bytes`；`tree_factor_device`
+按这个值设置 `ControlPlaneConfig.buffer_capacity_bytes`（旧 manifest 无此字段时
+保持默认 64 KiB）。因此“编译通过”就意味着设备槽放得下，不会在长时间运行后才报
+`BUFFER_FULL`。
+
+**数值提醒：** `numeric_status_pass=1` 只说明所有命令状态 OK。在
+`example/256X256JJ.mat`、`576X576JJ.mat` 上 FP32 + STATIC（阈值 0）设备全部
+成功，但 checker 失败：这两个矩阵接近奇异（条件数 1e10、1e13），超出 FP32 能力，
+不是设备错误。诊断工具 `software/tools/numeric_diagnosis.py`，详见
+`experiments/real_matrix_diagnosis/实验报告.md`。
 
 输出包括 `commands.csv`、`nodes.csv`、`units.csv`、`fronts.csv`、
 `panel_tasks.csv`、`transactions.csv`、`buffers.csv`、`summary.json` 和
@@ -176,9 +210,43 @@ checker 使用初始 FP32 image/map，设备与 checker 均不需要 golden 文�
 
 T11 共 24 个树形 artifact：23 个数值通过，1 个 INT32 STATIC 主元传播
 按预期失败。设备遇到失败、超时或 backend 不匹配时返回非零退出码；checker
-拒绝失败批次，不把预期失败记为数值通过。求解/原方程误差属于 T12。
+拒绝失败批次，不把预期失败记为数值通过。
 详细方案与本轮证据见
-[T11 真实装配与树形分解集成](../../docs/architecture/T11_真实装配与树形分解集成.md)。
+[装配与因子保存设计](../../docs/systemc/装配与因子保存设计.md)。
+
+## T12 树形求解（Ax=b 闭环）
+
+`tree_factor_device` 同时接受 `factorization_only` 与
+`factorization_and_solve` artifact，并默认开启 `enable_real_solve`（真实求解
+单元）。CLI 默认编译完整链：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 ../../.venv/bin/python -m src.main \
+  --n 128 --density 0.03 --out /tmp/t12-rand
+/tmp/t04-build/tree_factor_device --device-dir /tmp/t12-rand \
+  --out /tmp/t12-rand-rep --backend FP32_SYSTEMC
+/tmp/t04-build/tree_factor_check /tmp/t12-rand /tmp/t12-rand-rep
+/tmp/t04-build/tree_solve_check /tmp/t12-rand /tmp/t12-rand-rep
+```
+
+`tree_solve_check` 只读初始镜像、最终镜像、manifest 与设备报告：
+1. 前代后向误差 `η_f`（设备 L/P 组装 L̃、设备前代 workspace z 组装 y）；
+2. 回代后向误差 `η_b`（设备 U 与 solution_data 的 x̂）；
+3. 变换后系统 `Â x̂ = b̂` 的残差与分量后向误差（Â 由初始 local front 散射）；
+4. 原方程残差/后向误差/解误差（host 参考文件存在时，只报告）。
+`solve_pass = η_f ≤ tol ∧ η_b ≤ tol ∧ 全部求解命令 OK`，输出
+`solve_validation.json`；容限默认 `1e-4`，FP32 实测 η 在 1e-7 量级。
+
+T12 fixture：`tools/t12_fixture_gen.py` 生成同一组 24 个树形 IR 的求解版本
+（两种后端）。23 个正向用例 `solve_pass=1`；唯一预期失败用例（INT32
+STATIC 主元传播）的全部 backward 与失败节点起的 forward 为 `DEPENDENCY_FAILED`
+（之前的 forward 可为 OK）、设备退出码非 0、checker 拒绝验收。每条求解命令只等
+本节点 commit + 上一条求解命令（2026-10-11 去掉全局求解门），节点数不受
+`max_wait_tokens` 限制，`wide_tree`（297 节点）用例回归这一点；设备把 solve
+命令停靠到所有 commit 终态之后才占用调度窗口（窗口防死锁）。
+`tree_solve_check_tests` 单测 checker 的 P-vector 约定（三元轮换与其逆排列）。
+求解语义、失败码与设计决策见
+[树形求解模块设计](../../docs/systemc/树形求解模块设计.md)。
 
 ## 既有阶段冒烟入口
 

@@ -1,116 +1,160 @@
-# 多前沿稀疏 LU 求解器软硬件协同架构
+# 多前沿稀疏 LU 求解器软硬件协同毕业设计
 
-状态：当前项目入口（2026-10-07 按当前代码同步；STATIC 分解已推进至 T11）
+本项目研究面向稀疏线性方程 `Ax=b` 的多前沿 LU 求解器软硬件协同设计，
+关注数值可靠性、计算资源组织和存储开销。工程包含 Python 编译工具、
+SystemC/C++ 设备架构模型、RTL 模块及独立验证工具。
 
-本项目研究使用多前沿方法组织稀疏方阵求解，并通过软件编译器、SystemC 硬件架构模型和关键 RTL 原型验证软硬件协同方案。
+## 文档入口
 
-正式问题是：
+| 文档 | 阅读目的 |
+|---|---|
+| [项目主线梳理](项目主线梳理.md) | 理解项目目标、数据流、代码分工和下一阶段方向 |
+| [当前进度](当前进度.md) | 查看已交付能力、验证证据和完成边界 |
+| [todo](todo.md) | 查看当前尚未完成的工作 |
 
-```text
-Ax = b
+理论、接口、模块设计和验证规范/记录放在 `docs/`；数值实验的报告、批次数据和图表放在
+`experiments/`，由上述文档链接进入。
+
+## 环境准备
+
+以下命令按 macOS 编写，均从仓库根目录开始。
+
+- Python 3.10+，使用根目录 `.venv`，依赖 NumPy、SciPy、pytest。
+- CMake 3.16+、支持 C++17 的编译器、SystemC 3.0.x。
+- 本机 SystemC 路径为 `/usr/local/systemc-3.0.2`；其他环境替换下方路径。
+- RTL 仿真使用 Icarus Verilog 12+，需要 `iverilog` 和 `vvp`。
+
+本机已有 `.venv`。新环境可按下列命令创建：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install numpy scipy pytest
 ```
 
-显式逆矩阵不作为主工作负载；需要求逆时，将单位矩阵作为多个 RHS，复用同一套 LU 因子和求解流程。
+## 构建与测试
 
-## 当前架构结论
+### 分别运行 Python、C++ 和端到端样例
 
-```text
-软件编译器 → schema v2 artifact → FP32 SystemC/C++ 设备模型 → 最终 DDR image + reports
-                                     （可选局部 INT32 GEMM）              ↓
-初始 artifact ─────────────────────────────────────────────→ 独立 FP64 checker
+从仓库根目录执行对应脚本；四个脚本彼此独立，不会自动依次执行：
+
+```bash
+bash scripts/run_pytest.sh
+bash scripts/run_cpp_build.sh
+bash scripts/run_cpp_test.sh
+bash scripts/run_sample.sh
 ```
 
-- FP64 Python/C++：独立数学参考与外部 checker，不向设备注入参考 front、因子、预选主元或解；
-- 正式设备后端：`FP32_SYSTEMC` 和 `FP32_SYSTEMC_INT32_GEMM`，模拟命令、buffer、依赖、真实数据运算与周期；FP64 局部诊断不等同于正式 FP64 设备后端；
-- 局部 INT32：仅用于顶层 `GEMM_SCHUR` 的 tile/K 分块，front、因子、update、装配、Panel 和 TRSM 保持 FP32；`Int32GemmBehavioral` 是设计职责名称，当前由 `precision_adapter.cpp` 函数集合实现，并由 `MultiModePe` 调用；
-- RTL：GCU/HPU/ATU 等独立原型尚未形成 schema v2 设备闭环，不能用 SystemC 通过记录宣称 RTL 已完成。
+其中 `run_cpp_build.sh` 会完成 CMake Release 配置和 C++/SystemC 编译；
+`run_cpp_test.sh` 需要先存在已经配置和编译好的构建目录；`run_sample.sh` 需要先
+完成 `run_cpp_build.sh`，然后运行 Python 编译器、SystemC 设备模型、因子 checker
+和求解 checker。
 
-## 软件、SystemC 与硬件的职责
+脚本默认使用根目录 `.venv`、`/usr/local/systemc-3.0.2` 和
+`/tmp/gp-docs-rel`。`--sample` 的输入和报告会写入自动创建的 `/tmp` 临时目录。
+如需覆盖这些设置，可在执行时传入环境变量，例如：
 
-```text
-稀疏矩阵 A、RHS b
-  → 均衡、加权匹配行置换、ordering、fill、消除森林
-  → supernode、front、map
-  → command buffer、descriptor table、memory image
-  → SystemC/C++ STATIC 分解设备
-  → 持久 L/U/P、update、status 和周期/访存报告
-  → 独立 FP64 因子/update/P 验收
-
-后续 T12：真实树形前代/回代 → solution 写回 → 原方程 Ax=b 验收
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python" \
+SYSTEMC_HOME=/usr/local/systemc-3.0.2 \
+BUILD_DIR=/tmp/gp-rel JOBS=4 \
+bash scripts/run_cpp_build.sh
 ```
 
-软件负责全局结构分析和命令编译；设备执行已编译命令。当前分解入口是
-[`tree_factor_device`](graduation-code/systemc/src/tree_factor_device.cpp)，
-外部验收入口是 [`tree_factor_check`](graduation-code/systemc/reference/tools/tree_factor_check.cpp)。
-分配 RHS/solution 区域或存在参考 solve 不表示设备已完成求解。
+运行样例时也可以固定输出目录：
 
-当前 artifact 是 Command/Descriptor schema v2：32B Command、64B Descriptor、64B Completion，数据位于同一 `memory_image.bin` 的显式区域。`FRONT_DESC` 携带主元策略；正式设备支持 `STATIC`，局部 P-vector 成功后写 identity。`DYNAMIC_PANEL` 已有接口与独立参考语义，但真实设备尚未实现，显式拒绝。旧 `NodeTask` ABI v2 已归档，与 schema v2 无关。
-
-当前进度：T00–T11 的 STATIC 分解链已实现，包含真实 Panel-LU、左右 TRSM、GEMM_Schur、extend-add、完整因子与 update 写回、单节点/树/森林执行。T05 test stub 仅用于显式控制流测试；T06 合成原型不替代正式数值验收。T12 树形 solve 与完整 Ax=b 尚未完成；T14 HPU/ATU 契约统一后移，动态路径依赖该工作。详见[任务说明书](docs/项目实现任务说明书.md)和[当前任务状态](todo.md)。
-
-共享计算架构已落地：Panel/TRSM/GEMM 命令共用一个 PE 池，实验配置为 **2 组×每组 2 个完整 16×16 PE**；每条计算命令独占一组，组内按依赖处理 tile。统一片上读/写预算各方向每拍只授予一个 requester，余量不转授。`*_unit_count` 是命令执行单元实例数，PE 数量由 `compute_group_count × pes_per_group` 决定。见[计算架构基线](docs/architecture/多模式PE与16x16分块计算基线.md)。
-
-新人入口：[当前实现技术导读](docs/当前实现技术导读.md)。当前缺陷与复现见[审查报告](docs/当前实现审查与验证报告.md)：B01 abort 响应丢失已修复；独立 RTL 的 B02/B03 尚未修复。
-
-## 当前代码目录
-
-```text
-Graduation-Project/
-├── README.md
-├── todo.md
-├── docs/                         当前架构、接口、SystemC 和验证规范
-├── graduation-code/
-│   ├── software/                 稀疏结构分析和软件产物生成
-│   ├── systemc/                  多前沿 SystemC 系统模型
-│   ├── hardware/                 GCU、ATU、HPU 等 RTL 原型
-│   ├── sim/                      Python 行为模型和实验脚本
-│   └── fixtures/                 Python/C++ 共用 golden fixture（schema v1/v2）
-├── graduation-project/           论文、开题、汇报和参考资料
-├── archive/                      归档：NodeTask ABI v2、历史优化与精度实验
-└── unused/                       早期设计与历史 optimization-v1/v2/v3 副本
+```bash
+SAMPLE_DIR=/tmp/gp-docs-smoke \
+REPORT_DIR=/tmp/gp-docs-smoke-rep \
+bash scripts/run_sample.sh
 ```
 
-## 快速验证
-
-软件：
+### Python
 
 ```bash
 cd graduation-code/software
-python -m pytest -q
+../../.venv/bin/python -m pytest -q
+cd ../..
 ```
 
-SystemC：
+### C++ / SystemC Release
+
+使用新的构建目录，避免复用仓库中残留的旧构建产物。
+CMake 默认使用仓库 `.venv` 生成测试输入。
 
 ```bash
-cd graduation-code/systemc
-cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+cmake -S graduation-code/systemc -B /tmp/gp-docs-rel \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DSYSTEMC_HOME=/usr/local/systemc-3.0.2
+cmake --build /tmp/gp-docs-rel -j 4
+ctest --test-dir /tmp/gp-docs-rel --output-on-failure
 ```
 
-Python 历史行为模型：
+### ASan / UBSan
+
+修改 C++ 后同时执行 Release 与 sanitizer 回归。
 
 ```bash
-python graduation-code/sim/hardware.py --n 32 --mode stable --seed 42 --ir-iters 5
+cmake -S graduation-code/systemc -B /tmp/gp-docs-san \
+  -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DENABLE_SANITIZERS=ON \
+  -DSYSTEMC_HOME=/usr/local/systemc-3.0.2
+cmake --build /tmp/gp-docs-san -j 4
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  ctest --test-dir /tmp/gp-docs-san --output-on-failure
 ```
 
-## 当前主线文档
+### RTL
 
-- [项目范围与交付边界](docs/architecture/项目范围与交付边界.md)
-- [系统架构与模块职责](docs/architecture/系统架构与模块职责.md)
-- [软件侧算法说明](docs/algorithm/README.md)
-- [Command Stream 与 Descriptor 接口](docs/interface/Command_Stream_and_Descriptor.md)
-- [Command / Descriptor Schema v2](docs/interface/Command_Schema_v2.md)
-- [Command / Descriptor 固定格式 v1（历史）](docs/interface/Command_Schema_v1.md)
-- [SystemC 模型规范](docs/systemc/SystemC_模型规范.md)
-- [验证计划与结果口径](docs/verification/验证计划与结果口径.md)
-- [T00 可复现基线](docs/verification/T00_baseline.md)
-- [项目实现任务说明书](docs/项目实现任务说明书.md)
-- [总体架构重新定型方案](项目总体架构重新定型方案.md)
-- [当前推进计划](todo.md)
+在仓库根目录执行：
 
-## 文档使用规则
+```bash
+bash graduation-code/hardware/run_rtl_tests.sh
+```
 
-上述主线文档定义当前项目范围。`unused/optimization-v1/v2/v3`、`archive/`、旧开题方案、旧量化方案和早期 prompt 只用于追溯历史实验，不能继续修改为当前架构依据。
+RTL 仿真的覆盖范围和其他入口见 [硬件目录说明](graduation-code/hardware/README.md)。
 
-FP64 参考结果、FP32 SystemC 结果、INT32 GEMM 行为模型结果和未来 RTL 结果必须在实验中分开标记。SystemC 运行成功不等于 Verilog 已经实现，也不等于真实芯片周期已经得到验证。
+## 运行一个完整样例
+
+先完成上述 Release 构建，再执行：
+
+```bash
+cd graduation-code/software
+../../.venv/bin/python -m src.main --n 128 --density 0.03 --seed 0 \
+  --out /tmp/gp-docs-smoke
+/tmp/gp-docs-rel/tree_factor_device \
+  --device-dir /tmp/gp-docs-smoke --out /tmp/gp-docs-smoke-rep \
+  --backend FP32_SYSTEMC
+/tmp/gp-docs-rel/tree_factor_check \
+  /tmp/gp-docs-smoke /tmp/gp-docs-smoke-rep
+/tmp/gp-docs-rel/tree_solve_check \
+  /tmp/gp-docs-smoke /tmp/gp-docs-smoke-rep
+cd ../..
+```
+
+输入目录保存编译产物，报告目录保存设备执行报告、最终镜像和两份验收报告。
+解读结果时同时查看因子验收、前代/回代后向误差、原方程后向误差和解误差；
+具体口径见 [验证规范](docs/verification/验证规范.md)。
+
+真实矩阵在 `graduation-code/software/example/`。在上述软件目录的编译命令中，
+用 `--mtx` 替换随机矩阵参数，并按矩阵设置容量：
+
+| 矩阵 | 编译参数 |
+|---|---|
+| 256JJ | `--mtx example/256X256JJ.mat` |
+| 576JJ | `--mtx example/576X576JJ.mat --device-buffer-bytes 131072` |
+| 1024JJ | `--mtx example/1024X1024JJ.mat --max-front-size 300 --device-buffer-bytes 524288` |
+
+真实矩阵的数值限制见 [真实矩阵数值分析](experiments/real_matrix_diagnosis/实验报告.md)。
+更多输入、后端和运行选项见 [软件说明](graduation-code/software/README.md)
+和 [SystemC 说明](graduation-code/systemc/README.md)。
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `graduation-code/software/` | Python 编译工具、数值诊断与实验代码 |
+| `graduation-code/systemc/` | C++/SystemC 模型、独立参考与验收工具 |
+| `graduation-code/hardware/` | RTL 模块和仿真入口 |
+| `graduation-code/fixtures/` | 跨语言共享的测试输入 |
+| `docs/` | 算法、接口、设计和验证资料 |
+| `参考文献/` | 文献与阅读笔记 |
+| `archive/` | 历史材料，只读，不参与当前主线构建 |

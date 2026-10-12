@@ -135,6 +135,24 @@ CommandHeader {
 
 它不定义整个 front、factor、pivot 或消除树的全局数据格式。
 
+### 4.5 SolveDesc
+
+描述一次树形前代或回代（T12 冻结）：
+
+- `factor`（`FACTOR_DESC`）、RHS/solution region、workspace region 与
+  P-vector region 引用（P-vector 必须与 `FACTOR_DESC` 同一 region）；
+- `direction`（FORWARD/BACKWARD）、单 RHS（`rhs_count = 1`）、FP32；
+- **payload**：节点 `front_indices`（u32[total_dim]，Q 序全局变量号），
+  前 `pivot_dim` 个是连续 node range。设备据它在全局变量空间
+  gather/scatter，不接触 host 侧映射。缺失或非法的 payload →
+  `BAD_DESCRIPTOR`；见 [Command_Schema_v2.md](Command_Schema_v2.md) §3.2.2。
+
+求解语义（累加器形式）：`solution_data` 初始化为 0 并充当工作向量 `w`；
+前代按拓扑序 `r = b̂[g[p[i]]] + w[g[p[i]]]`、解 L11、把 `−L21·z` 写回
+update 段、`w[g[i]] = z`；回代按逆拓扑序解 U11、结果写回 `w`。`rhs_data`
+全程只读；workspace 第 0 行保存每节点的前代 z 供独立 checker 使用。命令依赖
+与完整数学推导见 [树形求解模块设计](../systemc/树形求解模块设计.md)。
+
 ## 5. 主元策略、P-vector 与失败语义
 
 ### 5.1 策略声明
@@ -273,7 +291,7 @@ SYSTEMC_INT32_GEMM_MODEL
 
 在 `FP32_SYSTEMC_INT32_GEMM` 中，`PANEL_LU`、`TRSM`、pivot 和树形依赖仍使用浮点；只有 `GEMM_SCHUR` 通过 `ScaleDesc` 进行局部 INT32 适配。T10 已冻结 `SCALE_DESC` word 0–5 的编码与 `KERNEL_DESC`/backend 组合规则，见
 [Command_Schema_v2.md](Command_Schema_v2.md) §3.2.1 与
-[../architecture/T10_GEMM_Schur与局部INT32设计.md](../architecture/T10_GEMM_Schur与局部INT32设计.md)。
+[../systemc/GEMM_Schur与局部INT32设计.md](../systemc/GEMM_Schur与局部INT32设计.md)。
 
 ## 10. 当前实现策略
 
@@ -292,6 +310,7 @@ RTL executor
 [Command_Schema_v2.md](Command_Schema_v2.md)，[Command_Schema_v1.md](Command_Schema_v1.md)
 仅作追溯。T04/T05 的 SystemC executor（数据面/控制面、DMA、descriptor reader、token
 scoreboard 运行时）已实现；T07–T11 已接入 STATIC Panel/TRSM/GEMM/真实
-extend-add 与树形分解。完整 solve/Ax=b 属于 T12。软件显式分解模式通过
-`compiler.operation_scope=factorization_only` 声明并省略 solve 命令，未声明
-该字段的旧 artifact 仍要求含 solve 的完整链，32B/64B/64B 记录布局不变。
+extend-add 与树形分解；T12 已实现设备端 `SOLVE_FORWARD`/`SOLVE_BACKWARD`（专用
+求解单元 + SOLVE_DESC payload + 独立 `tree_solve_check`），主线闭环到 Ax=b。软件显式
+分解模式通过 `compiler.operation_scope=factorization_only` 声明并省略 solve 命令；
+未声明该字段的旧 artifact 仍要求含 solve 的完整链，32B/64B/64B 记录布局不变。

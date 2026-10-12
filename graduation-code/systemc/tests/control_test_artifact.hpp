@@ -5,6 +5,7 @@
 // compiler emits) with deterministic, independently computable data patterns
 // so tests can verify byte outcomes without golden files.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -115,6 +116,63 @@ inline void append_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
 
 inline std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
+}
+
+// Children-before-parents order with the same sibling grouping as the
+// compiler's sibling_friendly_order (deterministic, stable by (parent, id)).
+inline std::vector<std::uint32_t> topological_order(const std::vector<TestNode>& nodes) {
+    const std::size_t count = nodes.size();
+    std::vector<std::uint32_t> indegree(count, 0);
+    for (const auto& node : nodes) {
+        if (node.parent_id >= 0) {
+            indegree[static_cast<std::size_t>(node.parent_id)] += 1;
+        }
+    }
+    std::vector<std::uint32_t> ready;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (indegree[index] == 0) {
+            ready.push_back(index);
+        }
+    }
+    const auto sibling_key = [&nodes](std::uint32_t node) {
+        return std::make_pair(
+            nodes[node].parent_id >= 0 ? static_cast<std::int32_t>(nodes[node].parent_id)
+                                       : -1,
+            static_cast<std::int32_t>(node));
+    };
+    std::vector<std::uint32_t> order;
+    order.reserve(count);
+    while (!ready.empty()) {
+        std::sort(ready.begin(), ready.end(), [&](std::uint32_t lhs, std::uint32_t rhs) {
+            return sibling_key(lhs) < sibling_key(rhs);
+        });
+        std::vector<std::uint32_t> current = ready;
+        ready.clear();
+        for (const auto node : current) {
+            order.push_back(node);
+            const auto parent = nodes[node].parent_id;
+            if (parent >= 0) {
+                indegree[static_cast<std::size_t>(parent)] -= 1;
+                if (indegree[static_cast<std::size_t>(parent)] == 0) {
+                    ready.push_back(static_cast<std::uint32_t>(parent));
+                }
+            }
+        }
+    }
+    if (order.size() != count) {
+        throw std::runtime_error("test artifact: elimination forest contains a cycle");
+    }
+    return order;
+}
+
+inline std::vector<std::uint8_t> solve_payload(
+    const std::vector<std::uint32_t>& variables) {
+    std::vector<std::uint8_t> payload;
+    payload.reserve(variables.size() * 4);
+    for (const auto variable : variables) {
+        append_u32(payload, variable);
+    }
+    return payload;
 }
 
 inline std::string node_prefix(const std::string& name) {
@@ -291,6 +349,32 @@ inline TestArtifact build_test_artifact(
     TestArtifact result;
     result.nodes = nodes;
     result.options = options;
+
+    // ---- T12 solve contract data -----------------------------------------
+    // Children-before-parents order (same shape as the compiler's
+    // sibling-friendly order) and a per-node variable table: node k owns the
+    // contiguous variable block starting at the cumulative pivot count. The
+    // SOLVE_DESC payloads and the manifest must agree with both.
+    const std::vector<std::uint32_t> solve_order = detail::topological_order(nodes);
+    std::vector<std::vector<std::uint32_t>> node_variables(nodes.size());
+    {
+        std::uint32_t base = 0;
+        for (const auto& node : nodes) {
+            if (base + node.total_dim > options.matrix_dim) {
+                // Keep the synthetic variables inside the RHS column count
+                // when possible; artifacts with a front larger than matrix_dim
+                // are intentionally invalid for solve (the runtime reader
+                // refuses them), which some panel tests rely on.
+                base = 0;
+            }
+            std::vector<std::uint32_t> variables;
+            for (std::uint32_t index = 0; index < node.total_dim; ++index) {
+                variables.push_back(base + index);
+            }
+            node_variables[node.node_id] = std::move(variables);
+            base += node.pivot_dim;
+        }
+    }
 
     // ---- region specs ----------------------------------------------------
     std::vector<RegionSpec> regions;
@@ -493,29 +577,34 @@ inline TestArtifact build_test_artifact(
         rotation = (chosen_index + 1) % node_count;
     }
 
-    // Solve phase (trailing chain).
+    // Solve phase (trailing chain) in children-before-parents order, with the
+    // backward chain in reverse; matches symbolic.factorization_order. Each
+    // forward waits on its own commit plus the previous forward (no global
+    // solve gate since the 2026-10-11 revision).
     std::optional<std::pair<std::uint32_t, std::string>> previous;
     if (options.include_solve) {
-    for (const auto& node : nodes) {
-        CommandSpec spec{cmd::Opcode::SolveForward, node.node_id,
-                         "node." + std::to_string(node.node_id) + ".solve_forward",
-                         {{node.node_id, "commit"}}, "solve_forward"};
+    for (const auto node_id : solve_order) {
+        std::vector<std::pair<std::uint32_t, std::string>> waits;
+        waits.push_back({node_id, "commit"});
         if (previous.has_value()) {
-            spec.waits.push_back(*previous);
+            waits.push_back(*previous);
         }
+        CommandSpec spec{cmd::Opcode::SolveForward, node_id,
+                         "node." + std::to_string(node_id) + ".solve_forward",
+                         waits, "solve_forward"};
         emit(spec);
-        previous = std::make_pair(node.node_id, std::string("solve_forward"));
+        previous = std::make_pair(node_id, std::string("solve_forward"));
     }
-    for (auto iterator = nodes.rbegin(); iterator != nodes.rend(); ++iterator) {
-        const auto& node = *iterator;
-        CommandSpec spec{cmd::Opcode::SolveBackward, node.node_id,
-                         "node." + std::to_string(node.node_id) + ".solve_backward",
-                         {{node.node_id, "commit"}}, "solve_backward"};
+    for (auto iterator = solve_order.rbegin(); iterator != solve_order.rend(); ++iterator) {
+        const auto node_id = *iterator;
+        CommandSpec spec{cmd::Opcode::SolveBackward, node_id,
+                         "node." + std::to_string(node_id) + ".solve_backward",
+                         {{node_id, "commit"}}, "solve_backward"};
         if (previous.has_value()) {
             spec.waits.push_back(*previous);
         }
         emit(spec);
-        previous = std::make_pair(node.node_id, std::string("solve_backward"));
+        previous = std::make_pair(node_id, std::string("solve_backward"));
     }
     }
 
@@ -582,13 +671,13 @@ inline TestArtifact build_test_artifact(
              {cmd::NONE, cmd::NONE, cmd::NONE, cmd::NONE, cmd::NONE, 1,
               static_cast<std::uint32_t>(cmd::SolveDirection::Forward),
               static_cast<std::uint32_t>(cmd::DataFormat::Fp32), 0, 0},
-             {}});
+             detail::solve_payload(node_variables[node.node_id])});
         descriptor_specs.push_back(
             {prefix + ".solve_backward", cmd::DescriptorType::Solve,
              {cmd::NONE, cmd::NONE, cmd::NONE, cmd::NONE, cmd::NONE, 1,
               static_cast<std::uint32_t>(cmd::SolveDirection::Backward),
               static_cast<std::uint32_t>(cmd::DataFormat::Fp32), 0, 0},
-             {}});
+             detail::solve_payload(node_variables[node.node_id])});
     }
     for (const auto& node : nodes) {
         const std::string prefix = "node." + std::to_string(node.node_id);
@@ -720,7 +809,12 @@ inline TestArtifact build_test_artifact(
           static_cast<std::uint64_t>(command_specs.size()) * cmd::COMPLETION_RECORD_BYTES,
           {});
     for (auto& region : regions) {
-        place(region.name, region.data.size(), std::move(region.data));
+        // Read the size before moving: function-argument evaluation order is
+        // unspecified, and GCC evaluates right-to-left, so passing
+        // `region.data.size()` next to `std::move(region.data)` recorded a
+        // size of 0 and the later memcpy overflowed the image.
+        const std::uint64_t size = region.data.size();
+        place(region.name, size, std::move(region.data));
     }
     const std::uint64_t total_bytes = detail::align_up(cursor, 64);
 
@@ -812,9 +906,9 @@ inline TestArtifact build_test_artifact(
         parent_list += index + 1 == nodes.size() ? "" : ", ";
     }
     std::string order_list;
-    for (std::size_t index = 0; index < nodes.size(); ++index) {
-        order_list += std::to_string(index);
-        order_list += index + 1 == nodes.size() ? "" : ", ";
+    for (std::size_t index = 0; index < solve_order.size(); ++index) {
+        order_list += std::to_string(solve_order[index]);
+        order_list += index + 1 == solve_order.size() ? "" : ", ";
     }
 
     std::string manifest = "{\n";
@@ -827,8 +921,11 @@ inline TestArtifact build_test_artifact(
         "    \"command_record_bytes\": 32,\n"
         "    \"descriptor_record_bytes\": 64,\n"
         "    \"completion_record_bytes\": 64,\n"
-        "    \"pivot_policy_field\": \"FRONT_DESC.body_words[8..9]\"\n"
-        "  },\n";
+        "    \"pivot_policy_field\": \"FRONT_DESC.body_words[8..9]\"";
+    if (options.include_solve) {
+        manifest += ",\n    \"solve_desc_payload\": \"front_variable_indices_u32\"";
+    }
+    manifest += "\n  },\n";
     manifest +=
         "  \"compiler\": {\n"
         "    \"device_format\": \"FP32\",\n"
@@ -842,7 +939,11 @@ inline TestArtifact build_test_artifact(
         "    \"alignment\": 64,\n"
         "    \"tile_size\": " + std::to_string(options.tile_size) + ",\n"
         "    \"max_front_size\": 256,\n"
-        "    \"max_wait_tokens\": 256\n"
+        "    \"max_wait_tokens\": 256,\n"
+        "    \"operation_scope\": \"" +
+        std::string(options.include_solve ? "factorization_and_solve"
+                                          : "factorization_only") +
+        "\"\n"
         "  },\n";
     float threshold_ratio = 0.0f;
     std::memcpy(&threshold_ratio, &options.threshold_bits, sizeof(threshold_ratio));
@@ -899,6 +1000,19 @@ inline TestArtifact build_test_artifact(
         "    \"ordering\": \"interleaved_topological\",\n"
         "    \"admission_dependencies\": \"NODE_BEGIN waits for child commits\"\n"
         "  },\n";
+    if (options.include_solve) {
+        manifest +=
+            "  \"solve\": {\n"
+            "    \"chain\": \"serial\",\n"
+            "    \"forward_order\": \"factorization_order\",\n"
+            "    \"backward_order\": \"reverse_factorization_order\",\n"
+            "    \"solution_semantics\": \"zero-initialized accumulator; final = x_hat\",\n"
+            "    \"rhs_read_only\": true,\n"
+            "    \"workspace_rows\": [\"forward_z\", \"backward_scratch\"],\n"
+            "    \"p_vector_semantics\": \"gather_within_pivot_block\",\n"
+            "    \"row_buffer_depth\": 2\n"
+            "  },\n";
+    }
     manifest +=
         "  \"descriptor_table\": {\n"
         "    \"region\": \"descriptor_table\",\n"
@@ -935,9 +1049,18 @@ inline TestArtifact build_test_artifact(
         }
         manifest += "    \"" + std::to_string(node.node_id) + "\": {\n";
         manifest += "      \"parent_id\": " + std::to_string(node.parent_id) + ",\n";
-        manifest += "      \"range\": {\"start\": 0, \"end\": " +
-                    std::to_string(node.pivot_dim) + "},\n";
-        manifest += "      \"front_indices\": [0],\n";
+        {
+            const auto& variables = node_variables[node.node_id];
+            manifest += "      \"range\": {\"start\": " +
+                        std::to_string(variables.front()) + ", \"end\": " +
+                        std::to_string(variables.front() + node.pivot_dim) + "},\n";
+            manifest += "      \"front_indices\": [";
+            for (std::size_t v = 0; v < variables.size(); ++v) {
+                manifest += std::to_string(variables[v]);
+                manifest += v + 1 == variables.size() ? "" : ", ";
+            }
+            manifest += "],\n";
+        }
         manifest += "      \"total_dim\": " + std::to_string(node.total_dim) + ",\n";
         manifest += "      \"pivot_dim\": " + std::to_string(node.pivot_dim) + ",\n";
         manifest += "      \"update_dim\": " +

@@ -1,0 +1,44 @@
+{
+  "metadata_schema_version": 1,
+  "experiment": "real_matrix_diagnosis",
+  "migration_date": "2026-10-11",
+  "original_run": {
+    "date_as_reported": "2026-10-10",
+    "commit": null,
+    "environment": null,
+    "binary_sha256": null,
+    "rhs_seed": null
+  },
+  "method": {
+    "backend": "FP32_SYSTEMC",
+    "pivot_policy": "STATIC",
+    "factor_storage": "FP32",
+    "host_triangular_solve": "FP64",
+    "refinement_steps_as_reported": 3,
+    "residual_and_accumulation": "FP64"
+  },
+  "evidence_status": "report_only; original diagnostic JSON not recovered",
+  "legacy_report_sha256": "a542dc26a2fa254ec2da02cdbc1c5855f24ad6558cb77dcc124e4a09fa0353eb",
+  "checked_original_locations": [
+    "/tmp/jj256-diag.json",
+    "/tmp/jj576-diag.json",
+    "/tmp/jj1024-diag.json"
+  ],
+  "search_scope": "repository active files and /private/tmp, max depth 4, *diag*.json and *diagnosis*.json",
+  "results_reconstructed_from_report": false,
+  "device_rerun_during_migration": false,
+  "migration_time_source_snapshot": {
+    "git_head": "57a9df49576c4e25c500989c0a84e258f6928834",
+    "working_tree_dirty": true,
+    "sha256": {
+      "graduation-code/software/tools/numeric_diagnosis.py": "7685d5f7eeb4251426fcd790fe5ffc8e21e59b4fcfd076f7077d39120e955e82"
+    },
+    "note": "Current source identity only; not original run provenance."
+  },
+  "migration_time_matrix_sources_sha256": {
+    "graduation-code/software/example/256X256JJ.mat": "ee05423e6c6b9bf5afb44845e32309e0f41b81309b3eb3ab4b47489847405114",
+    "graduation-code/software/example/576X576JJ.mat": "f4fbf73f6c4df13c5e6a7f6196c6ea29893abcaa43428a4e6c679d9ae5e006f6",
+    "graduation-code/software/example/1024X1024JJ.mat": "2740a169ecc694c6c22387f1abadac18ec0a07c04bdbbfa6fcef4294ee6afb4b"
+  },
+  "required_follow_up": "Recover the original JSON if available; otherwise rerun in a new dated batch and retain configuration, environment, source and binary identities without relabeling new output as 2026-10-10 evidence."
+}

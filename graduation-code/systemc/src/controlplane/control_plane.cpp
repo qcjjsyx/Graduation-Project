@@ -226,6 +226,14 @@ CommandDevice::CommandDevice(dp::LoadedArtifact artifact, ControlPlaneConfig con
             factor->set_on_chip_arbiter(&on_chip_);
             units_.push_back(std::move(factor));
         }
+        if (config_.enable_real_solve) {
+            for (std::uint32_t index = 0; index < config_.solve_unit_count; ++index) {
+                auto solve = std::make_unique<SolveExecutionUnit>(
+                    index, &plane_.memory_service(), config_.solve);
+                solve->set_on_chip_arbiter(&on_chip_);
+                units_.push_back(std::move(solve));
+            }
+        }
     }
     if (config_.enable_test_stub) {
         auto make_units = [this](UnitKind kind, std::uint32_t count) {
@@ -326,6 +334,22 @@ bool CommandDevice::start(std::string* error) { //合法性检查
     }
     if (config_.enable_real_panel && config_.factor_unit_count < 1) {
         return reject("the real panel backend needs at least one factor unit");
+    }
+    if (config_.enable_real_solve) {
+        if (!config_.enable_real_panel) {
+            return reject(
+                "the real solve backend requires the real panel backend "
+                "(enable_real_panel)");
+        }
+        if (config_.solve_unit_count < 1) {
+            return reject("the real solve backend needs at least one solve unit");
+        }
+        if (config_.solve.lanes < 1 || config_.solve.row_buffer_depth < 1 ||
+            config_.solve.max_elements_per_request < 1) {
+            return reject(
+                "solve lanes, row_buffer_depth and max_elements_per_request "
+                "must all be positive");
+        }
     }
     if (config_.enable_real_panel &&
         (config_.assemble_unit_count < 1 || config_.assembly.add_latency_cycles < 1)) {
@@ -657,10 +681,25 @@ void CommandDevice::dispatch_phase(std::uint64_t cycle) {
     //   * a NODE_BEGIN of an un-admitted node is "parked": tracked, not
     //     counted against the window, so an un-admitted node can never block
     //     the window of an active front;
+    //   * a SOLVE command is parked until every NODE_COMMIT of the batch has
+    //     reached a terminal completion (commits_finished_, failed commits
+    //     included). This is purely a window anti-deadlock measure, using the
+    //     device's internal count rather than any wait list: the trailing
+    //     solve chain can be pulled long before the node blocks it depends on
+    //     (directly or through the serial chain) are admitted, and counted
+    //     solve commands could fill the window and starve those node blocks.
+    //     Parked solve commands stay pullable but do not consume the window;
+    //     once all commits are terminal they count normally.
     //   * everything else counts against command_window_depth (pre-dispatch
     //     only; running commands are not part of the scheduling window).
     // The fetch FIFO is scanned for the first pullable entry, so a gated entry
     // cannot jam the commands behind it.
+    const std::size_t node_count = plane_.boot().node_count;
+    const auto solve_parked = [&](cmd::Opcode opcode, std::size_t commits_done) {
+        return (opcode == cmd::Opcode::SolveForward ||
+                opcode == cmd::Opcode::SolveBackward) &&
+               commits_done < node_count;
+    };
     while (!fetch_.window_empty()) {
         std::size_t counted = 0;
         for (const auto& tracker : trackers_) {
@@ -669,9 +708,10 @@ void CommandDevice::dispatch_phase(std::uint64_t cycle) {
                 tracker->phase == Tracker::Phase::Resolving ||
                 tracker->phase == Tracker::Phase::Waiting;
             const bool parked =
-                tracker->command.opcode == cmd::Opcode::NodeBegin &&
-                context_for_node(tracker->command.node_id) == std::nullopt &&
-                aborted_nodes_.count(tracker->command.node_id) == 0;
+                (tracker->command.opcode == cmd::Opcode::NodeBegin &&
+                 context_for_node(tracker->command.node_id) == std::nullopt &&
+                 aborted_nodes_.count(tracker->command.node_id) == 0) ||
+                solve_parked(tracker->command.opcode, commits_finished_.size());
             if (pre_dispatch && !parked) {
                 ++counted;
             }
@@ -704,7 +744,8 @@ void CommandDevice::dispatch_phase(std::uint64_t cycle) {
                 continue;  // admission gate
             }
             const bool parked_entry =
-                command.opcode == cmd::Opcode::NodeBegin && !admitted;
+                (command.opcode == cmd::Opcode::NodeBegin && !admitted) ||
+                solve_parked(command.opcode, commits_finished_.size());
             if (!parked_entry && counted >= config_.command_window_depth) {
                 continue;  // window full for counted entries
             }
@@ -1058,6 +1099,80 @@ void CommandDevice::advance_solve(Tracker& tracker, std::uint64_t cycle) {
     }
     tracker.solve_load_pending = true;
     issue_solve_load(tracker, cycle);
+}
+
+bool CommandDevice::try_execute_real_solve(Tracker& tracker, std::uint64_t cycle) {
+    const auto& view = tracker.solve_view;
+    const std::uint64_t required = SolveExecutionUnit::scratch_bytes(
+        view.factor.total_dim, view.factor.pivot_dim,
+        config_.solve.row_buffer_depth);
+    if (required > config_.buffer_capacity_bytes) {
+        finish_command(
+            tracker, cmd::StatusCode::BufferFull,
+            "solve scratch exceeds the scratchpad capacity", cycle);
+        return false;
+    }
+    IExecutionUnit* unit = find_free_unit(UnitKind::Solve);
+    if (unit == nullptr) {
+        ++tracker.stall_resource;
+        return false;
+    }
+    const std::string owner =
+        "solve:" + std::to_string(tracker.command.command_id);
+    auto scratch = plane_.buffers().allocate(owner, required, cycle);
+    if (!scratch.ok) {
+        ++tracker.stall_resource;
+        return false;
+    }
+    const auto lease =
+        plane_.buffers().begin_write(scratch.handle, owner, 0, required, cycle);
+    if (!lease.ok) {
+        plane_.buffers().release(scratch.handle, owner, cycle);
+        ++tracker.stall_resource;
+        return false;
+    }
+    ExecRequest request;
+    request.txn_id = next_txn_id_++;
+    request.epoch = epoch_;
+    request.command_id = tracker.command.command_id;
+    request.node_id = tracker.command.node_id;
+    request.opcode = tracker.command.opcode;
+    request.unit_id = unit->unit_id();
+    request.solve = view;
+    request.total_dim = view.factor.total_dim;
+    request.update_dim = view.factor.total_dim - view.factor.pivot_dim;
+    request.temp_slot = scratch.handle;
+    request.temp_lease = lease.lease;
+    request.has_temp_lease = true;
+    request.range_bytes = required;
+    if (!unit->submit(request, cycle)) {
+        plane_.buffers().release_lease(lease.lease.lease_id, cycle);
+        plane_.buffers().release(scratch.handle, owner, cycle);
+        ++tracker.stall_resource;
+        return false;
+    }
+    tracker.temp_lease = lease.lease;
+    tracker.has_temp_lease = true;
+    tracker.owns_temp = true;
+    tracker.context_slot = scratch.handle.slot;
+    tracker.unit_kind = UnitKind::Solve;
+    tracker.unit_id = unit->unit_id();
+    tracker.unit_active = true;
+    tracker.txn_id = request.txn_id;
+    txn_map_[request.txn_id] = tracker.command.command_id;
+    UnitBusyRecord busy;
+    busy.kind = unit_kind_name(UnitKind::Solve);
+    busy.unit_id = unit->unit_id();
+    busy.command_id = tracker.command.command_id;
+    busy.node_id = tracker.command.node_id;
+    busy.start = cycle;
+    open_unit_records_[request.txn_id] = busy;
+    if (tracker.start_cycle == 0) {
+        tracker.start_cycle = cycle;
+    }
+    tracker.phase = Tracker::Phase::Running;
+    tracker.stage2_pending = false;
+    return true;
 }
 
 void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
@@ -1490,6 +1605,12 @@ void CommandDevice::try_execute(Tracker& tracker, std::uint64_t cycle) {
     }
     case cmd::Opcode::SolveForward:
     case cmd::Opcode::SolveBackward: {
+        if (config_.enable_real_solve) {
+            // T12 real path: the solve unit performs its own bounded DDR
+            // accesses; the T05 whole-RHS chunked DMA copy is never used.
+            try_execute_real_solve(tracker, cycle);
+            return;
+        }
         // The full RHS is traversed in scratchpad-sized chunks; a prefix-only
         // transfer would silently truncate data.
         const auto& view = tracker.solve_view;
@@ -1699,8 +1820,11 @@ void CommandDevice::handle_exec_response(
         return;
     }
     release_command_resources(tracker, cycle);
-    if (opcode == cmd::Opcode::SolveForward ||
-        opcode == cmd::Opcode::SolveBackward) {
+    if ((opcode == cmd::Opcode::SolveForward ||
+         opcode == cmd::Opcode::SolveBackward) &&
+        !config_.enable_real_solve) {
+        // Legacy T05 path: the compute-step result still has to be copied
+        // back to the solution region by DMA.
         tracker.solve_store_pending = true;
         return;
     }
@@ -1807,6 +1931,9 @@ void CommandDevice::drain_completion_results(std::uint64_t cycle) {
         tracker->phase = Tracker::Phase::Done;
         ++completed_commands_;
         completion_status_[slot] = tracker->status;
+        if (tracker->command.opcode == cmd::Opcode::NodeCommit) {
+            commits_finished_.insert(tracker->command.node_id);
+        }
         const bool ready = confirmed && tracker->status == cmd::StatusCode::Ok;
         scoreboard_.signal(
             tracker->command.signal_token,
@@ -2013,6 +2140,7 @@ void CommandDevice::reset() {
     front_slots_.resize(config_.max_resident_fronts);
     aborted_nodes_.clear();
     commit_seen_.clear();
+    commits_finished_.clear();
     completion_status_.clear();
     job_map_.clear();
     txn_map_.clear();
@@ -2285,6 +2413,37 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
                                   ? "panel_trsm_fp32_gemm_int32_external_reference_only"
                                   : "panel_trsm_gemm_fp32_external_reference_only";
         }
+        // T12 solve summary: per-command cycles / bytes / stalls live in
+        // commands.csv; this block aggregates them and records SolveConfig.
+        const std::string solve_forward_name = std::to_string(
+            static_cast<std::uint32_t>(cmd::Opcode::SolveForward));
+        const std::string solve_backward_name = std::to_string(
+            static_cast<std::uint32_t>(cmd::Opcode::SolveBackward));
+        std::uint32_t solve_commands = 0;
+        std::uint32_t solve_ok = 0;
+        std::uint32_t solve_failed = 0;
+        std::uint64_t solve_cycles = 0;
+        std::uint64_t solve_bytes_read = 0;
+        std::uint64_t solve_bytes_written = 0;
+        std::uint64_t solve_stall_cycles = 0;
+        for (const auto& entry : command_stats_) {
+            if (entry.opcode != solve_forward_name &&
+                entry.opcode != solve_backward_name) {
+                continue;
+            }
+            ++solve_commands;
+            if (entry.status == "OK") {
+                ++solve_ok;
+            } else {
+                ++solve_failed;
+            }
+            if (entry.finish_cycle >= entry.start_cycle) {
+                solve_cycles += entry.finish_cycle - entry.start_cycle;
+            }
+            solve_bytes_read += entry.bytes_read;
+            solve_bytes_written += entry.bytes_written;
+            solve_stall_cycles += entry.stall_cycles;
+        }
         std::ofstream out(output_dir + "/summary.json");
         out << "{\n"
             << "  \"tool\": \"t05_command_control_plane\",\n"
@@ -2343,6 +2502,33 @@ void CommandDevice::write_reports(const std::string& output_dir) const {
             << "    \"quantize_cycles\": " << gemm_quantize_cycles << ",\n"
             << "    \"integer_compute_cycles\": " << gemm_integer_cycles << ",\n"
             << "    \"dequantize_cycles\": " << gemm_dequantize_cycles << "\n"
+            << "  },\n"
+            << "  \"solve_execution\": {\n"
+            << "    \"enable_real_solve\": "
+            << (config_.enable_real_solve ? "true" : "false") << ",\n"
+            << "    \"backend\": \""
+            << (config_.enable_real_solve ? "solve_unit_fp32" : "t05_rhs_dma_copy")
+            << "\",\n"
+            << "    \"rhs_read_only\": true,\n"
+            << "    \"solution_semantics\": "
+               "\"zero-initialized accumulator; final = x_hat\",\n"
+            << "    \"commands\": " << solve_commands << ",\n"
+            << "    \"completed\": " << solve_ok << ",\n"
+            << "    \"failed\": " << solve_failed << ",\n"
+            << "    \"cycles\": " << solve_cycles << ",\n"
+            << "    \"bytes_read\": " << solve_bytes_read << ",\n"
+            << "    \"bytes_written\": " << solve_bytes_written << ",\n"
+            << "    \"stall_cycles\": " << solve_stall_cycles << ",\n"
+            << "    \"config\": {\n"
+            << "      \"lanes\": " << config_.solve.lanes << ",\n"
+            << "      \"reduce_latency\": " << config_.solve.reduce_latency
+            << ",\n"
+            << "      \"div_latency\": " << config_.solve.div_latency << ",\n"
+            << "      \"row_buffer_depth\": " << config_.solve.row_buffer_depth
+            << ",\n"
+            << "      \"max_elements_per_request\": "
+            << config_.solve.max_elements_per_request << "\n"
+            << "    }\n"
             << "  },\n"
             << "  \"panel_engine\": {\n"
             << "    \"compute_group_count\": " << config_.panel.compute_group_count

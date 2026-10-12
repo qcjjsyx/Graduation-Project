@@ -140,9 +140,13 @@ std::uint64_t PanelController::version_key(TileCoord coord) const {
     if (layout_.kind == PanelFrontLayout::Kind::PerTileSlots) {
         return layout_.handle.slot + coord.row * global_grid_ + coord.col;
     }
-    const std::uint64_t tile_index =
-        static_cast<std::uint64_t>(coord.row) * global_grid_ + coord.col;
-    return (static_cast<std::uint64_t>(layout_.handle.slot) << 32) | (tile_index + 1);
+    // Same key space as TRSM/GEMM and PanelEngine::erase_slot_versions:
+    // (slot << 48) | (FrontGrid << 32) | (tile_index + 1). The old
+    // (slot << 32) encoding aliased slot s's panel tiles onto slot 0's
+    // A12/A21/A22 views and was never erased on slot reuse.
+    return tile_version_key(
+        layout_.handle.slot, TileViewTag::FrontGrid,
+        coord.row * global_grid_ + coord.col);
 }
 
 std::uint32_t PanelController::operand_version(TileCoord coord) const {

@@ -175,8 +175,8 @@ always_ff @(posedge clk) begin
             // 交换 Pvec[pivot_row_i] 和 Pvec[pivot_row_j]
             Pvec[pivot_row_i] <= Pvec[pivot_row_j];
             Pvec[pivot_row_j] <= Pvec[pivot_row_i];
-        end else if(cfg_we) begin
-            // 外部写入
+        end else if (cfg_we && cfg_ready) begin
+            // 外部写入（只在真实接受时执行）
             Pvec[cfg_p_idx] <= cfg_p_row_physical;
         end else begin
             // do nothing
@@ -186,6 +186,9 @@ always_ff @(posedge clk) begin
     end
 end     
 
-assign cfg_ready = (init_state == INIT_IDLE);
+// B03 修复：写口仲裁显式化。pivot swap 与 cfg 写共用 Pvec 写口，
+// swap 优先；同拍有 pivot 请求时 cfg_ready=0，调用方保持 cfg_we 下一拍重试，
+// 不再出现 "两路都 ready、cfg 写被静默丢弃"。
+assign cfg_ready = (init_state == INIT_IDLE) && !pivot_req_valid;
 
 endmodule

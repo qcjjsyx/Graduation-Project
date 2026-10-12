@@ -5,10 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "software"
 version = "0.1.0"
-description = "Sparse-solver Command/Descriptor v1 compiler"
+description = "Multifrontal sparse LU compiler: matrix -> Command/Descriptor schema v2 artifact"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+# tools/precision_boundary plotting only; the compiler does not need it.
+experiments = ["matplotlib"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
